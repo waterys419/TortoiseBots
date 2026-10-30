@@ -1,5 +1,6 @@
 
 #include "playerbot/GroupMembers.h"
+#include "playerbot/TaxiRouteGuard.h"
 #include "playerbot/playerbot.h"
 #include "playerbot/PerformanceMonitor.h"
 #include "MovementActions.h"
@@ -13,10 +14,26 @@
 #include "playerbot/strategy/values/Stances.h"
 #include "Movement/TargetedMovementGenerator.h"
 #include "Movement/spline/MoveSplineInit.h"
+#include "Movement/spline/MoveSpline.h"
 #include "playerbot/TravelMgr.h"
+#include "playerbot/GrindSpotPolicy.h"
 #include "playerbot/TravelRepickPolicy.h"
-#include "Transports/Transport.h"
-#include "playerbot/strategy/generic/CombatStrategy.h"
+#include "playerbot/TravelRouteCachePolicy.h"
+#include "playerbot/AvoidAoePolicy.h"
+#include "playerbot/strategy/values/PossibleTargetsValue.h"
+#include "playerbot/PoolFleePolicy.h"
+#include "playerbot/CastKeepsRunningPolicy.h"
+#include "playerbot/JumpPolicy.h"
+#include "../../../../runtime/policy/movement/WalkModePolicy.h"
+#include "playerbot/MagmaHazardPolicy.h"
+#include "playerbot/SwimPathPolicy.h"
+#include "playerbot/MoveFailNotePolicy.h"
+#include "playerbot/BoundRunMapGuard.h"
+#include "../../../../runtime/CommandedGroupQuery.h"
+#include "host/ModuleLog.h"
+#include "vmap/VMapFactory.h"
+#include "playerbot/BotActionLog.h"
+#include "Database/DBCStores.h"
 
 using namespace ai;
 
@@ -25,6 +42,115 @@ using namespace ai;
 // of a real ground clamp. A stair step or slope is well under this; the
 // subterranean terrain fallback is not.
 static constexpr float kMaxWaypointDrop = 4.0f;
+
+// Thin floor over magma (specs/dmr-step453.md Fix B): collision (vmap-only)
+// floor confirmation, in yards — probe from navmeshZ + 1.0, accept within 1.0,
+// search down 2.0. VMapManager2::getHeight is a pure vmap raycast (StaticMapTree):
+// VMAP_INVALID_HEIGHT_VALUE when nothing is hit (IVMapManager.h). Map::GetHeight
+// is banned here: it mixes .map terrain and dynamic trees and retries a failed
+// vmap lookup with a 10000 yd search.
+static constexpr float kMagmaFloorProbeAboveZ = 1.0f;
+static constexpr float kMagmaFloorWindowZ = 1.0f;
+static constexpr float kMagmaFloorSearchDistZ = 2.0f;
+
+// MagmaHazardPolicy.h mirrors the core's liquid values (it has no core
+// includes); these pin the copies to GridMapDefines.h.
+static_assert(ai::kMagmaLiquidTypeFlag == MAP_LIQUID_TYPE_MAGMA, "magma type flag differs from the core");
+static_assert(ai::kSlimeLiquidTypeFlag == MAP_LIQUID_TYPE_SLIME, "slime type flag differs from the core");
+static_assert(ai::kLiquidStatusWaterWalk == static_cast<uint32>(LIQUID_MAP_WATER_WALK), "water-walk status differs from the core");
+static_assert(ai::kLiquidStatusInWater == static_cast<uint32>(LIQUID_MAP_IN_WATER), "in-water status differs from the core");
+static_assert(ai::kLiquidStatusUnderWater == static_cast<uint32>(LIQUID_MAP_UNDER_WATER), "under-water status differs from the core");
+
+// One "move refused: magma" line per bot per this many seconds.
+static constexpr time_t kMagmaLogSeconds = 10;
+
+static void LogMagmaRefusal(Player* bot, LastMovement& lastMove, const WorldPosition& at, const char* what)
+{
+    time_t const now = time(nullptr);
+    if (lastMove.magmaLogAt && now - lastMove.magmaLogAt < kMagmaLogSeconds)
+        return;
+    lastMove.magmaLogAt = now;
+    TB_LOG_DETAIL("TortoiseBots: %s: move refused: magma at %.1f %.1f %.1f (map %u, %s)", bot->GetName(), at.getX(),
+        at.getY(), at.getZ(), at.GetMapId(), what);
+}
+
+// MagmaHazardPolicy.h: whether the route walks into a liquid hazard after dry
+// ground (`hazardAt` then says roughly where: the path point ending the leg).
+// ONE sampled guard for magma AND slime (round 2): the predicate asks the
+// core's liquid at every CutPathBeforeMagma sample (same spacing, same
+// traversal), magma always, slime too when `withSlime` (the 0x81, 0x1 and
+// swim-out hand-off routes); `hazardIsSlime` tells a slime hit from magma.
+static bool RouteEntersLiquidHazard(Player* bot, const WorldPosition& startPos, TravelPath& movePath,
+    WorldPosition& hazardAt, bool withSlime, bool& hazardIsSlime)
+{
+    TerrainInfo const* terrain = bot->GetMap()->GetTerrain();
+    std::vector<PathNodePoint>& points = movePath.GetPath();
+    std::vector<ai::MagmaPoint> route;
+    route.reserve(points.size());
+    for (PathNodePoint const& p : points)
+    {
+        ai::MagmaPoint m;
+        m.x = p.point.getX();
+        m.y = p.point.getY();
+        m.z = p.point.getZ();
+        route.push_back(m);
+    }
+    ai::MagmaPoint start;
+    start.x = startPos.getX();
+    start.y = startPos.getY();
+    start.z = startPos.getZ();
+    ai::LiquidHazard hazard = ai::LiquidHazard::None;
+    uint32 const mapId = bot->GetMapId();
+    ai::MagmaPathCut const cut = ai::CutPathBeforeMagma(start, route, [terrain, mapId, withSlime, &hazard](ai::MagmaPoint const& m)
+    {
+        GridMapLiquidData liquid{};
+        GridMapLiquidStatus const status = terrain->getLiquidStatus(m.x, m.y, m.z + 0.01f, MAP_ALL_LIQUIDS, &liquid);
+        if (status == LIQUID_MAP_NO_WATER)
+            return false;
+        ai::LiquidHazard const at = ai::ClassifyLiquidHazard(liquid.type_flags, static_cast<uint32>(status), withSlime);
+        if (at == ai::LiquidHazard::None)
+            return false;
+        hazard = at;
+        return true;
+    });
+    if (!cut.cut)
+        return false;
+    hazardIsSlime = hazard == ai::LiquidHazard::Slime;
+    hazardAt = points[cut.keepPoints].point;
+    return true;
+}
+
+// Ordinary moves: the same sampled guard, magma only (slime does no damage in
+// this core and refusing it would strand bots in Undercity).
+static bool RouteEntersMagma(Player* bot, const WorldPosition& startPos, TravelPath& movePath, WorldPosition& magmaAt)
+{
+    bool hazardIsSlime = false;
+    return RouteEntersLiquidHazard(bot, startPos, movePath, magmaAt, false, hazardIsSlime);
+}
+
+// The magma guard refuses the whole move: nothing is dispatched (no hop to
+// the dry part of the route), the caller sees MOVE_FAIL_MAGMA, and the same
+// destination is refused from memory for kMagmaRefusalSeconds: from anywhere
+// for an end point in magma (`origin` null), from the same origin cell only
+// for a route into magma.
+static void RefuseMagmaMove(Player* bot, LastMovement& lastMove, const WorldPosition& endPos, const WorldPosition& magmaAt,
+    const WorldPosition* origin, const char* what)
+{
+    std::int64_t const now = static_cast<std::int64_t>(time(nullptr));
+    lastMove.magmaRefusal = origin
+        ? ai::MagmaRouteRefusalFor(endPos.GetMapId(), endPos.getX(), endPos.getY(), endPos.getZ(),
+              origin->getX(), origin->getY(), origin->getZ(), now)
+        : ai::MagmaRefusalFor(endPos.GetMapId(), endPos.getX(), endPos.getY(), endPos.getZ(), now);
+    lastMove.moveFailReason = MOVE_FAIL_MAGMA;
+    LogMagmaRefusal(bot, lastMove, magmaAt, what);
+}
+
+// Mounted follow spacing: the on-foot follow slot (FollowDistance 1.5 yd) is
+// smaller than a mount model, so mounted companions parked on top of the
+// master and each other after every ride. Out of combat and outside
+// instances a mounted bot follows this much further out (mod-playerbots
+// MovementAction::Follow also widens the follow distance for mounted bots).
+static constexpr float kMountedFollowSpacing = 3.0f;
 
 // Elevator boarding (issue #216): maximum 3D distance at which a bot may step
 // directly onto the master's transport. Large enough to cover the gap between
@@ -158,7 +284,7 @@ bool MovementAction::UseTaxi(PlayerbotAI* ai, uint32 entry, bool needNpc)
 
     ai->Unmount();
 
-    bool goTaxi = bot->ActivateTaxiPathTo({tEntry->from, tEntry->to}, unit, 1);
+    bool goTaxi = ai::BotTaxiRouteAllowed({ tEntry->from, tEntry->to }) && bot->ActivateTaxiPathTo({tEntry->from, tEntry->to}, unit, 1);
 
     if (!goTaxi)
         bot->SetMoney(botMoney);
@@ -560,6 +686,22 @@ bool MovementAction::WaitForTransport()
     return false;
 }
 
+void MovementAction::BeforeExecute()
+{
+    failNoteMark = AI_VALUE(LastMovement&, "last movement").moveTries;
+}
+
+std::string MovementAction::GetFailNote()
+{
+    LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
+    bool const tried = lastMove.moveTries != failNoteMark;
+    return MoveFailNote(MoveFailNoteReason(failNoteMark, lastMove.moveTries, MoveFailReasonName(lastMove.moveFailReason)),
+        bot->IsInWater(), bot->IsUnderwater(), bot->HasMovementFlag(MOVEFLAG_SWIMMING), tried ? lastMove.movePathType : 0);
+}
+
+std::atomic<uint32_t> MovementAction::routeReuseCount{ 0 };
+std::atomic<uint32_t> MovementAction::routeRebuildCount{ 0 };
+
 TravelPath MovementAction::ResolveMovePath(const WorldPosition& startPosition, const WorldPosition& endPosition, Unit* mover, LastMovement& lastMove)
 {
     float totalDistance = startPosition.distance(endPosition);
@@ -568,6 +710,7 @@ TravelPath MovementAction::ResolveMovePath(const WorldPosition& startPosition, c
     // Last long path still leads to roughly the same destination.
     if (!lastMove.lastPath.empty() && lastMove.lastPath.GetBack().distance(endPosition) < maxDistChange)
     {
+        routeReuseCount.fetch_add(1, std::memory_order_relaxed);
         return lastMove.lastPath;
     }
 
@@ -580,8 +723,33 @@ TravelPath MovementAction::ResolveMovePath(const WorldPosition& startPosition, c
 
     TravelPath outMovePath;
 
-    if (needsLongPath && !sTravelNodeMap.GetNodes().empty() && !bot->InBattleGround())
+    bool const useNodeRoute = needsLongPath && !sTravelNodeMap.GetNodes().empty() && !bot->InBattleGround();
+
+    if (useNodeRoute)
     {
+        // A route that stops short of the destination (no node route, or an incomplete
+        // navmesh path) misses the check above on every turn, and rebuilding it is the
+        // most expensive thing a travelling bot does. Keep walking the route it has for
+        // a few seconds while the same question is asked. Nothing downstream changes:
+        // the shortcut, clip and dispatch below still run each turn, so a move that
+        // fails still fails (and is counted by the caller) at the same cadence.
+        if (!lastMove.lastPath.empty())
+        {
+            WorldPosition const lastBack = lastMove.lastPath.GetBack();
+            if (TravelRouteCacheDecide(lastMove.routeCache, WorldTimer::getMSTime(),
+                    startPosition.GetMapId(), startPosition.getX(), startPosition.getY(), startPosition.getZ(),
+                    endPosition.GetMapId(), endPosition.getX(), endPosition.getY(), endPosition.getZ(),
+                    lastMove.lastPath.GetPath().size(),
+                    lastBack.GetMapId(), lastBack.getX(), lastBack.getY(), lastBack.getZ()) == TravelRouteCacheVerdict::Reuse)
+            {
+                // The rebuild also left its verdict for the TravelMoveFailed row and the
+                // off-graph rescue; replay it.
+                TravelNodeMap::LastRouteFail() = lastMove.routeCache.routeFail;
+                routeReuseCount.fetch_add(1, std::memory_order_relaxed);
+                return lastMove.lastPath;
+            }
+        }
+
         outMovePath = sTravelNodeMap.GetFullPath(startPosition, endPosition, bot); //Pathfind using nodes.
     }
     else
@@ -591,8 +759,23 @@ TravelPath MovementAction::ResolveMovePath(const WorldPosition& startPosition, c
         outMovePath.addPath(path);
     }
 
+    // A route-cache hit returned above, so reaching this line means the route was planned.
+    routeRebuildCount.fetch_add(1, std::memory_order_relaxed);
+
     if (!lastMove.lastPath.empty() && !outMovePath.empty() && lastMove.lastPath.GetBack().distance(endPosition) <= outMovePath.GetBack().distance(endPosition))
         outMovePath = lastMove.lastPath;
+
+    if (useNodeRoute && !outMovePath.empty())
+    {
+        WorldPosition const back = outMovePath.GetBack();
+        lastMove.routeCache = TravelRouteCacheStamp(WorldTimer::getMSTime(),
+            startPosition.GetMapId(), startPosition.getX(), startPosition.getY(), startPosition.getZ(),
+            endPosition.GetMapId(), endPosition.getX(), endPosition.getY(), endPosition.getZ(),
+            back.GetMapId(), back.getX(), back.getY(), back.getZ(),
+            TravelNodeMap::LastRouteFail());
+    }
+    else if (useNodeRoute)
+        lastMove.routeCache = TravelRouteCacheEntry();
 
     // A NOPATH fallback carries no route at all: tag the point so the dispatch
     // below can tell it from a clipped real path and keep failing (retry/drop)
@@ -706,6 +889,13 @@ bool MovementAction::HandleSpecialMovement(TravelPath& path)
 
     if (nextPoint.type == PathNodeType::NODE_TELEPORT && nextPoint.entry)
     {
+        // The hearthstone and the class teleports are 10 s casts: wait for the one in
+        // progress instead of declining the leg, which made the travel step walk on
+        // and interrupt it every few seconds (live: bots re-hearthing every ~13 s).
+        Spell* currentSpell = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (currentSpell && currentSpell->m_spellInfo->Id == nextPoint.entry)
+            return true;
+
         bool canCastNow = !bot->IsFlying() || WorldPosition(bot).currentHeight() < 10.0f;
 
         if (nextPoint.entry == 8690) // Hearthstone
@@ -722,7 +912,12 @@ bool MovementAction::HandleSpecialMovement(TravelPath& path)
 
             ai->RemoveShapeshift();
 
-            if (ai->DoSpecificAction("cast", Event("rpg action", chat->formatWorldobject(bot) + " " + std::to_string(nextPoint.entry)), true))
+            // Cast directly: the "cast" chat command read the spell id as a repeat
+            // count after the bot link and never found the spell.
+            if (bot->IsMoving())
+                ai->StopMoving();
+
+            if (ai->CastSpell(nextPoint.entry, bot))
                 return true;
         }
 
@@ -748,7 +943,14 @@ bool MovementAction::DispatchMovement(TravelPath movePath, bool generatePath, bo
 
     mm.Clear();
 
-    ForcedMovement moveMode = masterWalking ? FORCED_MOVEMENT_WALK : FORCED_MOVEMENT_RUN;
+    // A walk flag an action has just set (MoveToRpgTargetAction) must ride this
+    // same dispatch, and a walking bot is never flipped to run here: the core
+    // sends a launch's walk/run change with the pre-launch mode restored last,
+    // so a run spline launched on walk flags leaves watching clients walking
+    // until they reload. Leftover flags are cleared before the next tick's
+    // moves are dispatched (PlayerbotAI::DoNextAction); the master's walking is
+    // mimicked only through the walkDistance gate above.
+    ForcedMovement moveMode = ai::WalkModePolicy::DispatchWalks(masterWalking, bot->m_movementInfo.HasMovementFlag(MOVEFLAG_WALK_MODE)) ? FORCED_MOVEMENT_WALK : FORCED_MOVEMENT_RUN;
 
     std::vector<WorldPosition> path = movePath.GetPointPath();
 
@@ -841,20 +1043,86 @@ bool MovementAction::DispatchMovement(TravelPath movePath, bool generatePath, bo
     {
         bool normalizeZ = true;
 
+        // Hoisted for the magma floor guard below: the loop runs per path
+        // point, the two liquid lookups only on a lowered point.
+        TerrainInfo const* dispatchTerrain = bot->GetMap()->GetTerrain();
+        bool const dispatchMagmaGuard = ai::MagmaGuardApplies(bot->GetMap()->IsDungeon());
+        LastMovement& dispatchMove = AI_VALUE(LastMovement&, "last movement");
+
         for (auto& p : pointPath)
         {
             if (bot->GetTransport())
                 bot->GetTransport()->CalculatePassengerPosition(p.x, p.y, p.z);
             float const navmeshZ = p.z;
             bot->UpdateAllowedPositionZ(p.x, p.y, p.z);
+            // ORIGINAL clamp, before either restore path below: the magma/slime
+            // classification must see what the core produced, not what the
+            // stair workaround already restored.
+            float const clampedZ = p.z;
+            bool const magmaFloorLowered = clampedZ < navmeshZ;
+            // Cheap first: the clamped point's liquid status is usually dry, so
+            // it gates the navmesh lookup and the vmap query behind it. Both
+            // WorldPosition overloads are null-terrain safe.
+            bool magmaFloorClampedWet = false;
+            bool magmaFloorNavmeshWet = false;
+            if (!bot->GetTransport() && magmaFloorLowered && dispatchMagmaGuard &&
+                (WorldPosition(bot->GetMapId(), p.x, p.y, clampedZ).isInMagma(dispatchTerrain) ||
+                    WorldPosition(bot->GetMapId(), p.x, p.y, clampedZ).isInSlime(dispatchTerrain)))
+            {
+                magmaFloorClampedWet = true;
+                magmaFloorNavmeshWet =
+                    WorldPosition(bot->GetMapId(), p.x, p.y, navmeshZ).isInMagma(dispatchTerrain);
+            }
             // Crypt stairs (issue #217): a 3D navmesh waypoint carries the true
             // floor elevation. UpdateAllowedPositionZ re-derives the floor with a
             // downward raycast; when that ray starts underneath an uphill step it
             // misses the structure and the waypoint is clamped to the
             // subterranean terrain fallback - the bot then walks through the
-            // floor. Keep the navmesh elevation when the rewrite is a big drop.
-            if (p.z < navmeshZ && navmeshZ - p.z > kMaxWaypointDrop)
+            // floor. Keep the navmesh elevation on a big dry drop only: a big
+            // drop into magma/slime (an unconfirmed polygon over a hole or an
+            // open liquid pool) needs the confirmed-floor path below instead.
+            bool const stairRestore = ai::KeepStairNavmeshZ(magmaFloorLowered,
+                navmeshZ - clampedZ > kMaxWaypointDrop, magmaFloorClampedWet);
+            if (stairRestore)
                 p.z = navmeshZ;
+            // Thin floor over magma (specs/dmr-step453.md Fix B): over a WMO
+            // magma bed under a floor the core's GetWaterOrGroundLevel answers
+            // liquid level - 2 (swim=true, LIQUID_MAP_ABOVE_WATER), inside the
+            // magma; the 2.35 yd drop there is under the stair limit above.
+            // Keep the navmesh floor only when the core's COLLISION (vmap-only,
+            // no .map terrain, no dynamic tree) height confirms a real floor at
+            // the navmesh point: a dry navmesh z alone is no proof (bridged or
+            // eroded point over a hole, or a polygon a little above open lava).
+            // The vmap query runs only on the guard path that would otherwise
+            // restore — small drops want it (the thin floor), big drops too
+            // (the hole the stair path above refused to restore blindly).
+            bool magmaFloorConfirmed = false;
+            bool magmaFloorGuardFire = false;
+            if (!bot->GetTransport() && magmaFloorLowered && dispatchMagmaGuard && magmaFloorClampedWet &&
+                !magmaFloorNavmeshWet && !stairRestore)
+            {
+                // VMapManager2::getHeight is a pure vmap raycast down from
+                // navmeshZ + 1.0 over 2.0 yd: it reaches a thin floor at the
+                // navmesh point but not the lava bed or a deck far below/above.
+                // VMAP_INVALID_HEIGHT_VALUE (IVMapManager.h) means no hit.
+                float const collisionFloor = VMAP::VMapFactory::createOrGetVMapManager()->getHeight(
+                    bot->GetMapId(), p.x, p.y, navmeshZ + kMagmaFloorProbeAboveZ, kMagmaFloorSearchDistZ);
+                magmaFloorConfirmed = collisionFloor > VMAP_INVALID_HEIGHT_VALUE &&
+                    fabs(collisionFloor - navmeshZ) <= kMagmaFloorWindowZ;
+                magmaFloorGuardFire = ai::KeepNavmeshZOverMagma(dispatchMagmaGuard, magmaFloorLowered,
+                    true, false, magmaFloorConfirmed);
+            }
+            if (magmaFloorGuardFire)
+            {
+                p.z = navmeshZ;
+                time_t const now = time(nullptr);
+                if (!dispatchMove.magmaLogAt || now - dispatchMove.magmaLogAt >= kMagmaLogSeconds)
+                {
+                    dispatchMove.magmaLogAt = now;
+                    TB_LOG_DETAIL("TortoiseBots: %s: waypoint kept on the floor over magma at %.1f %.1f %.1f (clamp %.2f)",
+                        bot->GetName(), p.x, p.y, navmeshZ, clampedZ);
+                }
+            }
             if (bot->GetTransport())
                 bot->GetTransport()->CalculatePassengerOffset(p.x, p.y, p.z);
         }
@@ -895,13 +1163,336 @@ Unit* MovementAction::GetMover(Player* bot)
     return bot;
 }
 
-bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react, bool noPath, bool ignoreEnemyTargets)
+static constexpr time_t kSwimHandoffLogSeconds = 10;
+
+static void LogSwimHandoff(Player* bot, LastMovement& lastMove, const char* kind, const WorldPosition& endPos, float yd,
+    uint32 coreType, size_t routePoints, float routeYd, const std::string& line)
+{
+    time_t const now = time(nullptr);
+    if (lastMove.swimHandoffLogAt && now - lastMove.swimHandoffLogAt < kSwimHandoffLogSeconds)
+        return;
+    lastMove.swimHandoffLogAt = now;
+    TB_LOG_DETAIL("TortoiseBots: %s: swim hand-off (%s) to %.1f %.1f %.1f, %.1f yd (core path 0x%x; own route %u points, "
+        "%.1f yd; swim line: %s)", bot->GetName(), kind, endPos.getX(), endPos.getY(), endPos.getZ(), yd, coreType,
+        static_cast<uint32>(routePoints), routeYd, line.c_str());
+}
+
+// The hand-off's refusal line (round 1, Codex + Opus 2026-10-25): a stall the hand-off will not take
+// logs why, rate-limited on the same stamp as a taken hand-off, so the run leader can tell a stall
+// from a quiet old-style failure. `kind` names the branch that refused ("core path", "core line",
+// "swim out"); `reason` names the check ("clipped", "magma", "slime").
+static void LogSwimHandoffRefused(Player* bot, LastMovement& lastMove, const char* kind, const char* reason,
+    const WorldPosition& endPos, uint32 coreType, size_t routePoints, float routeYd)
+{
+    time_t const now = time(nullptr);
+    if (lastMove.swimHandoffLogAt && now - lastMove.swimHandoffLogAt < kSwimHandoffLogSeconds)
+        return;
+    lastMove.swimHandoffLogAt = now;
+    TB_LOG_DETAIL("TortoiseBots: %s: swim hand-off refused (%s: %s) to %.1f %.1f %.1f (core path 0x%x; own route %u points, "
+        "%.1f yd)", bot->GetName(), kind, reason, endPos.getX(), endPos.getY(), endPos.getZ(), coreType,
+        static_cast<uint32>(routePoints), routeYd);
+}
+
+// A hand-off leg run through the SAME ClipPath (hostile/hazard + packHold) as an ordinary route (round
+// 1: the hand-off used to run before ClipPath and swim through packs, enemies and hazards). Each 2-point
+// segment is clipped on its own: the brief's "2-point line" has no travelled tail, so the window start
+// cannot cut it, but an enemy ("ClipPath" melee clip), a hazard or a pack hold on the segment shortens
+// it and the hand-off is refused. Returns false when any segment clips.
+static bool SwimHandoffLegClear(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets, PackHoldResult* packHold,
+    const std::vector<WorldPosition>& leg)
+{
+    if (leg.size() < 2)
+        return false;
+    for (size_t i = 1; i < leg.size(); ++i)
+    {
+        TravelPath clipped;
+        clipped.addPath({ leg[i - 1], leg[i] });
+        clipped.ClipPath(ai, mover, ignoreEnemyTargets, packHold);
+        // Any clip shortens the segment: the walked route would not be the validated line.
+        if (clipped.GetPointPath().size() < 2)
+            return false;
+    }
+    return true;
+}
+
+// SwimPathPolicy.h ChooseSwimHandoff: a bot in water whose own route makes no progress hands the move to the
+// core's own swim (0x81 or the mid-water 0x11 shortcut via MovePoint with pathfinding, 0x1 by walking the
+// module's spline over the core's clipped points) or swims up and out to a shore point at the waterline.
+// Round 1 runs every hand-off route through the SAME ClipPath (hostile/hazard + packHold) as an ordinary route,
+// guards the walked 0x1 path (not the chord) against magma, and refuses slime and groundless swim-out ends. The
+// cheap gates come first: a route that walks never costs a path query.
+MovementAction::SwimHandoffResult MovementAction::SwimHandoff(const WorldPosition& startPos, const WorldPosition& endPos,
+    TravelPath& movePath, LastMovement& lastMove, PackHoldResult* packHold, bool ignoreEnemyTargets)
+{
+    if (!(bot->IsInWater() || bot->IsUnderwater() || bot->HasMovementFlag(MOVEFLAG_SWIMMING)))
+        return SwimHandoffResult::NotTaken;
+    // Round 1 (a): a follow that holds before packs keeps the old behaviour: never hand off.
+    if (packHold != nullptr)
+        return SwimHandoffResult::NotTaken;
+    std::vector<WorldPosition> const route = movePath.GetPointPath();
+    ai::SwimHandoffFacts f;
+    f.inWater = true;
+    f.excluded = ai->IsRealPlayer() || bot->GetTransport() || bot->IsFlying() || bot->IsTaxiFlying() ||
+        endPos.GetMapId() != bot->GetMapId();
+    // Round 1: a 1-point route far away is not "no progress": its distance is its progress.
+    f.routeEndFromBot = route.empty() ? 0.0f : route.back().distance(startPos);
+    f.endFromBot = startPos.distance(endPos);
+    if (f.excluded || !(f.endFromBot > ai::kSwimNoProgressYd) || f.routeEndFromBot > ai::kSwimNoProgressYd)
+        return SwimHandoffResult::NotTaken;
+
+    PathFinder path(bot);
+    path.calculate(endPos.getX(), endPos.getY(), endPos.getZ(), false);
+    f.coreType = static_cast<uint32>(path.getPathType());
+    Vector3 const coreEnd = path.getActualEndPosition();
+    Map* const map = bot->GetMap();
+    bool const isShortcut0x11 = f.coreType == (ai::kPathTypeNormal | ai::kPathTypeNotUsingPath);
+    f.coreLineHitsModel = isShortcut0x11
+        ? map->FindCollisionModel(startPos.getX(), startPos.getY(), startPos.getZ(),
+            coreEnd.x, coreEnd.y, coreEnd.z + 0.5f) != nullptr
+        : map->FindCollisionModel(startPos.getX(), startPos.getY(), startPos.getZ(),
+            coreEnd.x, coreEnd.y, coreEnd.z) != nullptr;
+    TerrainInfo const* const terrain = map->GetTerrain();
+    GridMapLiquidData here{};
+    f.swimmableHere = terrain->IsSwimmable(startPos.getX(), startPos.getY(), startPos.getZ(), 1.5f, &here);
+    f.endSwimmable = terrain->IsSwimmable(endPos.getX(), endPos.getY(), endPos.getZ());
+    // Karazhan Crypt shaft dive (Fix 2): for the mid-water 0x11 shortcut, the end must be in water too.
+    // Sampled at +0.5 yd like SwimPathFits' sight test, so the floor under the end is not read as a wall.
+    if (f.coreType == (ai::kPathTypeNormal | ai::kPathTypeNotUsingPath))
+    {
+        GridMapLiquidData endData{};
+        std::uint32_t const endStatus = terrain->getLiquidStatus(endPos.getX(), endPos.getY(), endPos.getZ() + 0.5f,
+            ai::kSwimLiquidRequest, &endData);
+        f.endInWater = ai::SwimSampleInWater(endStatus, endData.type_flags);
+    }
+    f.endGroundYd = std::sqrt(startPos.sqDistance2d(endPos));
+    float const surfaceZ = here.level - ai::kSwimOutSurfaceDepthYd;
+    f.endFromSurfaceYd = f.swimmableHere ? endPos.getZ() - here.level : 1000.0f;
+    // Round 1: the swim-out end must have ground under it (a floor query within 1 yd below it).
+    if (f.swimmableHere && !f.endSwimmable)
+    {
+        float const floorZ = map->GetHeight(endPos.getX(), endPos.getY(), endPos.getZ() + 0.5f);
+        f.endHasGround = floorZ > INVALID_HEIGHT && endPos.getZ() - floorZ >= 0.0f && endPos.getZ() - floorZ <= 1.0f;
+    }
+    else
+        f.endHasGround = false;
+    f.surfaceLineClear = f.swimmableHere &&
+        map->isInLineOfSight(startPos.getX(), startPos.getY(), startPos.getZ() + 0.5f,
+            startPos.getX(), startPos.getY(), surfaceZ, true) &&
+        map->isInLineOfSight(startPos.getX(), startPos.getY(), surfaceZ,
+            endPos.getX(), endPos.getY(), endPos.getZ() + 0.5f, true);
+    ai::SwimHandoff const kind = ai::ChooseSwimHandoff(f);
+    // Round 1: name the stall the hand-off will not take (the brief's "model on the line, over
+    // 100 yd" cases), rate-limited on the hand-off stamp. Anything else silent stays silent: it is
+    // the old behaviour (on land, walking, a land line, a partial path), not a stall. Fix 2 covers the
+    // 0x11 shortcut too when both ends are in water; a refused 0x11 falls through to the swim-out below.
+    bool const swimShortcutWanted = f.coreType == (ai::kPathTypeNormal | ai::kPathTypeUnderwater) ||
+        (f.coreType == (ai::kPathTypeNormal | ai::kPathTypeNotUsingPath) && f.swimmableHere && f.endInWater);
+    if (kind == ai::SwimHandoff::None)
+    {
+        if (f.inWater && !f.excluded && f.endFromBot > ai::kSwimNoProgressYd &&
+            f.routeEndFromBot <= ai::kSwimNoProgressYd && swimShortcutWanted)
+        {
+            if (f.coreLineHitsModel)
+                LogSwimHandoffRefused(bot, lastMove, "core line", "model on the line", endPos, f.coreType,
+                    route.size(), f.routeEndFromBot);
+            else if (!(f.endFromBot <= ai::kSwimHandoffMaxLineYd))
+                LogSwimHandoffRefused(bot, lastMove, "core line", "over 100 yd", endPos, f.coreType,
+                    route.size(), f.routeEndFromBot);
+        }
+        return SwimHandoffResult::NotTaken;
+    }
+
+    // The 0x1 core path, as the module's own spline over the core's points (round 1 (b)/(2)):
+    // the core's MovePoint would recompute a different route; the module walks exactly the path
+    // it validated. It runs through the SAME ClipPath (hostile/hazard + packHold) as an ordinary
+    // route; a cut route is dispatched when 2+ points remain, else the hand-off is refused.
+    // path.getPath()[0] is the bot's own spot, so it is kept once, not duplicated (a zero-length
+    // first leg would freeze the spline: Launch overwrites legs[0] with the live position).
+    std::vector<WorldPosition> coreRoute;
+    if (kind == ai::SwimHandoff::CoreLine && f.coreType == ai::kPathTypeNormal)
+    {
+        for (G3D::Vector3 const& p : path.getPath())
+        {
+            WorldPosition const wp(bot->GetMapId(), p.x, p.y, p.z);
+            if (coreRoute.empty() && wp.distance(startPos) < 0.1f)
+                continue;
+            coreRoute.push_back(wp);
+        }
+        coreRoute.insert(coreRoute.begin(), startPos);
+        if (coreRoute.size() < 2)
+            return SwimHandoffResult::NotTaken;
+        TravelPath clipped;
+        clipped.addPath(coreRoute);
+        clipped.ClipPath(ai, bot, ignoreEnemyTargets, packHold);
+        std::vector<WorldPosition> const kept = clipped.GetPointPath();
+        if (kept.size() < coreRoute.size())
+        {
+            if (kept.size() < 2)
+            {
+                LogSwimHandoffRefused(bot, lastMove, "core path", "clipped", endPos, f.coreType, route.size(),
+                    f.routeEndFromBot);
+                return SwimHandoffResult::Refused;
+            }
+            coreRoute = kept;
+        }
+    }
+
+    // The line the bot will take, for the magma/slime guard, the clip check and the spline.
+    std::vector<WorldPosition> linePoints{ startPos };
+    if (kind == ai::SwimHandoff::CoreLine)
+    {
+        if (f.coreType == ai::kPathTypeNormal)
+            linePoints = coreRoute;
+        else
+            linePoints.push_back(WorldPosition(bot->GetMapId(), coreEnd.x, coreEnd.y, coreEnd.z));
+    }
+    else
+    {
+        if (ai::SwimOutNeedsRise(startPos.getZ(), here.level))
+            linePoints.push_back(WorldPosition(bot->GetMapId(), startPos.getX(), startPos.getY(), surfaceZ));
+        linePoints.push_back(endPos);
+    }
+    // Fix 2: the 0x11 shortcut is a straight swim line like 0x81: same ClipPath, and the magma/slime guard below
+    // runs for it too.
+    bool const swimShortcut = f.coreType == (ai::kPathTypeNormal | ai::kPathTypeUnderwater) || f.coreType ==
+        (ai::kPathTypeNormal | ai::kPathTypeNotUsingPath);
+    if (kind == ai::SwimHandoff::SwimOut || swimShortcut)
+    {
+        if (!SwimHandoffLegClear(ai, bot, ignoreEnemyTargets, packHold, linePoints))
+        {
+            LogSwimHandoffRefused(bot, lastMove,
+                kind == ai::SwimHandoff::CoreLine ? "core line" : "swim out", "clipped", endPos, f.coreType,
+                route.size(), f.routeEndFromBot);
+            return SwimHandoffResult::Refused;
+        }
+    }
+    // Round 3 (Codex HIGH 2026-10-25): CutPathBeforeMagma spends one
+    // route-wide budget of kMagmaMaxInteriorSamples interior samples (~96
+    // yd); past it later legs are checked only at their endpoints, so
+    // slime/magma between two safe late waypoints is missed. A hand-off route
+    // longer than the budget covers at full density is refused instead (the
+    // bot keeps the old behaviour); other callers keep the shared budget.
+    std::vector<ai::MagmaPoint> guardRoute;
+    guardRoute.reserve(linePoints.size());
+    for (WorldPosition const& p : linePoints)
+    {
+        ai::MagmaPoint m;
+        m.x = p.getX();
+        m.y = p.getY();
+        m.z = p.getZ();
+        guardRoute.push_back(m);
+    }
+    if (ai::MagmaGuardApplies(map->IsDungeon()) && ai::MagmaRouteTooLongToCheck(guardRoute))
+    {
+        LogSwimHandoffRefused(bot, lastMove,
+            kind == ai::SwimHandoff::CoreLine ? "core line" : "swim out", "route too long to check", endPos,
+            f.coreType, route.size(), f.routeEndFromBot);
+        return SwimHandoffResult::Refused;
+    }
+    TravelPath line;
+    line.addPath(linePoints);
+    WorldPosition hazardAt;
+    // Round 2: ONE sampled liquid-hazard guard for magma AND slime (Codex HIGH
+    // 2026-10-25): the old waypoint-only slime loop checked only the route's
+    // points, so a leg between two safe points could cross a slime pool. Now
+    // the hand-off routes (0x81, 0x1, swim-out) sample every leg for slime
+    // exactly as for magma (same CutPathBeforeMagma spacing and traversal);
+    // slime off would be the old missed crossing.
+    bool hazardIsSlime = false;
+    if (ai::MagmaGuardApplies(map->IsDungeon()) &&
+        RouteEntersLiquidHazard(bot, startPos, line, hazardAt, true, hazardIsSlime))
+    {
+        if (hazardIsSlime)
+        {
+            lastMove.setPath(TravelPath());
+            lastMove.moveFailReason = MOVE_FAIL_MAGMA;
+            LogSwimHandoffRefused(bot, lastMove,
+                kind == ai::SwimHandoff::CoreLine ? "core line" : "swim out", "slime", endPos, f.coreType,
+                route.size(), f.routeEndFromBot);
+        }
+        else
+        {
+            lastMove.setPath(TravelPath());
+            RefuseMagmaMove(bot, lastMove, endPos, hazardAt, &startPos, "swim");
+            LogSwimHandoffRefused(bot, lastMove,
+                kind == ai::SwimHandoff::CoreLine ? "core line" : "swim out", "magma", endPos, f.coreType,
+                route.size(), f.routeEndFromBot);
+        }
+        return SwimHandoffResult::Refused;
+    }
+
+    // The taken line only: a 0x11 that fell to SwimOut logs the swim-out line, never the refused shortcut.
+    std::string const why = kind == ai::SwimHandoff::CoreLine && swimShortcut
+        ? WorldPosition::SwimLineWhy({ startPos, linePoints.back() }, bot) : std::string("-");
+    MotionMaster& mm = *bot->GetMotionMaster();
+    mm.Clear();
+    float length = 0.0f;
+    if (kind == ai::SwimHandoff::CoreLine && f.coreType == ai::kPathTypeNormal)
+    {
+        // Launch exactly the validated (and clipped) path: the module's own spline over those
+        // points, as DispatchMovement walks an ordinary route (no fresh core recompute).
+        std::vector<G3D::Vector3> pointPath = WorldPosition().toPointsArray(linePoints);
+        length = WorldPosition().GetPathLength(linePoints);
+        Movement::MoveSplineInit init(*bot, "SwimHandoffCore");
+        init.MovebyPath(pointPath);
+        init.SetWalk(false);
+        init.Launch();
+    }
+    else if (kind == ai::SwimHandoff::CoreLine)
+    {
+        mm.MovePoint(endPos.GetMapId(), endPos.getX(), endPos.getY(), endPos.getZ(), MOVE_RUN_MODE | MOVE_PATHFINDING);
+        length = path.Length() > 0.0f ? path.Length() : f.endFromBot;
+    }
+    else
+    {
+        Movement::PointsArray points;
+        for (WorldPosition& p : linePoints)
+            points.push_back(p.getVector3());
+        for (size_t i = 1; i < points.size(); ++i)
+            length += (points[i] - points[i - 1]).length();
+        Movement::MoveSplineInit init(*bot, "SwimOut");
+        init.MovebyPath(points);
+        init.SetWalk(false);
+        init.Launch();
+    }
+    lastMove.setPath(TravelPath()); // not reused: the next try asks again
+    lastMove.movePathType = f.coreType;
+    lastMove.moveFailReason = MOVE_FAIL_NONE;
+    WaitForReach(length);
+    LogSwimHandoff(bot, lastMove, kind == ai::SwimHandoff::CoreLine ? "core line" : "swim out", endPos, length,
+        f.coreType, route.size(), f.routeEndFromBot, why);
+    return SwimHandoffResult::Moving;
+}
+
+ 
+ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react, bool noPath, bool ignoreEnemyTargets, PackHoldResult* packHold)
 {
     LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
+    // A new try: its own fail reason and path type only (the FAILED line's note).
+    ++lastMove.moveTries;
+    lastMove.moveFailReason = MOVE_FAIL_NONE;
+    lastMove.movePathType = 0;
 
     if (!endPos.isValid())
     {
         lastMove.moveFailReason = MOVE_FAIL_INVALID_DEST;
+        return false;
+    }
+
+    // A bound run's bot never leaves the plan's map by its own move (pip S2
+    // Deadmines 2026-10-26: a player's ghost outside made the follow ping-pong
+    // through the portal). The cheap map compare comes first, so the run lookup
+    // runs only for a cross-map destination.
+    if (endPos.GetMapId() != bot->GetMapId() &&
+        ai::BoundRunRefusesMapChange(bot->GetMapId(), endPos.GetMapId(), TortoiseBots::BotCommands::BoundRunPlanMap(bot)))
+    {
+        // A walk already headed off the map (built before the run bound it) is dropped too.
+        if (!lastMove.lastPath.empty() && lastMove.lastPath.GetBack().GetMapId() != bot->GetMapId())
+        {
+            lastMove.clear();
+            ai->StopMoving();
+        }
+        lastMove.moveFailReason = MOVE_FAIL_BOUND_RUN_MAP;
         return false;
     }
 
@@ -911,6 +1502,26 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
     {
         lastMove.moveFailReason = MOVE_FAIL_CANT_MOVE;
         return false;
+    }
+
+    // Magma guard (MagmaHazardPolicy.h, RFC r3-19z20): on an instance map no
+    // move ends in magma and no route walks into it (a bot already in magma
+    // may walk out). The refusal memory is checked first: a destination
+    // refused in the last kMagmaRefusalSeconds costs no terrain query.
+    bool const magmaGuard = ai::MagmaGuardApplies(bot->GetMap()->IsDungeon());
+    if (magmaGuard)
+    {
+        if (ai::MagmaRefusalActive(lastMove.magmaRefusal, endPos.GetMapId(), endPos.getX(), endPos.getY(), endPos.getZ(),
+                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), static_cast<std::int64_t>(time(nullptr))))
+        {
+            lastMove.moveFailReason = MOVE_FAIL_MAGMA;
+            return false;
+        }
+        if (endPos.isInMagma())
+        {
+            RefuseMagmaMove(bot, lastMove, endPos, endPos, nullptr, "end point");
+            return false;
+        }
     }
 
     Unit* mover = GetMover(bot);
@@ -956,9 +1567,21 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
 
     bool isWalking = false;
 
+    WorldPosition::LastPathStepType() = 0;
     TravelPath movePath = ResolveMovePath(startPos, endPos, mover, lastMove);
+    lastMove.movePathType = WorldPosition::LastPathStepType();
 
     lastMove.setPath(movePath);
+
+    // A bot in water whose own route goes nowhere: the core's swim (SwimHandoff). Round 1: the
+    // follow's packHold reaches the hand-off (a hold never hands off); the hand-off clips its own
+    // route with the same ClipPath instead of running before it.
+    switch (SwimHandoff(startPos, endPos, movePath, lastMove, packHold, ignoreEnemyTargets))
+    {
+        case SwimHandoffResult::Moving: return true;
+        case SwimHandoffResult::Refused: return false;
+        case SwimHandoffResult::NotTaken: break;
+    }
 
     if (movePath.empty())
     {
@@ -973,6 +1596,13 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
     if (movePath.empty())
     {
         lastMove.setPath(movePath);
+        // The collapsed route goes nowhere: in water the core's swim may (SwimHandoff).
+        switch (SwimHandoff(startPos, endPos, movePath, lastMove, packHold, ignoreEnemyTargets))
+        {
+            case SwimHandoffResult::Moving: return true;
+            case SwimHandoffResult::Refused: return false;
+            case SwimHandoffResult::NotTaken: break;
+        }
         return true; // Path collapsed — will rebuild next tick.
     }
 
@@ -1002,7 +1632,15 @@ bool MovementAction::MoveTo2(const WorldPosition& endPos, bool idle, bool react,
         lastMove.setPath(movePath);
     }
 
-    movePath.ClipPath(ai, mover, ignoreEnemyTargets);
+    movePath.ClipPath(ai, mover, ignoreEnemyTargets, packHold);
+
+    WorldPosition magmaAt;
+    if (magmaGuard && !movePath.empty() && RouteEntersMagma(bot, startPos, movePath, magmaAt))
+    {
+        lastMove.setPath(TravelPath()); // not reused by the next call: the whole move is refused
+        RefuseMagmaMove(bot, lastMove, endPos, magmaAt, &startPos, "route");
+        return false;
+    }
 
     if(ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
     {
@@ -1198,6 +1836,8 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool idle, 
 bool MovementAction::MoveTo(Unit* target, float distance)
 {
     LastMovement& unitMove = AI_VALUE(LastMovement&, "last movement");
+    ++unitMove.moveTries;
+    unitMove.moveFailReason = MOVE_FAIL_NONE;
 
     if (!target || !target->IsInWorld())
     {
@@ -1328,6 +1968,9 @@ bool MovementAction::Follow(Unit* target, float distance, float angle)
 
     distance = distance <= target->GetObjectBoundingRadius() ? 0 : distance - target->GetObjectBoundingRadius();
 
+    if (bot->IsMounted() && !bot->IsInCombat() && bot->GetMap() && !bot->GetMap()->IsDungeon())
+        distance += kMountedFollowSpacing;
+
     UpdateMovementState();
 
     if (FollowOnTransport(target))
@@ -1454,6 +2097,29 @@ bool MovementAction::Follow(Unit* target, float distance, float angle)
     AI_VALUE(LastMovement&, "last movement").Set(target);
     ClearIdleState();
 
+    // Creature aura keep-out: never follow into a listed creature's hazard.
+    // Checked before the native follow continues, so a running follow is
+    // stopped at the edge too; normal follow resumes once the goal is clear.
+    if (sPlayerbotAIConfig.avoidCreatureAuras && HoldFollowOutsideKeepout(target, distance, angle))
+        return true;
+
+    if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+    {
+        Unit* currentTarget = sServerFacade.GetChaseTarget(bot);
+        // The Penqle generator intentionally keeps its requested angle and
+        // offset private. The public target/current-motion contract is enough
+        // to let the native generator continue; repeatedly replacing it while
+        // following causes jitter and defeats the follow dead-zone.
+        if (currentTarget && currentTarget->getObjectGuid() == target->getObjectGuid())
+            return false;
+    }
+
+    // A follower stranded on a dungeon navmesh island (a dais the core follow
+    // cannot leave) steps down off the edge; see StepDownOffLedge. After the
+    // follow-generator guard above: an active follow move is still closing the
+    // gap and must not be cleared for a new spline every tick.
+    if (tDist > distance + 3.0f && StepDownOffLedge(target))
+        return true;
 
     // Find jump shortcut
     if (ai->HasStrategy("follow jump", BotState::BOT_STATE_NON_COMBAT) && ai->AllowActivity())
@@ -1467,19 +2133,190 @@ bool MovementAction::Follow(Unit* target, float distance, float angle)
         }
     }
 
-    if (bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
-    {
-        Unit* currentTarget = sServerFacade.GetChaseTarget(bot);
-        // The Penqle generator intentionally keeps its requested angle and
-        // offset private. The public target/current-motion contract is enough
-        // to let the native generator continue; repeatedly replacing it while
-        // following causes jitter and defeats the follow dead-zone.
-        if (currentTarget && currentTarget->getObjectGuid() == target->getObjectGuid())
-            return false;
-    }
-
     mm.MoveFollow(target, distance, angle);
     return true;
+}
+
+bool MovementAction::HoldFollowOutsideKeepout(Unit* target, float distance, float angle)
+{
+    // Follow goal: the slot the native follow aims for (target position plus
+    // `distance` at `angle` off the target's facing), else the target itself.
+    // Bands and hysteresis: PlanCreatureAuraFollow (CreatureAuraKeepoutPolicy.h).
+    float const slotAngle = target->GetOrientation() + angle;
+    float const slotX = target->GetPositionX() + distance * cos(slotAngle);
+    float const slotY = target->GetPositionY() + distance * sin(slotAngle);
+    return HoldOutsideKeepout(slotX, slotY, target->GetPositionX(), target->GetPositionY(),
+        keepoutFollowEngaged, FOLLOW_MOTION_TYPE);
+}
+
+bool MovementAction::HoldChaseOutsideKeepout(WorldObject* target, float distance)
+{
+    // Chase goal: `distance` from the target toward the bot (the target for a
+    // melee chase). Without this a melee chase never met the keep-out: the
+    // hazard end-point check below in ChaseTo looks at a point `distance`
+    // toward the target from the bot (the bot's own spot for melee), finds no
+    // hazard there and hands the move to the core chase, which runs into
+    // melee contact with the creature - inside its pulse (Maraudon live test
+    // 2026-10-13: a warrior on "reach melee" stood 2-4 yd from a sludge).
+    // Tanks pick up and hold mobs: their chase is never held.
+    // Not for the rows that give tanks no pass (Living Poison): HoldOutsideKeepout
+    // skips only the exempt rows for a tank.
+    bool const tankChase = PlayerbotAI::IsTank(bot);
+    if (tankChase && !CreatureAuraMapHasNonTankExemptRow(bot->GetMapId()))
+    {
+        keepoutChaseEngaged = ObjectGuid();
+        keepoutChaseHoldTarget = ObjectGuid();
+        return false;
+    }
+    float gx = 0.0f, gy = 0.0f;
+    CreatureAuraChaseGoal(bot->GetPositionX(), bot->GetPositionY(),
+        target->GetPositionX(), target->GetPositionY(), distance, gx, gy);
+    // The target itself is planned against first: the cached 15 yd list
+    // does not see a sludge chased from farther away until the bot is almost
+    // in its pulse.
+    Unit* const targetUnit = target->ToUnit();
+    if (!HoldOutsideKeepout(gx, gy, gx, gy, keepoutChaseEngaged, CHASE_MOTION_TYPE, targetUnit, tankChase))
+    {
+        keepoutChaseHoldTarget = ObjectGuid();
+        return false;
+    }
+
+    // Bounded hold: holding outside a ring because the target is inside is
+    // no headway. After a few seconds on the same hostile current target the
+    // bot sets it aside and picks another (owner decision 2026-10-13), also
+    // in group dungeons where the reach give-up is off, so a self-picked
+    // sludge is not kited forever. A player's attack order keeps the hold.
+    uint32 const nowMs = WorldTimer::getMSTime();
+    ObjectGuid const targetGuid = target->GetObjectGuid();
+    // The timer starts over for a new target and after a pause in the hold
+    // (combat ended mid-hold): a later hold on the same mob must not set it
+    // aside on its first tick.
+    if (CreatureAuraChaseHoldRestarts(keepoutChaseHoldTarget == targetGuid, nowMs - keepoutChaseHoldLastMs))
+    {
+        keepoutChaseHoldTarget = targetGuid;
+        keepoutChaseHoldSinceMs = nowMs;
+    }
+    keepoutChaseHoldLastMs = nowMs;
+    bool const hostileCurrentTarget = targetUnit && targetUnit == AI_VALUE(Unit*, "current target") &&
+        !sServerFacade.IsFriendlyTo(bot, targetUnit);
+    bool const ordered = targetGuid == AI_VALUE(ObjectGuid, "explicit attack target");
+    if (CreatureAuraSetAsideTarget(hostileCurrentTarget, ordered, nowMs - keepoutChaseHoldSinceMs))
+    {
+        // Its own book, read by IgnoreTarget and by the picks that bypass
+        // the attackers list (the tank's victim, raid marks): all of them
+        // refuse the target until the set-aside runs out.
+        context->GetValue<std::map<ObjectGuid, uint32>&>("keepout set aside")->Get()[targetGuid] =
+            nowMs + kCreatureAuraSetAsideMs;
+        context->GetValue<ObjectGuid>("attack target")->Set(ObjectGuid());
+        context->GetValue<Unit*>("current target")->Set(nullptr);
+        bot->AttackStop();
+        // Cached picks would hand the target back within the cache window.
+        context->GetValue<std::list<ObjectGuid>>("attackers")->Reset();
+        context->GetValue<std::list<ObjectGuid>>("attackers", 1)->Reset();
+        context->GetValue<std::list<ObjectGuid>>("possible attack targets")->Reset();
+        context->GetValue<Unit*>("dps target")->Reset();
+        context->GetValue<Unit*>("dps aoe target")->Reset();
+        context->GetValue<Unit*>("tank target")->Reset();
+        context->GetValue<bool>("has attackers")->Reset();
+        keepoutChaseHoldTarget = ObjectGuid();
+        ai->TellDebug(GetMaster(), "Setting aside " + std::string(target->GetName()) +
+            " - it stands in a creature aura keep-out", "debug move");
+        // Once per set-aside (at most one per 3 s hold), never per tick: the
+        // per-bot action log (AiPlayerbot.EnableActionLog) and the detail
+        // server log, which carries the other [BOT CHASE] lines.
+        botdiag::BotActionLog::Write(ai, "KEEPOUT_SET_ASIDE", "target=%s entry=%u guid=0x%llx forMs=%u",
+            target->GetName(), target->GetEntry(), (unsigned long long)targetGuid.GetRawValue(),
+            kCreatureAuraSetAsideMs);
+        sLog.outDetail("[BOT CHASE] %s: set aside %s (entry %u) for %u ms - it stands in a creature aura keep-out",
+            bot->GetName(), target->GetName(), target->GetEntry(), kCreatureAuraSetAsideMs);
+    }
+    return true;
+}
+
+bool MovementAction::HoldOutsideKeepout(float gx, float gy, float ax, float ay, ObjectGuid& engaged,
+    MovementGeneratorType nativeType, Unit* first, bool tankChase)
+{
+    float const bx = bot->GetPositionX(), by = bot->GetPositionY();
+    ObjectGuid const explicitTarget = AI_VALUE(ObjectGuid, "explicit attack target");
+    MotionMaster& mm = *bot->GetMotionMaster();
+    auto stopNative = [&mm, nativeType]()
+    {
+        // Only the native follow or chase is stopped: the hold and back-off
+        // moves and the step-out's strafe are point moves that never head
+        // inward.
+        if (mm.GetCurrentMovementGeneratorType() == nativeType)
+        {
+            mm.Clear(false, true);
+            mm.MoveIdle();
+        }
+    };
+    std::list<ObjectGuid> candidates = AI_VALUE(std::list<ObjectGuid>, "possible triggers");
+    if (first && PossibleTriggersValue::KeepoutFor(first))
+    {
+        ObjectGuid const firstGuid = first->GetObjectGuid();
+        candidates.remove(firstGuid);
+        candidates.push_front(firstGuid);
+    }
+    for (ObjectGuid const& guid : candidates)
+    {
+        Unit* unit = ai->GetUnit(guid);
+        CreatureAuraKeepout const* row = PossibleTriggersValue::KeepoutFor(unit);
+        if (!CreatureAuraKeepoutApplies(true, row, true, true, guid == explicitTarget))
+            continue;
+        if (tankChase && CreatureAuraChaseExempt(*row, true))
+            continue; // a tank's chase is not held at this row
+        bool const wasEngaged = guid == engaged;
+        float const cx = unit->GetPositionX(), cy = unit->GetPositionY();
+        float hx = 0.0f, hy = 0.0f;
+        CreatureAuraFollowStep step = PlanCreatureAuraFollow(*row, wasEngaged, bx, by, gx, gy, cx, cy, hx, hy);
+        if (step == CreatureAuraFollowStep::Follow)
+            step = PlanCreatureAuraFollow(*row, wasEngaged, bx, by, ax, ay, cx, cy, hx, hy);
+        if (step == CreatureAuraFollowStep::Follow)
+            continue;
+        engaged = guid;
+        if (step == CreatureAuraFollowStep::BackOff || step == CreatureAuraFollowStep::Approach)
+        {
+            WorldPosition point(bot->GetMapId(), hx, hy, bot->GetPositionZ());
+            point.setZ(point.GetHeight());
+            if (MoveTo(point.GetMapId(), point.getX(), point.getY(), point.getZ()))
+                return true;
+        }
+        else if (step == CreatureAuraFollowStep::Hold && mm.GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE)
+        {
+            // A point move left over from before (e.g. an earlier move toward
+            // the master) that ends inside the hazard is stopped too; the
+            // hold and back-off moves end outside it and keep running.
+            LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
+            if (!lastMove.lastPath.empty())
+            {
+                WorldPosition const end = lastMove.lastPath.GetBack();
+                float const ex = end.getX() - cx, ey = end.getY() - cy;
+                float const hazard = CreatureAuraHazardRadius(*row);
+                if (ex * ex + ey * ey < hazard * hazard)
+                {
+                    lastMove.clear();
+                    ai->StopMoving();
+                }
+            }
+        }
+        // StepOut (the avoid-aoe step-out moves the bot), Hold, or no way to
+        // the point: stop rather than follow or chase into the pulse.
+        stopNative();
+        return true;
+    }
+    engaged = ObjectGuid();
+    return false;
+}
+
+bool MovementAction::EndPointInCreatureAuraKeepout(float x, float y, float z)
+{
+    if (!sPlayerbotAIConfig.avoidCreatureAuras)
+        return false;
+    // A tank in combat is exempt from the rows that give tanks a pass only.
+    bool const tankInCombat = PlayerbotAI::IsTank(bot) && bot->IsInCombat();
+    if (tankInCombat && !CreatureAuraMapHasNonTankExemptRow(bot->GetMapId()))
+        return false;
+    return PossibleTriggersValue::EndPointRinged(ai, x, y, z, AI_VALUE(Unit*, "current target"), tankInCombat);
 }
 
 WorldPosition CalculatePerpendicularPoint(const WorldPosition& A, const WorldPosition& B, float offset, bool left = true)
@@ -1512,6 +2349,13 @@ bool MovementAction::ChaseTo(WorldObject* obj, float distance, float angle)
         sLog.outDetail("[BOT CHASE] %s: IsSafe() blocked", bot->GetName());
         return false;
     }
+
+    // Creature aura keep-out: never chase into a listed creature's pulse.
+    // Before every chase branch below (the far/out-of-sight walk, the hazard
+    // end-point shift and the core chase fallback, which ends in melee
+    // contact with the target whatever hazard it stands in).
+    if (sPlayerbotAIConfig.avoidCreatureAuras && HoldChaseOutsideKeepout(obj, distance))
+        return true;
 
 
     if (ai->HasStrategy("behind", BotState::BOT_STATE_COMBAT))
@@ -1585,6 +2429,7 @@ bool MovementAction::ChaseTo(WorldObject* obj, float distance, float angle)
         {
             float distance = botPosition.GetPathLength(path);
             mm.Clear(false, true);
+            mm.MoveIdle(); // A raw spline does not restore the default movement generator.
 
             std::vector<G3D::Vector3> pointsArray = WorldPosition().toPointsArray(path);
             Movement::MoveSplineInit init(*bot, "ChaseTo");
@@ -1750,11 +2595,23 @@ bool MovementAction::Flee(Unit *target)
     if (!sPlayerbotAIConfig.fleeingEnabled)
         return false;
 
+    LastMovement& fleeMovement = AI_VALUE(LastMovement&, "last movement");
+    uint32 const nowMs = WorldTimer::getMSTime();
+    fleeMovement.fleeFailures.Observe(target->GetObjectGuid().GetRawValue(),
+        target->GetMapId(), sServerFacade.getDistance2d(bot, target), nowMs, bot->movespline->GetId());
+
     if (!ai->CanMove())
     {
+        fleeMovement.fleeFailures.Clear();
         ai->TellError(GetMaster(), "I am stuck while fleeing");
         return false;
     }
+
+    // (#903: melee-range repositioning is not a hazard escape - stepping
+    // out mid-cast cancels the bar. Finish the cast first; the trigger
+    // re-fires next tick. The already-running flee above keeps running.)
+    if (ai::MoveBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true), false))
+        return false;
 
     HostileReference* ref = sServerFacade.GetThreatManager(target).getCurrentVictim();
     const bool isTarget = ref && ref->getTarget() == bot;
@@ -1888,6 +2745,10 @@ bool MovementAction::Flee(Unit *target)
 
     if (!ai->HasRealPlayerMaster() && !ai->IsRealPlayer(target))
     {
+        // A flee toward a group member is already under way: keep it.
+        if (succeeded)
+            return true;
+
         bool fullDistance = false;
         if (target->IsPlayer())
             fullDistance = true;
@@ -1896,16 +2757,12 @@ bool MovementAction::Flee(Unit *target)
 
         float distance = fullDistance ? (ai->GetRange("flee") * 2) : ai->GetRange("flee");
 
-        MotionMaster* mm = bot->GetMotionMaster();
-
-        if (mm->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
-        {
-            if (sServerFacade.GetChaseTarget(bot) == target && !bot->IsStopped())
-                return true;
-        }
-
-        mm->MoveChase(target, distance, WorldPosition(bot).GetAngleTo(target));
-        return true;
+        // Not a MoveChase at flee range: the core chase generator holds
+        // position while a standing target is within 1.4x the offset, so that
+        // flee "succeeded" every tick without moving. A checked point step
+        // moves for real, and fails when there is nowhere to go so the
+        // engine falls back to fighting.
+        return FleeStepAway(target, distance);
     }
 
     // Generate a position to flee
@@ -1950,37 +2807,117 @@ bool MovementAction::Flee(Unit *target)
         }
 
         float rx, ry, rz;
-        if (!manager.CalculateDestination(&rx, &ry, &rz))
+        if (!manager.CalculateDestination(&rx, &ry, &rz, &fleeMovement.fleeFailures, nowMs))
         {
             ai->TellError(GetMaster(), "Nowhere to flee");
             return false;
         }
 
+        float const fleeHeading = WorldPosition(bot).GetAngleTo(
+            WorldPosition(target->GetMapId(), rx, ry, rz));
+        float const fleeStartDistance = sServerFacade.getDistance2d(bot, target);
         if(MoveTo(target->GetMapId(), rx, ry, rz))
         {
-            LastMovement& lm = AI_VALUE(LastMovement&, "last movement");
-            // Count successive flee dispatches so FleeMultiplier can detect a flee loop and
-            // hand priority back to spellcasting. A dispatch within the return window of the
-            // previous one is "subsequent" (loop); otherwise it's a fresh flee episode.
-            if (lm.lastFleeAttempt && (now - lm.lastFleeAttempt) <= (time_t)(sPlayerbotAIConfig.returnDelay / 1000))
-                lm.fleeCount++;
-            else
-                lm.fleeCount = 1;
-            lm.lastFleeAttempt = now;
-            lm.lastFlee = time(0);
-            // Donor "recently flee info": remember the dispatched destination
-            // heading so the next flee/spread steps elsewhere. Absolute world
-            // heading, same frame as FleeManager's ring and RaidSpreadAction.
-            lm.lastFleeAngles[1] = lm.lastFleeAngles[0];
-            lm.lastFleeAngles[0] = WorldPosition(bot).GetAngleTo(WorldPosition(target->GetMapId(), rx, ry, rz));
-            if (lm.lastFleeAngleCount < 2)
-                ++lm.lastFleeAngleCount;
-            lm.lastSpreadStepMs = WorldTimer::getMSTime();
+            NoteFleeDispatch(target, fleeHeading, fleeStartDistance, nowMs);
             succeeded = true;
         }
     }
 
     return succeeded;
+}
+
+void MovementAction::NoteFleeDispatch(Unit* target, float heading, float startDistance, uint32 nowMs)
+{
+    LastMovement& lm = AI_VALUE(LastMovement&, "last movement");
+    time_t const now = time(0);
+    // Count successive flee dispatches so FleeMultiplier can detect a flee loop and
+    // hand priority back to spellcasting. A dispatch within the return window of the
+    // previous one is "subsequent" (loop); otherwise it's a fresh flee episode.
+    if (lm.lastFleeAttempt && (now - lm.lastFleeAttempt) <= (time_t)(sPlayerbotAIConfig.returnDelay / 1000))
+        lm.fleeCount++;
+    else
+        lm.fleeCount = 1;
+    lm.lastFleeAttempt = now;
+    lm.lastFlee = now;
+    lm.fleeFailures.BeginAttempt(target->GetObjectGuid().GetRawValue(),
+        target->GetMapId(), heading, startDistance, nowMs, bot->movespline->GetId());
+    lm.lastSpreadStepMs = WorldTimer::getMSTime();
+}
+
+bool MovementAction::FleeStepAway(Unit* target, float distance)
+{
+    LastMovement& lm = AI_VALUE(LastMovement&, "last movement");
+    uint32 const nowMs = WorldTimer::getMSTime();
+    // A search that just found nothing is not repeated every tick.
+    if (PoolFleeSearchBackedOff(lm.fleeNoSpotMs, nowMs))
+        return false;
+
+    WorldPosition const botPos(bot);
+    float const startDistance = sServerFacade.getDistance2d(bot, target);
+    float const away = target->GetAngle(bot);
+
+    // Unpulled hostile mobs one step could wake: one cached "possible
+    // targets" read, filtered once, not a scan per candidate.
+    struct Sleeper { Unit* unit; float radius; float toBot; };
+    std::vector<Sleeper> sleepers;
+    std::list<ObjectGuid> const& possibleTargets = AI_VALUE(std::list<ObjectGuid>, "possible targets");
+    for (ObjectGuid const& guid : possibleTargets)
+    {
+        Unit* unit = ai->GetUnit(guid);
+        if (!unit || unit == target || !sServerFacade.IsAlive(unit) || unit->IsInCombat())
+            continue;
+        Creature* creature = unit->ToCreature();
+        if (!creature || !unit->IsHostileTo(bot))
+            continue;
+        float const radius = creature->GetAttackDistance(bot);
+        float const toBot = sServerFacade.getDistance2d(unit, bot);
+        if (radius <= 0.0f || !PoolFleeMobInReach(toBot, radius, distance))
+            continue;
+        sleepers.push_back({ unit, radius, toBot });
+    }
+
+    float offsets[kPoolFleeHeadingCount];
+    int const count = PoolFleeHeadingOffsets(offsets);
+    for (int i = 0; i < count; ++i)
+    {
+        float const heading = away + offsets[i];
+        // Headings that just failed to gain distance are skipped; when every
+        // one has failed the bot fights instead of fleeing again.
+        if (!lm.fleeFailures.IsHeadingFree(heading, nowMs))
+            continue;
+
+        WorldPosition cand = botPos + WorldPosition(0, distance * cos(heading), distance * sin(heading), 1.0f);
+        cand.setZ(cand.GetHeight());
+        if (cand.isInWater())
+            continue;
+
+        bool wakesMob = false;
+        for (Sleeper const& sleeper : sleepers)
+        {
+            if (PoolFleeLandingWakesMob(sServerFacade.getDistance2d(sleeper.unit, cand.getX(), cand.getY()),
+                sleeper.toBot, sleeper.radius))
+            {
+                wakesMob = true;
+                break;
+            }
+        }
+        if (wakesMob)
+            continue;
+
+        if (!bot->IsWithinLOS(cand.getX(), cand.getY(), cand.getZ() + bot->GetCollisionHeight()))
+            continue;
+        if (!botPos.canPathTo(cand, bot))
+            continue;
+        if (!MoveTo(bot->GetMapId(), cand.getX(), cand.getY(), cand.getZ()))
+            continue;
+
+        NoteFleeDispatch(target, heading, startDistance, nowMs);
+        lm.fleeNoSpotMs = 0;
+        return true;
+    }
+
+    lm.fleeNoSpotMs = nowMs ? nowMs : 1;
+    return false;
 }
 
 void MovementAction::ClearIdleState()
@@ -2022,6 +2959,171 @@ bool MovementAction::IsHazardNearPosition(const WorldPosition& position, HazardP
     }
 
     return false;
+}
+
+bool MovementAction::StepDownOffLedge(Unit* target)
+{
+    // Dungeon navmeshes have islands: raised daises and ledges the mesh does
+    // not link to the floor (Uldaman's Hall of the Keepers has 17, about 4 yd
+    // up). A bot summoned or teleported onto one gets only a partial path to
+    // its target that ends about a yard from it; the core's chase and follow
+    // stand still on such a path in sight of the target and the reach waited
+    // out the whole fight (Uldaman VM run 2026-10-12, the party on the dais
+    // above the Rockchewer). Owner decision 2026-10-12: in dungeons only, the
+    // bot steps down off the ledge like a player does. Nothing here runs
+    // outside instances, and the probe is paced by ledgeStepDown so no bot
+    // searches on every tick.
+    if (!target || !target->IsInWorld() || target->GetMapId() != bot->GetMapId())
+        return false;
+
+    Map* map = bot->GetMap();
+    if (!map || !map->IsDungeon() || bot->GetTransport() || bot->IsTaxiFlying() || bot->IsFlying() || bot->IsInWater())
+        return false;
+
+    if (!ai->CanMove() || !ai->IsSafe(target) || bot->IsNonMeleeSpellCasted(true, false, true))
+        return false;
+
+    // Not while something is hitting the bot: stepping away would drag the
+    // fight off the tank, and a creature in melee contact is reachable anyway.
+    bool beingHit = false;
+    for (Unit* attacker : bot->GetAttackers())
+    {
+        if (attacker && attacker->IsAlive() && attacker->CanReachWithMeleeAutoAttack(bot))
+        {
+            beingHit = true;
+            break;
+        }
+    }
+    if (beingHit)
+        return false;
+
+    uint32 const nowMs = WorldTimer::getMSTime();
+    if (!ledgeStepDown.Due(nowMs, bot->GetPositionX(), bot->GetPositionY(), target->GetObjectGuid().GetRawValue()))
+        return false;
+
+    LedgePoint from;
+    from.x = bot->GetPositionX();
+    from.y = bot->GetPositionY();
+    from.z = bot->GetPositionZ();
+    LedgePoint goal;
+    goal.x = target->GetPositionX();
+    goal.y = target->GetPositionY();
+    goal.z = target->GetPositionZ();
+
+    PathFinder path(bot);
+    path.calculate(goal.x, goal.y, goal.z, false);
+    bool const incomplete = (path.getPathType() & PATHFIND_INCOMPLETE) != 0;
+    float partialEndDistance = 0.0f;
+    Movement::PointsArray const& points = path.getPath();
+    if (!points.empty())
+    {
+        // Horizontal only: the partial end sits on the navmesh, which can be a
+        // yard above or below the bot's feet on stairs or slopes, and that Z
+        // gap alone must not read as headway (or its absence).
+        float const dx = points.back().x - from.x;
+        float const dy = points.back().y - from.y;
+        partialEndDistance = std::sqrt(dx * dx + dy * dy);
+    }
+
+    bool const stuck = UseLedgeStepDown(true, incomplete, partialEndDistance, beingHit);
+    if (!stuck)
+    {
+        ledgeStepDown.Probed(nowMs, LedgeProbeResult::NotStuck);
+        return false;
+    }
+
+    auto const groundAt = [map](float x, float y, float z, float& outZ)
+    {
+        if (!MaNGOS::IsValidMapCoord(x, y, z))
+            return false;
+        float const height = map->GetHeight(x, y, z + 0.5f, true, kLedgeStepMaxDrop + 2.0f);
+        if (height <= INVALID_HEIGHT)
+            return false;
+        outZ = height;
+        return true;
+    };
+    // No lava or slime under the landing point (GetHeight returns the bed
+    // under a liquid, which can sit inside the height band) and no AoE hazard.
+    auto const landingSafe = [this, map](LedgePoint const& point)
+    {
+        GridMapLiquidData liquid{};
+        // Half a yard above the bed: a ray from exactly on it can miss its own floor (t > 0, WorldModel.cpp:75; cf. GridMap.cpp:1212).
+        if (map->GetTerrain()->getLiquidStatus(point.x, point.y, point.z + 0.5f, MAP_ALL_LIQUIDS, &liquid) != LIQUID_MAP_NO_WATER &&
+            (liquid.type_flags & (MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME)))
+            return false;
+        return !IsHazardNearPosition(WorldPosition(bot->GetMapId(), point.x, point.y, point.z));
+    };
+    // Each leg is checked low (half a yard up, so a railing or a low wall
+    // blocks it) and at eye height (so a wall or an overhang does).
+    float const eyeHeight = bot->GetCollisionHeight();
+    auto const clearLine = [map, eyeHeight](LedgePoint const& a, LedgePoint const& b)
+    {
+        return map->isInLineOfSight(a.x, a.y, a.z + 0.5f, b.x, b.y, b.z + 0.5f, true) &&
+            map->isInLineOfSight(a.x, a.y, a.z + eyeHeight, b.x, b.y, b.z + eyeHeight, true);
+    };
+    auto const pathFromLanding = [this, &goal](LedgePoint const& point)
+    {
+        PathFinder probe(bot);
+        probe.calculate(Vector3(point.x, point.y, point.z), Vector3(goal.x, goal.y, goal.z), false);
+        LedgePathProbe result;
+        result.normal = probe.getPathType() == PATHFIND_NORMAL;
+        Movement::PointsArray const& steps = probe.getPath();
+        if (!steps.empty())
+        {
+            result.hasStart = true;
+            result.start.x = steps.front().x;
+            result.start.y = steps.front().y;
+            result.start.z = steps.front().z;
+        }
+        return result;
+    };
+
+    LedgeStepDownChoice const choice = SelectLedgeStepDownPoint(from, goal, groundAt, landingSafe, clearLine, pathFromLanding);
+    ledgeStepDown.Probed(nowMs, choice.valid ? LedgeProbeResult::Stepped : LedgeProbeResult::NoFloor);
+    if (!choice.valid)
+    {
+        ai->TellDebug(GetMaster(), "Stuck on a ledge above " + std::string(target->GetName()) + " - no floor to step down to", "debug move");
+        return false;
+    }
+
+    bot->HandleEmoteState(0);
+    if (bot->GetStandState() != UNIT_STAND_STATE_STAND)
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+
+    // A raw two-leg spline, no navmesh (it has no link off the island, so a
+    // path-finding move would stop at the edge again): flat out over the edge
+    // at the bot's own height, then down to the floor. A straight line from
+    // foot to foot would cut through the platform itself. path[0] is the
+    // current position, as the core's spline expects. Both legs must have
+    // length: Launch overwrites legs[0] with the live position, so a bot that
+    // drifted onto the edge (or an edge sampled at the feet) would launch a
+    // zero-length spline and freeze in MoveIdle.
+    float const ex = choice.edge.x - from.x;
+    float const ey = choice.edge.y - from.y;
+    float const lx = choice.point.x - choice.edge.x;
+    float const ly = choice.point.y - choice.edge.y;
+    float const lz = choice.point.z - choice.edge.z;
+    if (ex * ex + ey * ey < 0.01f || lx * lx + ly * ly + lz * lz < 0.01f)
+        return false;
+    std::vector<G3D::Vector3> legs;
+    legs.push_back(G3D::Vector3(from.x, from.y, from.z));
+    legs.push_back(G3D::Vector3(choice.edge.x, choice.edge.y, choice.edge.z));
+    legs.push_back(G3D::Vector3(choice.point.x, choice.point.y, choice.point.z));
+
+    MotionMaster& mm = *bot->GetMotionMaster();
+    mm.Clear(false, true);
+    mm.MoveIdle(); // A raw spline does not restore the default movement generator.
+    Movement::MoveSplineInit init(*bot, "StepDownOffLedge");
+    init.MovebyPath(legs);
+    init.SetWalk(false);
+    init.Launch();
+
+    WaitForReach(std::sqrt(ex * ex + ey * ey) + std::sqrt(lx * lx + ly * ly + lz * lz));
+
+    ai->TellDebug(GetMaster(), "Stepping down off a ledge towards " + std::string(target->GetName()), "debug move");
+    sPlayerbotAIConfig.logEvent(ai, "LedgeStepDown", target->GetName(),
+        "drop=" + std::to_string((int)(from.z - choice.point.z)) + "|map=" + std::to_string(bot->GetMapId()));
+    return true;
 }
 
 bool MovementAction::GeneratePathAvoidingHazards(std::vector<WorldPosition>& movePath)
@@ -2122,6 +3224,7 @@ bool MovementAction::GeneratePathAvoidingHazards(std::vector<WorldPosition>& mov
         else
         {
             firstPoint = false;
+            movePath[i] = pathPoint;
             previousPosition.x = pathPoint.getX();
             previousPosition.y = pathPoint.getY();
             previousPosition.z = pathPoint.getZ();
@@ -2152,6 +3255,369 @@ bool MovementAction::GeneratePathAvoidingHazards(std::vector<WorldPosition>& mov
 bool FleeAction::Execute(Event& event)
 {
     return Flee(AI_VALUE(Unit*, "current target"));
+}
+
+bool AvoidAoeAction::isUseful()
+{
+    if (!MovementAction::isUseful())
+        return false;
+    float radius = 0.0f;
+    WorldPosition center;
+    keepoutSource = ObjectGuid();
+    keepoutRow = nullptr;
+    // Cheap sensor first (dynobj scan the value already caches); the GO
+    // and trigger scans run only when no aura already marks the bot.
+    if (AvoidAuraWithDynamicObj(radius, center))
+        return true;
+    if (AvoidDamagingTrap(radius, center))
+        return true;
+    if (!AvoidTriggerNpc(radius, center))
+        return false;
+    // A keep-out step-out that just found no landing spot backs off briefly.
+    if (!keepoutSource.IsEmpty() && WorldTimer::getMSTime() < keepoutNoLandingUntilMs)
+        return false;
+    return true;
+}
+
+bool AvoidAoeAction::Execute(Event& event)
+{
+    (void)event;
+    float radius = 0.0f;
+    WorldPosition center;
+    keepoutSource = ObjectGuid();
+    keepoutRow = nullptr;
+    if (!AvoidAuraWithDynamicObj(radius, center) &&
+        !AvoidDamagingTrap(radius, center) &&
+        !AvoidTriggerNpc(radius, center))
+        return false;
+    // A pet left on the boss keeps biting inside the spin: pull it out with
+    // the bot when it stands inside the hazard. Packet only, no stance
+    // change (the CC-discipline passive gate in CanPetAttack is untouched).
+    RecallPetFromHazard(radius, center);
+    bool const moved = StrafeToSafety(center, radius);
+    if (!moved && !keepoutSource.IsEmpty() && keepoutRow)
+        keepoutNoLandingUntilMs = CreatureAuraNoLandingUntilMs(*keepoutRow, WorldTimer::getMSTime());
+    return moved;
+}
+
+void AvoidAoeAction::RecallPetFromHazard(float radius, const WorldPosition& center)
+{
+    Pet* pet = bot->GetPet();
+    if (!pet || !pet->IsInWorld() || !sServerFacade.IsAlive(pet))
+        return;
+    // Only when the pet itself stands inside the hazard: no packet spam
+    // when it already waits outside with the bot.
+    WorldPosition petPos(pet);
+    if (petPos.distance(center) > radius)
+        return;
+    // COMMAND_FOLLOW, the same packet ChooseTargetActions sends when the
+    // fight ends: the pet breaks off and trails the stepping-out bot.
+    // No stance change, so an explicitly passive pet stays passive and the
+    // autonomous stance pin re-sends the attack once the bot re-engages.
+    ObjectGuid const& petGuid = pet->GetObjectGuid();
+    ObjectGuid const targetGuid;
+    uint8 const flag = ACT_COMMAND;
+    uint32 const spellId = COMMAND_FOLLOW;
+    uint32 const command = (uint32(flag) << 24) | spellId;
+    WorldPacket data(CMSG_PET_ACTION);
+    data << petGuid;
+    data << command;
+    data << targetGuid;
+    bot->GetSession()->HandlePetAction(data);
+}
+
+bool AvoidAoeAction::AvoidAuraWithDynamicObj(float& outRadius, WorldPosition& outCenter)
+{
+    if (!AI_VALUE2(bool, "has area debuff", "self target"))
+        return false;
+    // The value checks "self target"; re-scan the cached dynobj list for
+    // the aura actually affecting the bot to recover its radius.
+    std::list<ObjectGuid> const& dynobjs = AI_VALUE(std::list<ObjectGuid>, "nearest dynamic objects no los");
+    for (ObjectGuid const& guid : dynobjs)
+    {
+        DynamicObject* dyn = bot->GetMap()->GetDynamicObject(guid);
+        if (!dyn || !dyn->IsInWorld())
+            continue;
+        SpellEntry const* spellProto = sServerFacade.LookupSpellInfo(dyn->GetSpellId());
+        if (!spellProto || spellProto->IsPositiveEffect(dyn->GetEffIndex()))
+            continue;
+        if (!dyn->IsAffecting(bot))
+            continue;
+        float radius = dyn->GetRadius();
+        if (!IsAvoidableAoeRadius(radius))
+            continue;
+        if (bot->GetDistance(dyn) > radius)
+            continue;
+        outRadius = radius;
+        outCenter = WorldPosition(dyn->GetMapId(), dyn->GetPositionX(), dyn->GetPositionY(), dyn->GetPositionZ());
+        return true;
+    }
+    return false;
+}
+
+bool AvoidAoeAction::AvoidDamagingTrap(float& outRadius, WorldPosition& outCenter)
+{
+    std::list<ObjectGuid> const& traps = AI_VALUE(std::list<ObjectGuid>, "nearest damaging traps");
+    for (ObjectGuid const& guid : traps)
+    {
+        GameObject* go = ai->GetGameObject(guid);
+        if (!go || !go->IsInWorld())
+            continue;
+        GameObjectInfo const* goInfo = go->GetGOInfo();
+        if (!goInfo || goInfo->type != GAMEOBJECT_TYPE_TRAP)
+            continue;
+        // 1.12 trap GOs carry an activation radius (no diameter field);
+        // same shape as the environmental-trap react radius nearby.
+        float radius = (float)goInfo->trap.radius + go->GetCombatReach();
+        if (!IsAvoidableAoeRadius(radius))
+            continue;
+        if (bot->GetDistance(go) > radius)
+            continue;
+        outRadius = radius;
+        outCenter = WorldPosition(go->GetMapId(), go->GetPositionX(), go->GetPositionY(), go->GetPositionZ());
+        return true;
+    }
+    return false;
+}
+
+bool AvoidAoeAction::AvoidTriggerNpc(float& outRadius, WorldPosition& outCenter)
+{
+    std::list<ObjectGuid> const& triggers = AI_VALUE(std::list<ObjectGuid>, "possible triggers");
+    ObjectGuid const explicitTarget = AI_VALUE(ObjectGuid, "explicit attack target");
+    for (ObjectGuid const& guid : triggers)
+    {
+        Unit* unit = ai->GetUnit(guid);
+        if (!unit || !unit->IsInWorld() || !sServerFacade.IsAlive(unit))
+            continue;
+        // Listed permanent-aura creature (AiPlayerbot.AvoidCreatureAuras):
+        // keep out to the row's keep-out radius, wider than the pulse, for
+        // every role. The creature the player ordered this bot to attack is
+        // left alone (the order wins).
+        if (CreatureAuraKeepout const* row = PossibleTriggersValue::KeepoutFor(unit))
+        {
+            if (!CreatureAuraKeepoutApplies(true, row, true, true, guid == explicitTarget))
+                continue;
+            // A tank in combat may stand in the ring to hold its mobs.
+            if (CreatureAuraCombatExempt(*row, PlayerbotAI::IsTank(bot), bot->IsInCombat()))
+                continue;
+            // Centre to centre, the same measure as the movement hazard.
+            if (!InsideCreatureAuraKeepout(*row, WorldPosition(bot).distance(WorldPosition(unit))))
+                continue;
+            keepoutSource = guid;
+            keepoutRow = row;
+            outRadius = row->keepoutRadius;
+            outCenter = WorldPosition(unit->GetMapId(), unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ());
+            return true;
+        }
+        // Selectable spinning bosses (Herod 8989) count; a selectable mob
+        // with a permanent burning aura (Fire Shield II 184) does not — its
+        // school-damage pulse keeps the invisible-emitter-only rule, or
+        // melee would step out forever and never fight it.
+        bool const selectable = !unit->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE);
+        Unit::AuraList const& periodic = unit->GetAurasByType(SPELL_AURA_PERIODIC_TRIGGER_SPELL);
+        for (Unit::AuraList::const_iterator it = periodic.begin(); it != periodic.end(); ++it)
+        {
+            Aura* aura = *it;
+            if (!aura)
+                continue;
+            SpellEntry const* spellProto = aura->GetSpellProto();
+            if (!spellProto)
+                continue;
+            SpellEntry const* triggerProto = sServerFacade.LookupSpellInfo(
+                spellProto->EffectTriggerSpell[aura->GetEffIndex()]);
+            if (!triggerProto)
+                continue;
+            for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                // School damage lists invisible emitters only; self-centred
+                // weapon-damage spins (Herod's Whirlwind 8989 -> 15578) list
+                // anyone. The radius gate and the range test below are
+                // unchanged.
+                if (!TriggerSpellMarksSpinHazard((int)triggerProto->Effect[i],
+                    (int)triggerProto->EffectImplicitTargetA[i], (int)triggerProto->EffectImplicitTargetB[i], selectable))
+                    continue;
+                SpellRadiusEntry const* radiusEntry = sSpellRadiusStore.LookupEntry(triggerProto->EffectRadiusIndex[i]);
+                float radius = radiusEntry ? radiusEntry->Radius : 0.0f;
+                if (!IsAvoidableAoeRadius(radius))
+                    continue;
+                if (bot->GetDistance(unit) > radius)
+                    continue;
+                outRadius = radius;
+                outCenter = WorldPosition(unit->GetMapId(), unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ());
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool AvoidAoeAction::StrafeToSafety(const WorldPosition& hazardCenter, float radius)
+{
+    Unit* target = AI_VALUE(Unit*, "current target");
+    float const step = AoeEscapeStep(radius, sPlayerbotAIConfig.fleeDistance);
+    // Ordered offsets (policy): strafes off the target first, straight
+    // lines after; straight landings must stay in the combat band.
+    float offsets[5] = {};
+    int count = 0;
+    bool const melee = ai->IsMelee(bot);
+    bool tanking = false;
+    if (target && target->GetVictim() == bot &&
+        !target->HasAuraType(SPELL_AURA_MOD_ROOT) && !target->HasAuraType(SPELL_AURA_MOD_STUN))
+        tanking = true;
+    if (!target)
+    {
+        // Donor shape: with no target a single away-from-hazard candidate.
+        // The full anchored list would step into the zone (the ranged PI
+        // slot heads away+PI = toward the center, and open-ground LOS/path
+        // lets it through with no band check to reject it).
+        offsets[0] = 0.0f;
+        count = 1;
+    }
+    else if (melee)
+        count = MeleeAoeCandidates(tanking, offsets);
+    else
+        count = RangedAoeCandidates(offsets);
+    float const angleFromHazard = hazardCenter.GetAngleTo(WorldPosition(bot));
+    // No target (opened on the bot, target died mid-tick): the single
+    // candidate above heads straight away from the hazard — never toward it.
+    float const angleToTarget = target ? bot->GetAngle(target) : angleFromHazard;
+    const WorldPosition botPos(bot);
+    LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
+    uint32 const nowMs = WorldTimer::getMSTime();
+    lastMove.fleeFailures.Observe(target ? target->GetObjectGuid().GetRawValue() : 0,
+        bot->GetMapId(), target ? sServerFacade.getDistance2d(bot, target) : 0.0f, nowMs, bot->movespline->GetId());
+    // Unpulled-hostile guard (mirrors the FindStep aggro sense used by the
+    // bomb/spread step-outs: FindStep itself lives in DungeonActions.cpp):
+    // one cached "possible targets" read, no scan per candidate.
+    std::list<ObjectGuid> const& possibleTargets = AI_VALUE(std::list<ObjectGuid>, "possible targets");
+    // Creature aura keep-out: listed creatures other than the one stepped
+    // away from (sludges stand in groups; in the Maraudon live test four
+    // pulled at once). A landing clears their keep-out, or on the second
+    // pass at least their pulse, so a step-out never lands in another one.
+    struct OtherKeepout { WorldPosition centre; CreatureAuraKeepout const* row; };
+    std::vector<OtherKeepout> otherKeepouts;
+    if (sPlayerbotAIConfig.avoidCreatureAuras)
+    {
+        ObjectGuid const explicitTarget = AI_VALUE(ObjectGuid, "explicit attack target");
+        for (ObjectGuid const& guid : AI_VALUE(std::list<ObjectGuid>, "possible triggers"))
+        {
+            if (guid == keepoutSource)
+                continue;
+            Unit* unit = ai->GetUnit(guid);
+            CreatureAuraKeepout const* row = PossibleTriggersValue::KeepoutFor(unit);
+            if (!CreatureAuraKeepoutApplies(true, row, true, true, guid == explicitTarget))
+                continue;
+            otherKeepouts.push_back({ WorldPosition(unit), row });
+        }
+    }
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        bool const vetoSecondPass = (pass == 1);
+        for (int i = 0; i < count; ++i)
+        {
+            // Last slot anchors away-from-hazard; the rest anchor the target.
+            // Strict = the toward-target re-approach guard only (melee index
+            // 2, ranged toward/away/hazard slots): strafes and tank-fallback
+            // escapes never band-reject, so a tank can always leave a zone
+            // wider than the cast band.
+            bool const hazardAnchored = (i == count - 1) && count > 3;
+            float heading = hazardAnchored ? angleFromHazard : angleToTarget + offsets[i];
+            bool strict = melee ? (i == 2)
+                : (offsets[i] == 0.0f || offsets[i] > 3.14f || hazardAnchored);
+            WorldPosition cand = botPos + WorldPosition(0, step * cos(heading), step * sin(heading), 1.0f);
+            cand.setZ(cand.GetHeight());
+            if (target && strict)
+            {
+                // Reach-relative (donor shape: raw target reach, not the
+                // melee-range helper with its +1.33/min-5.0 padding) — on
+                // large mobs/bosses the reach is 10-20 yd, and raw center
+                // distance would fail every melee landing.
+                float landing = sqrtf((cand.getX() - target->GetPositionX()) * (cand.getX() - target->GetPositionX()) +
+                    (cand.getY() - target->GetPositionY()) * (cand.getY() - target->GetPositionY()));
+                float const distFromReach = std::max(0.0f, landing - target->GetCombatReach());
+                if (melee)
+                {
+                    if (!MeleeAoeLandingInRange(distFromReach, sPlayerbotAIConfig.tooCloseDistance))
+                        continue;
+                }
+                else if (!RangedAoeLandingInRange(distFromReach, sPlayerbotAIConfig.tooCloseDistance, sPlayerbotAIConfig.spellDistance))
+                    continue;
+            }
+            if (!vetoSecondPass)
+            {
+                float checkHeading = botPos.GetAngleTo(cand);
+                if (!lastMove.fleeFailures.IsHeadingFree(checkHeading, nowMs))
+                    continue;
+            }
+            // Keep-out step-out: the landing must clear the keep-out circle
+            // (centre measure), or the next tick steps out again.
+            if (!keepoutSource.IsEmpty() && cand.distance(hazardCenter) <= radius)
+                continue;
+            bool inOtherKeepout = false;
+            for (OtherKeepout const& other : otherKeepouts)
+            {
+                if (cand.distance(other.centre) <= CreatureAuraLandingClearance(*other.row, vetoSecondPass))
+                {
+                    inOtherKeepout = true;
+                    break;
+                }
+            }
+            if (inOtherKeepout)
+                continue;
+            WorldPosition out = cand;
+            if (!bot->IsWithinLOS(out.getX(), out.getY(), out.getZ() + bot->GetCollisionHeight()))
+                continue;
+            if (!botPos.canPathTo(out, bot))
+                continue;
+            bool nearUnpulled = false;
+            for (ObjectGuid const& guid : possibleTargets)
+            {
+                Unit* unit = ai->GetUnit(guid);
+                if (!unit || !sServerFacade.IsAlive(unit) || unit == bot)
+                    continue;
+                if (unit->GetVictim())
+                    continue;
+                // The idle keep-out creature being stepped away from is not an
+                // unpulled hostile to avoid: every landing is within its aggro
+                // range. Other unpulled hostiles still count.
+                if (guid == keepoutSource)
+                    continue;
+                if (sServerFacade.IsDistanceLessThan(sServerFacade.getDistance2d(unit, out.getX(), out.getY()),
+                    sPlayerbotAIConfig.aggroDistance))
+                {
+                    nearUnpulled = true;
+                    break;
+                }
+            }
+            if (nearUnpulled)
+                continue;
+            if (!MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true))
+                continue;
+            lastMove.fleeFailures.BeginAttempt(target ? target->GetObjectGuid().GetRawValue() : 0,
+                bot->GetMapId(), botPos.GetAngleTo(out),
+                target ? sServerFacade.getDistance2d(bot, target) : 0.0f, nowMs, bot->movespline->GetId());
+            return true;
+        }
+    }
+    // A lethal keep-out (Living Poison) with every landing refused: step
+    // straight away from the creature rather than stand in the blast. Only
+    // the module's own safe-point checks stay (line of sight and a path, then
+    // MoveTo); the heading veto, the target band and the unpulled-hostile
+    // guard are dropped, because they are what refused the landings and
+    // staying put is worse.
+    if (!keepoutSource.IsEmpty() && keepoutRow && !keepoutRow->tankExempt)
+    {
+        float px = 0.0f, py = 0.0f;
+        CreatureAuraStepAwayPoint(hazardCenter.getX(), hazardCenter.getY(), botPos.getX(), botPos.getY(),
+            keepoutRow->keepoutRadius, angleFromHazard, px, py);
+        WorldPosition away(bot->GetMapId(), px, py, botPos.getZ() + 1.0f, 0.0f);
+        away.setZ(away.GetHeight());
+        if (bot->IsWithinLOS(away.getX(), away.getY(), away.getZ() + bot->GetCollisionHeight()) &&
+            botPos.canPathTo(away, bot) &&
+            MoveTo(bot->GetMapId(), away.getX(), away.getY(), away.getZ(), false, IsReaction(), false, true))
+            return true;
+    }
+    return false;
 }
 
 bool FleeWithPetAction::Execute(Event& event)
@@ -2333,7 +3799,9 @@ bool SetBehindTargetAction::Execute(Event& event)
     target->GetMap()->GetLosHitPosition(ox, oy, oz + bot->GetCollisionHeight(), x, y, z, -0.5f);
 
     const bool isLos = target->IsWithinLOS(x, y, z + bot->GetCollisionHeight(), true);
-    bool moved = MoveTo(bot->GetMapId(), x, y, z);
+    // Creature aura keep-out: never end behind a mob inside a listed
+    // creature's ring (the hazard check only bends the path there).
+    bool moved = !EndPointInCreatureAuraKeepout(x, y, z) && MoveTo(bot->GetMapId(), x, y, z);
     if (!moved && !isLos)
     {
         distance = sPlayerbotAIConfig.contactDistance;
@@ -2341,7 +3809,7 @@ bool SetBehindTargetAction::Execute(Event& event)
         y = target->getPositionY() + sin(angle) * distance;
         z = target->getPositionZ();
         bot->UpdateGroundPositionZ(x, y, z);
-        moved = MoveTo(bot->GetMapId(), x, y, z);
+        moved = !EndPointInCreatureAuraKeepout(x, y, z) && MoveTo(bot->GetMapId(), x, y, z);
     }
 
     return moved;
@@ -2353,14 +3821,26 @@ bool SetBehindTargetAction::isUseful()
         return false;
 
     Unit* target = AI_VALUE(Unit*, "current target");
-    if (target && !bot->IsBehindTarget(target, false))
-    {
-        // Don't move behind if the target is too far away
-        const float distance = bot->GetDistance(target);
-        return distance <= 15.0f;
-    }
+    if (!target)
+        return false;
 
-    return false;
+    // Mirror isPossible/Execute (donor): while the mob attacks the bot or is
+    // moving, set-behind cannot act, so do not count the streak either.
+    if ((target->GetVictim() && target->GetVictim()->getObjectGuid() == bot->getObjectGuid()) || target->IsMoving())
+        return false;
+
+    // Issue #911: position only once in melee reach (donor shape); closing in
+    // is "reach melee"'s job, which this ACTION_HIGH row used to starve.
+    const bool inMeleeReach = bot->CanReachWithMeleeAutoAttack(target);
+    const bool alreadyBehind = bot->IsBehindTarget(target, false);
+    if (!inMeleeReach || alreadyBehind)
+        return false;
+
+    // Bounded per-target streak: a blocked behind spot falls back to
+    // attacking from the front instead of re-issuing the move forever.
+    const uint32 nowMs = WorldTimer::getMSTime();
+    SetBehindStreakPoll(streak, target->getObjectGuid().GetRawValue(), nowMs);
+    return SetBehindUseful(inMeleeReach, alreadyBehind, SetBehindStreakExpired(streak, nowMs));
 }
 
 bool SetBehindTargetAction::isPossible()
@@ -2388,6 +3868,140 @@ bool SetBehindTargetAction::isPossible()
     return false;
 }
 
+bool RearFlankAction::isUseful()
+{
+    if (!MovementAction::isUseful())
+        return false;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsCreature() || !sServerFacade.IsAlive(target))
+        return false;
+    // Front-arc-only (mirrors the trigger): the tail clause would re-fire
+    // at set-behind's exact-rear destination and ping-pong every tick.
+    // (1.12 HasInArc takes the target first, arc second.)
+    return target->HasInArc(bot, 2.0f * (float)M_PI / 2.0f);
+}
+
+bool RearFlankAction::isPossible()
+{
+    if (!MovementAction::isPossible() || !ai->CanMove())
+        return false;
+    // Tank guard (mirrors SetBehindTargetAction::isPossible): an aggro flip
+    // between trigger poll and Execute must not walk a tank off its mob.
+    Unit* target = AI_VALUE(Unit*, "current target");
+    return !target || !(target->GetVictim() && target->GetVictim()->getObjectGuid() == bot->getObjectGuid());
+}
+
+bool RearFlankAction::Execute(Event& event)
+{
+    (void)event;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !sServerFacade.IsAlive(target))
+        return false;
+    // Donor shape: nearest of +-frand(90, 120)-degree polar offsets at
+    // meleeRange x 0.5. The sidestep lands on a flank, never through the
+    // frontal cone to the exact rear point.
+    float facing = target->GetOrientation();
+    float flankAngle = frand((float)M_PI / 2.0f, 2.0f * (float)M_PI / 3.0f);
+    float baseDist = bot->GetCombatReach(target, true, 0.0f) * 0.5f;
+    float leftX = target->getPositionX() + cosf(facing + flankAngle) * baseDist;
+    float leftY = target->getPositionY() + sinf(facing + flankAngle) * baseDist;
+    float rightX = target->getPositionX() + cosf(facing - flankAngle) * baseDist;
+    float rightY = target->getPositionY() + sinf(facing - flankAngle) * baseDist;
+    float dxl = leftX - bot->getPositionX(), dyl = leftY - bot->getPositionY();
+    float dxr = rightX - bot->getPositionX(), dyr = rightY - bot->getPositionY();
+    bool leftFirst = (dxl * dxl + dyl * dyl) < (dxr * dxr + dyr * dyr);
+    // Resolve each flank to where the bot would really stand (ground height,
+    // then pulled in by the line of sight from the mob) before the keep-out
+    // check, so its 5 yd height filter judges the destination's floor, not
+    // the mob's.
+    float ox, oy, oz;
+    target->GetPosition(ox, oy, oz);
+    auto resolve = [&](float& x, float& y, float& z)
+    {
+        z = target->getPositionZ();
+        bot->UpdateGroundPositionZ(x, y, z);
+        target->GetMap()->GetLosHitPosition(ox, oy, oz + bot->GetCollisionHeight(), x, y, z, -0.5f);
+    };
+    float leftZ = 0.0f, rightZ = 0.0f;
+    resolve(leftX, leftY, leftZ);
+    resolve(rightX, rightY, rightZ);
+    // Creature aura keep-out: a flank inside a listed creature's ring is
+    // refused; take the other flank, or stay put when both are ringed.
+    bool const leftRinged = EndPointInCreatureAuraKeepout(leftX, leftY, leftZ);
+    bool const rightRinged = EndPointInCreatureAuraKeepout(rightX, rightY, rightZ);
+    if (leftRinged && rightRinged)
+        return false;
+    if (leftRinged || rightRinged)
+        leftFirst = !leftRinged;
+    float const destX = leftFirst ? leftX : rightX;
+    float const destY = leftFirst ? leftY : rightY;
+    float const destZ = leftFirst ? leftZ : rightZ;
+    if (!target->IsWithinLOS(destX, destY, destZ + bot->GetCollisionHeight(), true))
+        return false;
+    return MoveTo(bot->GetMapId(), destX, destY, destZ);
+}
+
+bool TankFaceAwayAction::Execute(Event& event)
+{
+    (void)event;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !sServerFacade.IsAlive(target))
+        return false;
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    // Average angle from the mob to the live party (donor
+    // CombatFormationMoveAction::AverageGroupAngle, self excluded).
+    float sumX = 0.0f, sumY = 0.0f;
+    int count = 0;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (!member || member == bot || !sServerFacade.IsAlive(member))
+            continue;
+        if (member->GetMapId() != bot->GetMapId())
+            continue;
+        sumX += member->GetPositionX() - target->GetPositionX();
+        sumY += member->GetPositionY() - target->GetPositionY();
+        ++count;
+    }
+    if (!count)
+        return false;
+    float averageAngle = atan2(sumY, sumX);
+    // Donor TankFaceAction destinations: averageAngle +- 3*PI/5 puts the
+    // ranged clump behind the tank, outside the frontal cone, while staying
+    // in melee. Nearest of the two wins. The 90-degree trigger window is
+    // the anti-oscillation: after the sidestep the tank sits ~108 degrees
+    // off, outside the fire window, so it holds instead of ping-ponging.
+    const float dist = std::max(sServerFacade.getDistance2d(bot, target), 3.0f);
+    const float sides[] = { averageAngle + 3.0f * M_PI / 5.0f, averageAngle - 3.0f * M_PI / 5.0f };
+    float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestDist = FLT_MAX;
+    bool found = false;
+    for (float side : sides)
+    {
+        float x = target->getPositionX() + cos(side) * dist;
+        float y = target->getPositionY() + sin(side) * dist;
+        float z = target->getPositionZ();
+        bot->UpdateGroundPositionZ(x, y, z);
+        float ox, oy, oz;
+        target->GetPosition(ox, oy, oz);
+        target->GetMap()->GetLosHitPosition(ox, oy, oz + bot->GetCollisionHeight(), x, y, z, -0.5f);
+        if (!target->IsWithinLOS(x, y, z + bot->GetCollisionHeight(), true))
+            continue;
+        float d = sServerFacade.getDistance2d(bot, x, y);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestX = x;
+            bestY = y;
+            bestZ = z;
+            found = true;
+        }
+    }
+    if (!found)
+        return false;
+    return MoveTo(bot->GetMapId(), bestX, bestY, bestZ);
+}
+
 bool MoveOutOfCollisionAction::Execute(Event& event)
 {
     WorldPosition botPos(bot);
@@ -2402,6 +4016,10 @@ bool MoveOutOfCollisionAction::Execute(Event& event)
         WorldPosition randomPoint = botPos;
         if (randomPoint.GetReachableRandomPointOnGround(bot, ai->GetRange("follow")))
         {
+            // Creature aura keep-out: try another point rather than unstack
+            // into a listed creature's ring.
+            if (EndPointInCreatureAuraKeepout(randomPoint.getX(), randomPoint.getY(), randomPoint.getZ()))
+                continue;
             return MoveTo(bot->GetMapId(), randomPoint.getX(), randomPoint.getY(), randomPoint.getZ());
         }
     }
@@ -2409,7 +4027,11 @@ bool MoveOutOfCollisionAction::Execute(Event& event)
     // old style
     float angle = M_PI * 2000 / (float)urand(1, 1000);
     float distance = ai->GetRange("follow");
-    return MoveTo(bot->GetMapId(), bot->getPositionX() + cos(angle) * distance, bot->getPositionY() + sin(angle) * distance, bot->getPositionZ());
+    float const oldX = bot->getPositionX() + cos(angle) * distance;
+    float const oldY = bot->getPositionY() + sin(angle) * distance;
+    if (EndPointInCreatureAuraKeepout(oldX, oldY, bot->getPositionZ()))
+        return false;
+    return MoveTo(bot->GetMapId(), oldX, oldY, bot->getPositionZ());
 }
 
 bool MoveOutOfCollisionAction::isUseful()
@@ -2442,6 +4064,43 @@ bool MoveRandomAction::isUseful()
     return !ai->HasRealPlayerMaster() && ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid> >("nearest friendly players")->Get().size() > urand(25, 100);
 }
 
+bool IdleWanderAction::Execute(Event& event)
+{
+    // One short drift to a near reachable point (donor mod-playerbots
+    // MoveRandomNear, same shape): 8 sampled candidates, height + static
+    // line-of-sight vetted inside GetReachableRandomPointOnGround, and the
+    // ordinary core path runs the winner. A bad roll returns false and the
+    // next often tick tries again - never a blind walk.
+    WorldPosition botPos(bot);
+    WorldPosition wanderTo = botPos;
+    if (!wanderTo.GetReachableRandomPointOnGround(bot, ai::IDLE_WANDER_RANGE_YD))
+        return false;
+    // The helper may return a point underfoot when every sample fails open;
+    // standing still is not a wander.
+    if (wanderTo.sqDistance2d(botPos) < 5.0f * 5.0f)
+        return false;
+    return MoveTo(bot->GetMapId(), wanderTo.getX(), wanderTo.getY(), wanderTo.getZ());
+}
+
+bool IdleWanderAction::isUseful()
+{
+    if (!MovementAction::isUseful())
+        return false;
+    // No grind-target clause: a held-but-unattackable pick must not veto the
+    // only motion that can break the standstill (see IdleWanderAllowed). The
+    // attack row (5.0) outranks this drift (0.6), so a usable prey still wins.
+    if (!ai::IdleWanderAllowed(sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster(),
+        AI_VALUE(bool, "travel target active"), sServerFacade.IsInCombat(bot),
+        bot->InBattleGround(), WorldPosition(bot).isOverworld(),
+        AI_VALUE(bool, "can move around")))
+        return false;
+    // A bot already walking to its held prey is not standing still: never
+    // turn that approach into a drift.
+    if (bot->IsMoving() && AI_VALUE(Unit*, "grind target"))
+        return false;
+    return true;
+}
+
 bool MoveToAction::Execute(Event& event)
 {
     std::list<GuidPosition> guidList = AI_VALUE_SAFE(std::list<GuidPosition>, getQualifier());
@@ -2461,6 +4120,11 @@ bool JumpAction::isUseful()
 
 bool JumpAction::Execute(ai::Event &event)
 {
+    // Audit fix 125: no automatic jumps inside dungeons/raids (strategies);
+    // an explicit player `jump` command (event has an owner) still works.
+    if (!ai::JumpAllowedOnMap(bot->GetMap() && bot->GetMap()->IsDungeon(), event.GetOwner() != nullptr))
+        return false;
+
     // don't jump while casting without real player command
     if (!event.GetOwner() && bot->IsNonMeleeSpellCasted(false, false, true))
         return false;

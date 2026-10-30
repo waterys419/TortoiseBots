@@ -1,5 +1,8 @@
 #pragma once
 
+#include <memory>
+#include <unordered_map>
+
 #include "Action.h"
 #include "ActionFailureBackoff.h"
 #include "Queue.h"
@@ -11,6 +14,19 @@
 
 namespace ai
 {
+    // How one pass of the engine's action loop ended for one action; reported
+    // to the listeners through ActionExecutionListener::Outcome.
+    enum class ActionOutcome
+    {
+        Ok,         // executed
+        Failed,     // possible, ran, returned false
+        Impossible, // isPossible() said no
+        Useless,    // isUseful() said no
+        Prereq,     // its prerequisites were queued first
+        Vetoed,     // a multiplier zeroed its relevance
+        Backoff     // the failure backoff dropped it
+    };
+
     class ActionExecutionListener
     {
     public:
@@ -18,6 +34,10 @@ namespace ai
         virtual bool AllowExecution(Action* action, const Event& event) = 0;
         virtual void After(Action* action, bool executed, const Event& event) = 0;
         virtual bool OverrideResult(Action* action, bool executed, const Event& event) = 0;
+        // Optional: the outcome of every action the loop took out of the queue
+        // (run trace, runtime/RunTrace.cpp). Not called for actions run outside
+        // the loop. Default: nothing.
+        virtual void Outcome(Action* action, ActionOutcome outcome, const Event& event, float baseRelevance, float relevance) {}
         virtual ~ActionExecutionListener() {};
     };
 
@@ -34,8 +54,17 @@ namespace ai
         virtual bool AllowExecution(Action* action, const Event& event) override;
         virtual void After(Action* action, bool executed, const Event& event) override;
         virtual bool OverrideResult(Action* action, bool executed, const Event& event) override;
+        virtual void Outcome(Action* action, ActionOutcome outcome, const Event& event, float baseRelevance, float relevance) override;
 
     public:
+        template<class T>
+        bool Has() const
+        {
+            for (ActionExecutionListener* listener : listeners)
+                if (dynamic_cast<T*>(listener))
+                    return true;
+            return false;
+        }
         void Add(ActionExecutionListener* listener)
         {
             listeners.push_back(listener);
@@ -43,6 +72,22 @@ namespace ai
         void Remove(ActionExecutionListener* listener)
         {
             listeners.remove(listener);
+        }
+        // Removes and deletes every listener of type T (they are owned here).
+        // Not from inside a listener call: the list is being walked then.
+        template<class T>
+        void RemoveAll()
+        {
+            for (auto it = listeners.begin(); it != listeners.end();)
+            {
+                if (T* listener = dynamic_cast<T*>(*it))
+                {
+                    it = listeners.erase(it);
+                    delete listener;
+                }
+                else
+                    ++it;
+            }
         }
 
     private:
@@ -79,7 +124,16 @@ namespace ai
 		void ChangeStrategy(const std::string& names);
 		void PrintStrategies(Player* requester, const std::string& engineType);
         std::string GetLastAction() { return lastAction; }
+        // The newest action the engine gave a verdict on, as parts (the remote commander's feed reads these
+        // instead of cutting the joined lastAction text). Result letter: O ok, F failed, I impossible,
+        // U useless, P prerequisites queued first, V dropped before running (veto or failure backoff),
+        // '-' none yet. castFail is the SpellCastResult of the last failed cast check made while the action
+        // was judged (0 = none or not a cast).
+        char const* GetLastOutcomeName() const { return lastOutcomeName; }
+        char GetLastOutcomeResult() const { return lastOutcomeResult; }
+        uint32 GetLastOutcomeCastFail() const { return lastOutcomeCastFail; }
         const Action* GetLastExecutedAction() const { return lastExecutedAction; }
+        std::string const& GetLastExecutedTrigger() const { return lastExecutedTrigger; }
 
     public:
 	    virtual bool DoNextAction(Unit*, int depth, bool minimal, bool isStunned);
@@ -98,6 +152,16 @@ namespace ai
         void removeActionExecutionListener(ActionExecutionListener* listener)
         {
             actionExecutionListeners.Remove(listener);
+        }
+        template<class T>
+        bool HasActionExecutionListener() const
+        {
+            return actionExecutionListeners.Has<T>();
+        }
+        template<class T>
+        void RemoveActionExecutionListeners()
+        {
+            actionExecutionListeners.RemoveAll<T>();
         }
 
     public:
@@ -140,11 +204,20 @@ namespace ai
         std::list<Multiplier*> multipliers;
         AiObjectContext* aiObjectContext;
         std::map<std::string, Strategy*> strategies;
+        // One ActionNode prototype per action name (null = no strategy node), copied by CreateActionNode.
+        // Per engine, world thread only; cleared whenever `strategies` changes.
+        static constexpr size_t kMaxActionNodePrototypes = 1024;
+        std::unordered_map<std::string, std::unique_ptr<ActionNode>> actionNodePrototypes;
         float lastRelevance;
         std::string lastAction;
+        char lastOutcomeName[24] = {0};
+        char lastOutcomeResult = '-';
+        uint32 lastOutcomeCastFail = 0;
+        void NoteOutcome(Action* action, char result);
         ActionExecutionListeners actionExecutionListeners;
         BotState state;
         Action* lastExecutedAction;
+        std::string lastExecutedTrigger; // event source of lastExecutedAction
         bool inDoNextAction = false;
         bool reinitPending = false;
         // Issue #84 state. Per-engine failure memory plus the transition

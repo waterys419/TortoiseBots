@@ -2,6 +2,7 @@
 
 // pi-lens-ignore: clang:pp_file_not_found
 #include "ObjectGuid.h"
+#include "runtime/policy/hire/HireDeparturePolicy.h"
 
 #include <cstdint>
 #include <ctime>
@@ -52,6 +53,32 @@ public:
     // and the master-departure rule leaves it alone.
     void MarkGrouped(ObjectGuid botGuid);
 
+    // Issue #490: the gear tier the hire was provisioned in (0 = random
+    // kit). A respec keeps a tier kit instead of re-rolling pool gear.
+    void SetGearTier(ObjectGuid botGuid, uint8_t tier);
+    uint8_t GearTier(ObjectGuid botGuid) const;
+
+    // Remote commander (issue #884): a hire may be bound by its own hirer, which
+    // takes the hirer out of the hire's party. While bound, the "left the
+    // hirer's party" end conditions are suspended (HireDeparturePolicy.h); the
+    // hire still ends on dismiss and on the hirer's logout grace.
+    //
+    // Before the bind moves anybody: the hire enters its transition. False (and
+    // nothing changes) for a bot that is not a hire of `commanderGuid`.
+    bool BeginCommand(ObjectGuid botGuid, ObjectGuid commanderGuid);
+    // The bind succeeded: this commander's hires in transition are bound.
+    void ConfirmCommand(ObjectGuid commanderGuid);
+    // The binding ended (or the bind failed): the commander's hires go back to
+    // the commander's party if it is online, or wait for its return inside the
+    // logout grace. Returns the hires handled; 0 for a commander with none.
+    uint32_t EndCommand(ObjectGuid commanderGuid);
+    uint32_t CommandedHireCount(ObjectGuid commanderGuid) const;
+    // After the module moved `bot` into its current party (a bind, a hire's
+    // return) while it stands in a dungeon: the party keeps the bot's instance
+    // instead of the core teleporting it to its hearth 60 s later
+    // (DecidePartyMoveInstance). Any bot, hired or not.
+    static void KeepInstanceAfterPartyMove(Player* bot);
+
     // Group hooks (called from the module GroupScript adapter).
     void OnGroupMemberRemoved(Group* group, ObjectGuid guid);
     void OnGroupDisband(Group* group);
@@ -82,6 +109,18 @@ private:
         // A departure before that is a provisioning artefact, never an end of
         // hire: only then is a master-less group a dismissal.
         bool everGrouped = false;
+        uint8_t gearTier = 0;
+        // Remote commander: where the hire stands in its hirer's binding.
+        HireCommandState commandState = HireCommandState::None;
+        // The hirer logged out while the hire sat in a bound party: when the
+        // hirer returns the hire leaves that party before it is re-invited.
+        bool regroupOnReturn = false;
+        // A hire out of world when its hirer's binding ended is held in
+        // transition (regroupOnReturn set) until it is back, but not longer
+        // than this.
+        time_t regroupDeadline = 0;
+        // Battleground queue entry was warned once for the current queue stay.
+        bool bgQueueWarned = false;
     };
 
     // A dismissed hire whose character is waiting for its asynchronous
@@ -96,6 +135,23 @@ private:
         // request, so a stuck session is not spammed and is abandoned instead.
         bool stopRequested = false;
     };
+
+    enum class DismissalReason { MasterLeft, Disbanded, Removed, EnteredBattleground };
+    struct PendingDismissal
+    {
+        ObjectGuid botGuid;
+        ObjectGuid masterGuid;
+        DismissalReason reason;
+    };
+    // Group hooks run inside core group iteration; never log out there.
+    void QueueDismissal(HiredRecord const& record, DismissalReason reason);
+    void DrainDismissals();
+    // Battleground boundary: warned queue-entry masters and dismissed
+    // entered masters, once per queue stay / entry.
+    void SweepBattlegroundBoundary();
+    void WarnMasterOnQueueEntry(Player* master);
+    // Native leave-queue path for a queued hire (action=0 port packet).
+    void LeaveBattlegroundQueue(Player* bot);
 
     void Dismiss(HiredRecord const& record, char const* reason, bool removeFromGroup = true);
     bool MasterOnline(HiredRecord const& record) const;
@@ -118,10 +174,12 @@ private:
     std::unordered_map<uint32_t, HiredRecord> m_hired;
     std::unordered_set<uint32_t> m_dismissing;
     std::vector<PendingDeletion> m_pendingDeletions;
+    std::vector<PendingDismissal> m_pendingDismissals;
     bool m_ledgerRecovered = false;
     time_t m_recoveryRetryAt = 0;
     uint32_t m_updateElapsedMs = 0;
     uint32_t m_restockElapsedMs = 0;
+    uint32_t m_bgElapsedMs = 0;
 };
 
 } // namespace TortoiseBots

@@ -1,14 +1,46 @@
 
 #include "playerbot/playerbot.h"
 #include "LootRollAction.h"
-#include "playerbot/LootRollPolicy.h"
+#include "../../policy/loot/LootRollPolicy.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/LootValues.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireLootPolicy.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
 #include "Group/Group.h"
 #include "Maps/Map.h"
-
 using namespace ai;
+
+namespace
+{
+    std::string RollVoteName(RollVote vote)
+    {
+        switch (vote)
+        {
+        case ROLL_NEED:
+            return "need";
+        case ROLL_GREED:
+            return "greed";
+        case ROLL_DISENCHANT:
+            return "disenchant";
+        default:
+            return "pass";
+        }
+    }
+
+    void LogLootRoll(PlayerbotAI* ai, ItemQualifier& itemQualifier, RollVote vote, std::string const& reason)
+    {
+        if (!sPlayerbotAIConfig.hasLog("bot_events.csv"))
+            return;
+
+        ItemPrototype const* proto = itemQualifier.GetProto();
+        std::string itemName = proto ? proto->Name1 : "unknown item";
+        sPlayerbotAIConfig.logEvent(ai, "LootRoll", itemName,
+            RollVoteName(vote) + ":" + std::to_string(itemQualifier.GetId()) + ":" + reason);
+    }
+}
 
 bool LootStartRollAction::Execute(Event& event)
 {
@@ -48,6 +80,30 @@ bool LootStartRollAction::Execute(Event& event)
         }
     }
 
+    // Prune vote sightings for rolls that already resolved (#967): match the
+    // exact (guid, slot) pair against the pre-insert state, so a stale entry
+    // for this same pair (same mob respawned, same slot rolling again) can
+    // never demote the fresh roll. Runs BEFORE the insert for that reason.
+    LootVoteMap seenVotes = AI_VALUE(LootVoteMap, "seen need rolls");
+    for (auto itr = seenVotes.begin(); itr != seenVotes.end();)
+    {
+        bool alive = false;
+        auto range = lootRolls.equal_range(std::get<0>(itr->first));
+        for (auto roll = range.first; roll != range.second; ++roll)
+        {
+            if (roll->second == std::get<1>(itr->first))
+            {
+                alive = true;
+                break;
+            }
+        }
+        if (!alive)
+            itr = seenVotes.erase(itr);
+        else
+            ++itr;
+    }
+    SET_AI_VALUE(LootVoteMap, "seen need rolls", seenVotes);
+
     if (!known)
         lootRolls.insert({ creatureGuid, itemSlot });
 
@@ -56,6 +112,64 @@ bool LootStartRollAction::Execute(Event& event)
     SET_AI_VALUE(LootRollMap, "active rolls", lootRolls);
 
     return false;
+}
+
+bool LootVoteAction::Execute(Event& event)
+{
+    WorldPacket p(event.GetPacket()); //WorldPacket packet for SMSG_LOOT_ROLL, (8+4+8+4+4+4+1+1)
+    ObjectGuid lootGuid;
+    uint32 itemSlot;
+    ObjectGuid voterGuid;
+    uint32 itemId;
+    p.rpos(0); //reset packet pointer
+    p >> lootGuid; //creature guid what we're looting
+    p >> itemSlot; // the loot slot rolled for
+    p >> voterGuid; // who voted
+    p >> itemId; // the itemEntryId voted on
+    p.read_skip<uint32>(); // randomSuffix, unused
+    uint32 randomPropertyId = 0;
+    p >> randomPropertyId;
+    uint8 rollNumber = 0;
+    p >> rollNumber;
+    uint8 rollType = ROLL_PASS;
+    p >> rollType;
+
+    // Core wire format (Group::CountRollVote): a live vote is (number 0,
+    // type 0) for NEED, (128, 2) for GREED, (128, 128) for PASS. Anything
+    // else carries a real roll number and is a post-resolution echo
+    // (CountTheRoll) - the roll is already decided, ignore it.
+    if (ai::LootVoteIsEcho(rollNumber, rollType))
+        return false;
+    ai::LootRollVote liveVote = ai::LootWireVote(rollNumber, rollType);
+
+    if (voterGuid == bot->getObjectGuid())
+        return false;
+
+    Player* voter = sObjectMgr.GetPlayer(voterGuid);
+    if (!voter || !ai->IsRealPlayer(voter))
+        return false;
+
+    // Only while the bot is still holding this roll: late duplicates and
+    // echoes for an already-voted slot never land.
+    LootRollMap lootRolls = AI_VALUE(LootRollMap, "active rolls");
+    bool active = false;
+    auto range = lootRolls.equal_range(lootGuid);
+    for (auto roll = range.first; roll != range.second; ++roll)
+    {
+        if (roll->second == itemSlot)
+        {
+            active = true;
+            break;
+        }
+    }
+    if (!active)
+        return false;
+
+    LootVoteMap seenVotes = AI_VALUE(LootVoteMap, "seen need rolls");
+    seenVotes[{ lootGuid, itemSlot, voterGuid }] = (uint8)liveVote;
+    SET_AI_VALUE(LootVoteMap, "seen need rolls", seenVotes);
+
+    return true;
 }
 
 bool RollAction::Execute(Event& event)
@@ -111,7 +225,7 @@ bool RollAction::Execute(Event& event)
         if (!rollFeedback)
             ai->TellPlayerNoFacing(requester, "Roll feedback disabled.");
         else
-            ai->TellPlayerNoFacing(requester, "Roll feedback enalbed.");
+            ai->TellPlayerNoFacing(requester, "Roll feedback enabled.");
 
         SET_AI_VALUE2(bool, "manual bool", "roll feedback", rollFeedback);
 
@@ -158,7 +272,14 @@ bool RollAction::Execute(Event& event)
 
         RollVote doVote = vote;
         if (doVote == ROLL_NOT_VALID) //Auto
-            doVote = CalculateRollVote(itemQualifier);
+            doVote = CalculateRollVote(itemQualifier, nullptr, nullptr, true);
+        else
+        {
+            std::string orderReason = std::string("ordered by ") + (requester ? requester->GetName() : "?");
+            if (!StoreLootAction::IsLootAllowed(itemQualifier, PlayerbotAIStorage::Instance().GetAI(bot)))
+                orderReason += " (can not be looted)";
+            LogLootRoll(ai, itemQualifier, doVote, orderReason);
+        }
 
         rolledItems += RollOnItemInSlot(doVote, roll.first, roll.second);
     }
@@ -176,7 +297,7 @@ ItemQualifier RollAction::GetRollItem(ObjectGuid lootGuid, uint32 slot)
     return ItemQualifier();
 }
 
-RollVote RollAction::CalculateRollVote(ItemQualifier& itemQualifier)
+RollVote RollAction::CalculateRollVote(ItemQualifier& itemQualifier, RollVote* finalVote, std::string* reasonOut, bool log)
 {
     ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", itemQualifier.GetQualifier());
 
@@ -248,7 +369,16 @@ RollVote RollAction::CalculateRollVote(ItemQualifier& itemQualifier)
     {
         Group* rollGroup = bot->GetGroup();
         if (rollGroup && !ai::LootMethodTakesRolls((int)rollGroup->GetLootMethod()))
+        {
+            std::string lootMethodReason = "because the group's loot method takes no rolls.";
+            if (finalVote)
+                *finalVote = ROLL_PASS;
+            if (reasonOut)
+                *reasonOut = lootMethodReason;
+            if (log)
+                LogLootRoll(ai, itemQualifier, ROLL_PASS, lootMethodReason);
             return ROLL_PASS;
+        }
 
         // Recipe gate: SKILL usage on a recipe is already the learned-state
         // verdict (ItemUsageValue: known recipes fall to KEEP/NONE, unknown
@@ -300,24 +430,37 @@ RollVote RollAction::CalculateRollVote(ItemQualifier& itemQualifier)
 
     bool canLoot = StoreLootAction::IsLootAllowed(itemQualifier, PlayerbotAIStorage::Instance().GetAI(bot));
 
+    std::string reason = "because it can not be looted.";
+    if (canLoot)
+        reason = ItemUsageValue::ReasonForNeed(usage, itemQualifier, 1, bot);
+
     if (AI_VALUE2(bool, "manual bool", "roll feedback"))
     {
-        std::string reason = "because it can not be looted.";
-        std::string vote = "Passing";
-        if(canLoot)
-            reason = ItemUsageValue::ReasonForNeed(usage, itemQualifier, 1, bot);
-
+        std::string voteName = "Passing";
         if (needVote == ROLL_GREED)
-            vote = "Rolling greed";
+            voteName = "Rolling greed";
         else if (needVote == ROLL_NEED)
-            vote = "Rolling need";
+            voteName = "Rolling need";
         else if (needVote == ROLL_DISENCHANT)
-            vote = "Rolling disenchant";
+            voteName = "Rolling disenchant";
 
-         ai->TellPlayerNoFacing(ai->GetMaster(), vote + " on " + ChatHelper::formatItem(itemQualifier) + " " + reason);
+        ai->TellPlayerNoFacing(ai->GetMaster(), voteName + " on " + ChatHelper::formatItem(itemQualifier) + " " + reason);
     }
 
-    return canLoot ? needVote : ROLL_PASS;
+    // Issue #872: an autonomous alt rolls Greed or Pass, never Need (C).
+    if (needVote == ROLL_NEED &&
+        TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+        needVote = ROLL_GREED;
+
+    RollVote decision = canLoot ? needVote : ROLL_PASS;
+    if (finalVote)
+        *finalVote = decision;
+    if (reasonOut)
+        *reasonOut = reason;
+    if (log)
+        LogLootRoll(ai, itemQualifier, decision, reason);
+
+    return decision;
 }
 
 bool RollAction::RollOnItemInSlot(RollVote vote, ObjectGuid lootGuid, uint32 slot)
@@ -340,52 +483,198 @@ bool RollAction::RollOnItemInSlot(RollVote vote, ObjectGuid lootGuid, uint32 slo
 
     SET_AI_VALUE(LootRollMap, "active rolls", lootRolls);
 
+    // The bot voted: its decision for this slot is final, so drop the vote
+    // sightings with it. A later roll on the same pair starts untainted.
+    LootVoteMap seenVotes = AI_VALUE(LootVoteMap, "seen need rolls");
+    for (auto itr = seenVotes.begin(); itr != seenVotes.end();)
+    {
+        if (std::get<0>(itr->first) == lootGuid && std::get<1>(itr->first) == slot)
+            itr = seenVotes.erase(itr);
+        else
+            ++itr;
+    }
+    SET_AI_VALUE(LootVoteMap, "seen need rolls", seenVotes);
+
     return true;
 }
 
-// Do any real players still have the roll dialog open, and did one of them
-// ask for need? Bots are ignored - they are expected to sort themselves out.
-bool RollAction::HumansStillDeciding(ObjectGuid lootGuid, uint32 slot, bool& humanNeeds)
+// Would rolling need on this item take it from a real player? Every real
+// player in the group who is in this roll counts (same map, inside the
+// core's loot distance of the corpse). seenVoter/seenVote carry the one
+// vote the bot knows: its owner's own CMSG_LOOT_ROLL that woke "delayed
+// roll". The core keeps the other votes private, so an unseen player's bare
+// "can use it" only competes for a hired companion grouped with its master
+// (#967): alts wait like pool bots instead.
+bool RollAction::RealPlayerMayNeed(ObjectGuid lootGuid, ItemQualifier& itemQualifier, ObjectGuid seenVoter, uint8 seenVote)
 {
-    humanNeeds = false;
-
-    Group* group = bot->GetGroup();
-    if (!group)
+    const ItemPrototype* proto = itemQualifier.GetProto();
+    if (!proto || !bot->GetGroup() || !bot->GetMap())
         return false;
 
-    // Active roll votes are private in the core. Continue without trying to
-    // inspect human votes; CountRollVote still validates the bot's own vote.
+    Creature* lootTarget = bot->GetMap()->GetCreature(lootGuid);
+
+    bool const yieldUnseenUsable = TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) &&
+        ai->HasRealPlayerMaster();
+    for (Player* member : ai->GetPlayersInGroup())
+    {
+        if (member == bot || !member->IsInWorld() || member->GetMapId() != bot->GetMapId())
+            continue;
+
+        if (lootTarget && !member->IsWithinLootXPDist(lootTarget))
+            continue;
+
+        bool voteSeen = !seenVoter.IsEmpty() && member->GetObjectGuid() == seenVoter && seenVote < MAX_ROLL_FROM_CLIENT;
+        ai::LootRollVote vote = voteSeen ? ai::LootRollVote(seenVote) : ai::LootRollVote::Pass;
+        bool canUse = member->CanUseItem(proto) == EQUIP_ERR_OK;
+
+        if (ai::RealPlayerCompetes(voteSeen, vote, canUse, yieldUnseenUsable))
+            return true;
+    }
+
     return false;
 }
 
-// Half the countdown is gone. Past that the bot votes regardless, so one
-// player who walked away cannot make the whole group wait out the timer.
-bool RollAction::RollAboutToExpire(ObjectGuid lootGuid)
+// True while this bot must hold its vote on this roll: a pool bot (or alt)
+// in a group with real players waits so the humans get the whole window,
+// voting ~15 s before it ends or as soon as every real roller has voted
+// (#967). Hired companions grouped with their master never wait (they keep
+// the old yield-on-usable behaviour); bot-only groups vote at once.
+bool RollAction::ShouldWaitForPlayers(ObjectGuid lootGuid, uint32 slot)
 {
-    Creature* target = bot->GetMap() ? bot->GetMap()->GetCreature(lootGuid) : nullptr;
-    if (!target)
-        return true;
-
-    uint32 const left = target->GetGroupLootTimer();
-    return left == 0 || left < 30 * IN_MILLISECONDS;
-}
-
-// Vote on one item the polite way.
-bool RollAction::RollWithEtiquette(ObjectGuid lootGuid, uint32 slot)
-{
-    bool humanNeeds = false;
-    if (HumansStillDeciding(lootGuid, slot, humanNeeds) && !RollAboutToExpire(lootGuid))
+    Group* group = bot->GetGroup();
+    if (!group || !bot->GetMap())
         return false;
 
+    if (TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) && ai->HasRealPlayerMaster())
+        return false;
+
+    bool anyRealPlayer = false;
+    Creature* lootTarget = bot->GetMap()->GetCreature(lootGuid);
+    for (Player* member : ai->GetPlayersInGroup())
+    {
+        if (member == bot || !member->IsInWorld() || member->GetMapId() != bot->GetMapId())
+            continue;
+
+        if (lootTarget && !member->IsWithinLootXPDist(lootTarget))
+            continue;
+
+        anyRealPlayer = true;
+        break;
+    }
+
+    if (!anyRealPlayer)
+        return false;
+
+    // A NEED the bot already saw ends the wait on its own: the vote is
+    // decided (step down to GREED), so cast it now.
+    LootVoteMap seenVotes = AI_VALUE(LootVoteMap, "seen need rolls");
+    bool seenNeed = false;
+    for (auto const& entry : seenVotes)
+    {
+        if (std::get<0>(entry.first) == lootGuid && std::get<1>(entry.first) == slot &&
+            (ai::LootRollVote)entry.second == ai::LootRollVote::Need)
+        {
+            seenNeed = true;
+            break;
+        }
+    }
+    if (seenNeed)
+        return false;
+
+    // The core counts down from LOOT_ROLL_TIMEOUT (60 s); a zero timer means
+    // the window already resolved - vote now rather than hold forever.
+    uint32 remainingMs = lootTarget ? lootTarget->GetGroupLootTimer() : 0;
+    if (!remainingMs)
+        return false;
+
+    return !ai::RollWaitElapsed(remainingMs, AllRealRollersVoted(lootGuid, slot));
+}
+// True when every real player in this roll already voted: each eligible
+// roller (same map, loot distance, CanUseItem OK, AllowedForPlayer) has a
+// recorded live vote for this (guid, slot) - need, greed or pass. The
+// recorder only stores packets for active rolls, so an entry here is fresh
+// by construction. Cheap on purpose: one short member walk over the group
+// (usually 5), no world scan, no DB.
+bool RollAction::AllRealRollersVoted(ObjectGuid lootGuid, uint32 slot)
+{
+    ItemQualifier itemQualifier = GetRollItem(lootGuid, slot);
+    const ItemPrototype* proto = itemQualifier.GetProto();
+    if (!proto)
+        return false;
+
+    Loot* loot = sLootMgr.GetLoot(bot, lootGuid);
+    LootItem* item = (loot && slot < loot->items.size()) ? &loot->items[slot] : nullptr;
+
+    Creature* lootTarget = bot->GetMap() ? bot->GetMap()->GetCreature(lootGuid) : nullptr;
+    LootVoteMap seenVotes = AI_VALUE(LootVoteMap, "seen need rolls");
+
+    for (Player* member : ai->GetPlayersInGroup())
+    {
+        if (member == bot || !member->IsInWorld() || member->GetMapId() != bot->GetMapId())
+            continue;
+
+        if (lootTarget && !member->IsWithinLootXPDist(lootTarget))
+            continue;
+
+        if (member->CanUseItem(proto) != EQUIP_ERR_OK)
+            continue;
+
+        if (item && !item->AllowedForPlayer(member, lootTarget))
+            continue;
+
+        if (seenVotes.find({ lootGuid, slot, member->GetObjectGuid() }) == seenVotes.end())
+            return false;
+    }
+
+    return true;
+}
+
+// Vote on one item the polite way: never roll need against a real player.
+bool RollAction::RollWithEtiquette(ObjectGuid lootGuid, uint32 slot, ObjectGuid seenVoter, uint8 seenVote)
+{
     ItemQualifier itemQualifier = GetRollItem(lootGuid, slot);
     if (!itemQualifier.GetId())
         return false;
 
-    RollVote vote = CalculateRollVote(itemQualifier);
+    if (!TortoiseBots::HireMayLoot(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()),
+            sPlayerbotAIConfig.hireLoot))
+    {
+        LogLootRoll(ai, itemQualifier, ROLL_PASS, "because hired companion loot is off.");
+        return RollOnItemInSlot(ROLL_PASS, lootGuid, slot);
+    }
 
-    // A player asked for it. Never roll need against them.
-    if (humanNeeds && vote == ROLL_NEED)
-        vote = ROLL_GREED;
+    std::string reason;
+    RollVote vote = CalculateRollVote(itemQualifier, nullptr, &reason, false);
+
+    if (vote == ROLL_NEED)
+    {
+        // A FORCE_NEED usage is the player's own order and still needs.
+        bool forcedNeed = AI_VALUE2(ItemUsage, "item usage", itemQualifier.GetQualifier()) == ItemUsage::ITEM_USAGE_FORCE_NEED;
+        bool seenNeed = false;
+        LootVoteMap seen = AI_VALUE(LootVoteMap, "seen need rolls");
+        for (auto const& entry : seen)
+        {
+            if (std::get<0>(entry.first) == lootGuid && std::get<1>(entry.first) == slot &&
+                (ai::LootRollVote)entry.second == ai::LootRollVote::Need)
+            {
+                seenNeed = true;
+                break;
+            }
+        }
+        bool competes = !forcedNeed && (RealPlayerMayNeed(lootGuid, itemQualifier, seenVoter, seenVote) || seenNeed);
+        if (ai::PoliteRollVote(ai::LootRollVote::Need, competes, forcedNeed) == ai::LootRollVote::Greed)
+        {
+            vote = ROLL_GREED;
+
+            if (AI_VALUE2(bool, "manual bool", "roll feedback"))
+                ai->TellPlayerNoFacing(ai->GetMaster(), "Rolling greed on " + ChatHelper::formatItem(itemQualifier) + " instead: a player in the group may need it.");
+
+            LogLootRoll(ai, itemQualifier, vote, reason + " Stepped down to greed: a player in the group may need it.");
+            return RollOnItemInSlot(vote, lootGuid, slot);
+        }
+    }
+
+    LogLootRoll(ai, itemQualifier, vote, reason);
 
     return RollOnItemInSlot(vote, lootGuid, slot);
 }
@@ -403,7 +692,10 @@ bool LootRollAction::Execute(Event& event)
     p >> slot; //number of players invited to roll
     p >> rollType; //need,greed or pass on roll
 
-    return RollWithEtiquette(guid, slot);
+    // The packet is the owner's own vote: when they passed or greeded, the
+    // bot may need without competing with them.
+    Player* voter = GetMaster();
+    return RollWithEtiquette(guid, slot, voter ? voter->GetObjectGuid() : ObjectGuid(), rollType);
 }
 
 bool AutoLootRollAction::Execute(Event& event)
@@ -412,12 +704,58 @@ bool AutoLootRollAction::Execute(Event& event)
     if (lootRolls.empty())
         return false;
 
-    auto currentRoll = std::next(lootRolls.begin(), urand(0, lootRolls.size() - 1));
+    // Vote every roll whose wait elapsed in this tick: waiting synchronises
+    // votes near the deadline, so one random roll per tick would drain N
+    // simultaneous rolls over ~N ticks (#967 S1). Rolls still waiting stay
+    // in "active rolls" for the next tick.
+    uint32 voted = 0;
+    for (auto const& roll : lootRolls)
+    {
+        if (ShouldWaitForPlayers(roll.first, roll.second))
+            continue;
 
-    return RollWithEtiquette(currentRoll->first, currentRoll->second);
+        if (RollWithEtiquette(roll.first, roll.second))
+            ++voted;
+    }
+
+    return voted > 0;
 }
 
 bool AutoLootRollAction::isPossible()
 {
     return bot->GetGroup() && !AI_VALUE(LootRollMap, "active rolls").empty() && AI_VALUE(uint8, "bag space") < 100;
+}
+
+bool RollWonLogAction::Execute(Event& event)
+{
+    // SMSG_LOOT_ROLL_WON layout (Group::SendLootRollWon): [looted guid][slot]
+    // [item id][randomSuffix:0][randomPropertyId][winner guid][roll][type].
+    // It reaches every roller, so only the winner logs; the core also stores
+    // the item in the winner's bags before this packet goes out (Group::
+    // CountTheRoll), so no re-fetch or ownership check is needed here.
+    WorldPacket p(event.GetPacket());
+    p.rpos(0);
+    ObjectGuid lootGuid;
+    uint32 slot;
+    uint32 itemId;
+    p >> lootGuid;
+    p >> slot;
+    p >> itemId;
+    p.read_skip<uint32>(); // randomSuffix, unused
+    uint32 randomPropertyId = 0;
+    p >> randomPropertyId;
+    ObjectGuid winner;
+    p >> winner;
+
+    if (winner != bot->getObjectGuid())
+        return false;
+
+    ItemPrototype const* proto = sItemStorage.LookupEntry<ItemPrototype>(itemId);
+    if (!proto)
+        return false;
+
+    ItemQualifier itemQualifier(itemId, (int32)randomPropertyId);
+    sPlayerbotAIConfig.logEvent(ai, "RollWon", proto->Name1, std::to_string(itemId));
+    BroadcastHelper::BroadcastLootingItem(ai, bot, proto, itemQualifier);
+    return true;
 }

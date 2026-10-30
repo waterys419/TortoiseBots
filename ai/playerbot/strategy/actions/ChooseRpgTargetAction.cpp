@@ -11,6 +11,8 @@
 #include "playerbot/strategy/values/PositionValue.h"
 #include "playerbot/strategy/values/TravelValues.h"
 #include "playerbot/strategy/values/FreeMoveValues.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireQuestPolicy.h"
 #include <iomanip>
 
 using namespace ai;
@@ -161,6 +163,12 @@ std::unordered_map<ObjectGuid, float> ChooseRpgTargetAction::GetTargets(Player* 
             for (uint32 entry : ignoredRpgNpcEntries)
                 if ((uint32)guidP.GetEntry() == entry)
                     isIgnoredNpc = true;
+            // Hired companions never approach a <Mercenary Hire> recruiter on
+            // their own either: they follow their master. Owned alts and pool
+            // bots are untouched.
+            if (!isIgnoredNpc && TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) &&
+                TortoiseBots::IsHireQuestRecruiterEntry((uint32)guidP.GetEntry()))
+                isIgnoredNpc = true;
             if (isIgnoredNpc)
                 SkipRpgTarget("NPC is a challenge-quest giver that bots must ignore.");
         }
@@ -544,6 +552,27 @@ bool ChooseRpgTargetAction::Execute(Event& event)
     return true;
 }
 
+// Gate shared with MoveToRpgTargetAction::isUseful. Until 2026-10-07 only a
+// travelling target (TRAVEL) held the rpg layer back; #527 widened it to any
+// active target so rpg stopped hijacking journeys, but that also covered the
+// arrived trip (WORK). An arrived pool bot then never chose the auctioneer,
+// mailbox or rpg spot it had walked to (its 50% travel-target bonus above),
+// stood until the 30 s work-idle release and re-picked the same NPC - live
+// 2026-10-11: 2 "choose rpg target" in 74,972 dashboard samples, and 36 of
+// 108 three-minute standstills cycled through WORK this way. The donor
+// (mod-playerbots ChooseRpgTargetAction::isUseful) has no travel gate at all;
+// this keeps #527's guard for a journey in flight and releases WORK only.
+bool ChooseRpgTargetAction::TravelJourneyInFlight(PlayerbotAI* ai)
+{
+    AiObjectContext* context = ai->GetAiObjectContext();
+    TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
+
+    if (!travelTarget || !travelTarget->IsActive())
+        return false;
+
+    return travelTarget->GetStatus() != TravelStatus::TRAVEL_STATUS_WORK;
+}
+
 bool ChooseRpgTargetAction::isUseful()
 {
     if (!ai->AllowActivity(RPG_ACTIVITY))
@@ -554,7 +583,7 @@ bool ChooseRpgTargetAction::isUseful()
     if (guidP && guidP.distance(bot) < sPlayerbotAIConfig.reactDistance * 2)
         return false;
 
-    if (AI_VALUE(bool, "travel target traveling"))
+    if (TravelJourneyInFlight(ai))
         return false;
 
     if (AI_VALUE(std::list<ObjectGuid>, "possible rpg targets").empty())

@@ -1,6 +1,8 @@
 
 #include "playerbot/playerbot.h"
 #include "GrindTargetValue.h"
+#include "playerbot/GroupMembers.h"
+#include "RtiTargetValue.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/RandomBotFacade.h"
 #include "playerbot/ServerFacade.h"
@@ -9,8 +11,11 @@
 #include "PossibleAttackTargetsValue.h"
 #include "playerbot/strategy/actions/ChooseTargetActions.h"
 #include "playerbot/strategy/values/FreeMoveValues.h"
-#include "playerbot/PullRegenPolicy.h"
+#include "playerbot/policy/pull/PullRegenPolicy.h"
+#include "playerbot/policy/travel/PointDangerPolicy.h"
 #include "playerbot/GrindSpotPolicy.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
 #include "Maps/GridNotifiers.h"
 #include "Maps/GridNotifiersImpl.h"
 #include "Maps/CellImpl.h"
@@ -29,6 +34,37 @@ int MaxGrindLevelOverBot(Player* bot, PlayerbotAI* ai)
 {
     return ai::PullGrindLevelCap(bot->GetLevel(), ai->HasRealPlayerMaster());
 }
+}
+
+bool GrindTargetValue::IsAllowedInstanceTarget(PlayerbotAI* ai, Unit* target)
+{
+    if (!target) return false;
+    Player* bot = ai->GetBot();
+    Group* group = bot->GetGroup();
+    Player* master = ai->GetMaster();
+    if (!group || !ai->HasRealPlayerMaster() || !master || master->GetGroup() != group ||
+        !bot->IsInWorld() || !bot->GetMap()->IsDungeon())
+        return true;
+
+    AiObjectContext* context = ai->GetAiObjectContext();
+    if (AI_VALUE(ObjectGuid, "explicit attack target") == target->GetObjectGuid()) return true;
+    int const mark = RtiTargetValue::GetRtiIndex(AI_VALUE(std::string, "rti"));
+    if (mark >= 0 && ObjectGuid(group->GetTargetIcon(mark)) == target->GetObjectGuid()) return true;
+
+    // A global combat flag can belong to another party. Require this group's
+    // actual victim/threat relationship, never a stale autonomous attack order.
+    if (!target->IsInCombat() || !target->IsInMap(bot)) return false;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (!member->IsInWorld() || !member->IsAlive() || !member->IsInMap(bot)) continue;
+        auto engaged = [target](Unit* unit)
+        {
+            return unit && (target->GetVictim() == unit || unit->GetVictim() == target ||
+                target->GetThreatManager().getThreat(unit) > 0.0f);
+        };
+        if (engaged(member) || engaged(member->GetPet())) return true;
+    }
+    return false;
 }
 
 Unit* GrindTargetValue::Calculate()
@@ -106,7 +142,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
     for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); i++)
     {
         Unit* unit = ai->GetUnit(*i);
-        if (!unit || !sServerFacade.IsAlive(unit))
+        if (!unit || !sServerFacade.IsAlive(unit) || !IsAllowedInstanceTarget(ai, unit))
             continue;
 
         // Belt and braces: "possible attack targets" is built from "attackers", which
@@ -185,7 +221,7 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
     for (std::list<ObjectGuid>::iterator tIter = targets.begin(); tIter != targets.end(); tIter++)
     {
         Unit* unit = ai->GetUnit(*tIter);
-        if (!unit)
+        if (!unit || !IsAllowedInstanceTarget(ai, unit))
             continue;
 
 
@@ -211,6 +247,20 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
             continue;
         }
 
+        // No player pull while either side is fresh from a revive: pool bots of
+        // both factions revived at one shared spirit healer and killed each
+        // other in a loop. Self-defence (the attackers loop above) still fights.
+        if (Player* victim = unit->ToPlayer())
+        {
+            PlayerbotAI* victimAi = PlayerbotAIStorage::Instance().GetAI(victim);
+            if (ai->InReviveGrace() || (victimAi && victimAi->InReviveGrace()) ||
+                victim->HasAura(SPELL_ID_PASSIVE_RESURRECTION_SICKNESS))
+            {
+                logGrind(unit, "ignored (revive grace).");
+                continue;
+            }
+        }
+
         Creature* creature = dynamic_cast<Creature*>(unit);
         if (creature && creature->GetCreatureInfo() && creature->GetCreatureInfo()->rank > CREATURE_ELITE_NORMAL && !AI_VALUE(bool, "can fight elite"))
         {
@@ -222,6 +272,23 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
         {
             logGrind(unit, "ignored (is pet or evading/unkillable).");
             continue;
+        }
+        // Issue #872: an autonomous alt never PICKS a target whose kill
+        // lowers a reputation on its own. Self-defence (the attackers loop
+        // above) still answers anything that attacks it, and rep lost in a
+        // group fight is accepted. The core's ReputationOnKill table says
+        // whose kill moves which standing and by how much.
+        if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()) &&
+            unit->IsCreature())
+        {
+            Creature const* creature = static_cast<Creature const*>(unit);
+            ReputationOnKillEntry const* rep = sObjectMgr.GetReputationOnKillEntry(creature->GetEntry());
+            bool killLowersRep = rep && (rep->repvalue1 < 0 || rep->repvalue2 < 0);
+            if (!TortoiseBots::AltBotMayPickTarget(killLowersRep))
+            {
+                logGrind(unit, "ignored (kill lowers reputation).");
+                continue;
+            }
         }
 
         if (!PossibleAttackTargetsValue::IsPossibleTarget(unit, bot, sPlayerbotAIConfig.sightDistance, false))
@@ -367,16 +434,21 @@ Unit* GrindTargetValue::FindTargetForGrinding(int assistCount)
 Unit* GrindTargetValue::FindIdleFallbackTarget()
 {
     // Gate first, scan never: the wider grid visit only runs for an idle
-    // starter bot with no journey and an empty normal pick (see
+    // bot with no journey and an empty normal pick (see
     // GrindIdleFallbackAllowed in GrindSpotPolicy.h). Everything else keeps
-    // today's behaviour.
+    // today's behaviour. Called only when the normal pick came back empty,
+    // so normalPickEmpty is true by construction.
     TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
+    if (!ai::GrindIdleFallbackAllowed(sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster(),
+        bot->GetLevel(), travelTarget && travelTarget->IsActive(),
+        sServerFacade.IsInCombat(bot), bot->InBattleGround(),
+        WorldPosition(bot).isOverworld(), AI_VALUE(bool, "can move around"), true))
+        return nullptr;
 
     uint32 const nowMs = WorldTimer::getMSTime();
     if (lastIdleFallbackMs && nowMs - lastIdleFallbackMs < ai::GRIND_IDLE_FALLBACK_INTERVAL_MS)
         return nullptr;
     lastIdleFallbackMs = nowMs;
-
     // The normal 60 yd scan is empty by construction here: look a little
     // wider for the nearest mob the bot can actually fight. Every per-mob
     // gate mirrors the normal pick - in-cap only (PullGrindLevelCap, never
@@ -394,7 +466,7 @@ Unit* GrindTargetValue::FindIdleFallbackTarget()
 
     for (Unit* unit : units)
     {
-        if (!unit || !sServerFacade.IsAlive(unit))
+        if (!unit || !sServerFacade.IsAlive(unit) || !IsAllowedInstanceTarget(ai, unit))
             continue;
 
         Creature* creature = dynamic_cast<Creature*>(unit);
@@ -427,6 +499,20 @@ Unit* GrindTargetValue::FindIdleFallbackTarget()
 
         float const dist = sServerFacade.GetDistance2d(bot, unit);
         if (best && !(dist < bestDist))
+            continue;
+
+        // Above the starter band the fallback walks into real camps, so the
+        // travel layer's own survival gates apply: no mob inside a camp the
+        // bot keeps dying in (issue #398), and no mob whose surroundings
+        // hold hostiles past the grind cap (PointDangerPolicy.h, #418).
+        // Both are data-only reads (avoidance list, static spawn index),
+        // run only for a candidate nearer than the current best.
+        WorldPosition mobPos(unit);
+        if (ai->IsDeathSpotAvoided(mobPos.GetMapId(), mobPos.getX(), mobPos.getY(), nowMs))
+            continue;
+        uint32 const highestNear = mobPos.GetHighestHostileLevelNear(
+            ai::POINT_DANGER_RADIUS_YD, bot->GetTeam());
+        if (highestNear != 0 && ai::PointDangerous((int)highestNear, bot->GetLevel()))
             continue;
 
         if (!WorldPosition(bot).canPathTo(WorldPosition(unit), bot))

@@ -26,6 +26,13 @@ void FrostMageStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "icicles",
         NextAction::array(0, new NextAction("icicles", ACTION_HIGH), NULL)));
+
+    // The filler has no "shoot" fallback (a GCD or threat-veto refusal
+    // must not start the wand); wand only while its mana cost is out of
+    // reach, below every spell row (NukeUnaffordable, WandPolicy.h).
+    triggers.push_back(new TriggerNode(
+        "frostbolt unaffordable",
+        NextAction::array(0, new NextAction("shoot", ACTION_DEFAULT), NULL)));
 }
 
 void FrostMageStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -119,13 +126,28 @@ void FrostMageAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     MageAoeStrategy::InitCombatTriggers(triggers);
 
+    // MAG-2: own flamestrike burning under the pack — channel blizzard on
+    // top (donor: blizzard-on-active 24 above flamestrike 23).
     triggers.push_back(new TriggerNode(
-        "ranged medium aoe",
-        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH + 1), NULL)));
+        "flamestrike window",
+        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH + 2), NULL)));
+
+    // Instant burst: no cast or channel while the pack stands on the mage.
+    triggers.push_back(new TriggerNode(
+        "arcane explosion window",
+        NextAction::array(0, new NextAction("arcane explosion", ACTION_HIGH + 1.5f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "ranged light aoe",
+        NextAction::array(0, new NextAction("cone of cold", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "ranged medium aoe",
-        NextAction::array(0, new NextAction("flamestrike", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("flamestrike", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "ranged medium aoe",
+        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH), NULL)));
 }
 
 void FrostMageAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)

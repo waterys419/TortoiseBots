@@ -1,11 +1,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,9 +20,12 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"tortoise-observability/internal/agentmaps"
 	"tortoise-observability/internal/armory"
 	"tortoise-observability/internal/auth"
+	"tortoise-observability/internal/dungeons"
 	zoneproject "tortoise-observability/internal/map"
+	"tortoise-observability/internal/mapdir"
 	"tortoise-observability/internal/metrics"
 	"tortoise-observability/internal/model"
 	"tortoise-observability/internal/ringbuf"
@@ -46,8 +53,13 @@ func getEnvInt(key string, fallback int) int {
 
 func main() {
 	httpPort := flag.Int("http-port", getEnvInt("HTTP_PORT", 8095), "HTTP server port")
+	// 127.0.0.1 by default: the dashboard is a management surface, so it must
+	// not silently listen on all interfaces. Containers and LAN setups set
+	// 0.0.0.0 (HTTP_HOST) to make the port publishable.
+	httpHost := flag.String("http-host", getEnv("HTTP_HOST", "127.0.0.1"), "HTTP server bind address (127.0.0.1 = local only, 0.0.0.0 = all interfaces, for containers/LAN)")
 	udpHost := flag.String("udp-host", getEnv("UDP_HOST", "127.0.0.1"), "UDP telemetry listen address")
 	udpPort := flag.Int("udp-port", getEnvInt("UDP_PORT", 9195), "UDP telemetry listener port")
+	forwardUDP := flag.String("forward-udp", getEnv("FORWARD_UDP", ""), "Comma-separated host:port list; every telemetry datagram is also sent to each (empty = no forwarding)")
 	dbHost := flag.String("db-host", getEnv("DB_HOST", "127.0.0.1"), "MariaDB / MySQL host")
 	dbPort := flag.Int("db-port", getEnvInt("DB_PORT", 3306), "MariaDB / MySQL port")
 	dbUser := flag.String("db-user", getEnv("DB_USER", "mangos"), "MariaDB / MySQL user")
@@ -58,6 +70,20 @@ func main() {
 	dbcDir := flag.String("dbc-dir", getEnv("DBC_DIR", ""), "Optional operator DBC directory (same files mangosd reads); enables talent trees when world talent mirrors are empty")
 	issueMinAgeSec := flag.Int("issue-min-age-sec", getEnvInt("ISSUE_MIN_AGE_SEC", 300), "Only surface bot issues that persist at least this many seconds")
 	minGMLevel := flag.Int("min-gm-level", getEnvInt("MIN_GM_LEVEL", 2), "Minimum GM rank required for dashboard login (2 = gamemaster)")
+	// An optional external commander dashboard (for example turtle-agent's
+	// `turtle-agent dashboard`) that the Commanders tab embeds. Unset: the tab
+	// shows what the module knows and nothing else.
+	commanderURLRaw := flag.String("commander-url", getEnv("TBDASH_COMMANDER_URL", ""), "Optional URL of an external commander dashboard to embed in the Commanders tab (env TBDASH_COMMANDER_URL)")
+	// Optional folder of real game-map pictures (turtle-agent `minimap-extract` output) for the Commanders tab maps. Never part of the
+	// repository: the owner's own extracted assets. Unset: the maps keep their plain grid.
+	mapDirRaw := flag.String("map-dir", getEnv("TBDASH_MAP_DIR", ""), "Optional folder of map pictures (<id>.png + <id>.json from `turtle-agent minimap-extract`) drawn under the Commanders tab maps (env TBDASH_MAP_DIR)")
+	// The run summaries the module's run trace recorder writes (`.bot trace`, AiPlayerbot.RunTrace.Dir under LogsDir). Read-only.
+	// Unset: look in the usual places (logs/traces, traces) next to where the daemon runs, and keep looking until one exists.
+	traceDir := flag.String("trace-dir", getEnv("TBDASH_TRACE_DIR", ""), "Folder of run trace summaries (<run>.summary.json) for the Dungeon runs tab; the module's AiPlayerbot.RunTrace.Dir (env TBDASH_TRACE_DIR)")
+	traceScanSec := flag.Int("trace-scan-sec", getEnvInt("TBDASH_TRACE_SCAN_SEC", 10), "How often the trace folder is checked for new or changed summaries, in seconds")
+	// Optional folder of turtle-agent run maps (`turtle-agent map`: one SVG per run, plus the single-file HTML replay with --html).
+	// Read-only and off by default: unset, the Agent maps tab is hidden and its routes 404.
+	agentMapsDirRaw := flag.String("agent-maps-dir", getEnv("TBDASH_AGENT_MAPS_DIR", ""), "Optional folder of turtle-agent run maps (`turtle-agent map` .svg and .html replays) listed in the Agent maps tab (env TBDASH_AGENT_MAPS_DIR)")
 	devNoAuth := flag.Bool("dev-no-auth", false, "Disable Game Master authentication check for local dev testing")
 	// The activity rollup is in-memory, so without this a dashboard restart
 	// resets every counter. The file sits in the mounted icon-cache directory
@@ -66,7 +92,20 @@ func main() {
 	activityStateFile := flag.String("activity-state-file",
 		getEnv("ACTIVITY_STATE_FILE", filepath.Join(getEnv("ICON_CACHE_DIR", filepath.Join(os.TempDir(), "tortoise_icons")), "activity-state.json")),
 		"Where to persist the per-bot activity counters across dashboard restarts (empty disables)")
+	// Client zone art is not shipped: operators generate it from their own
+	// client with scripts/gen_zone_maps.py into maps/ next to the binary.
+	defaultMapsDir := "maps"
+	if exe, err := os.Executable(); err == nil {
+		defaultMapsDir = filepath.Join(filepath.Dir(exe), "maps")
+	}
+	mapsDir := flag.String("maps-dir", getEnv("MAPS_DIR", defaultMapsDir),
+		"Zone art generated by scripts/gen_zone_maps.py")
 	flag.Parse()
+	if art, _ := filepath.Glob(filepath.Join(*mapsDir, "*.webp")); len(art) > 0 {
+		log.Printf("[Map] Serving %d generated zone maps from %s", len(art), *mapsDir)
+	} else {
+		log.Printf("[Map] No zone maps in %s; generate them with scripts/gen_zone_maps.py (see README)", *mapsDir)
+	}
 
 	log.Println("=====================================================")
 	log.Println(" Tortoise WoW — Bot & Server Observability Platform")
@@ -109,13 +148,26 @@ func main() {
 	}
 	log.Printf("[Map] Initialized coordinate projection engine with %d zones", len(projectionEngine.GetAllZones()))
 
+	// The session cookie is signed with HMAC-SHA256 keyed by SESSION_SECRET.
+	// There is no shipped default: unset, a random key is generated at
+	// startup, which is safe but ends every session on a restart.
+	sessionSecret := getEnv("SESSION_SECRET", "")
+	if sessionSecret == "" {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			log.Fatalf("Failed to generate a random session key: %v", err)
+		}
+		sessionSecret = hex.EncodeToString(key)
+		log.Println("[Auth] SESSION_SECRET not set: generated a random session key; dashboard sessions end on restart (set SESSION_SECRET to keep them)")
+	}
+
 	authService, err := auth.NewService(auth.Config{
 		DBHost:     *dbHost,
 		DBPort:     *dbPort,
 		DBUser:     *dbUser,
 		DBPassword: *dbPass,
 		DBName:     *dbName,
-		SecretKey:  getEnv("SESSION_SECRET", "tortoise-observability-salt-secret"),
+		SecretKey:  sessionSecret,
 		MinGMLevel: *minGMLevel,
 	})
 	if err != nil {
@@ -124,25 +176,25 @@ func main() {
 	log.Printf("[Auth] Realmd MySQL authentication ready against %s:%d/%s", *dbHost, *dbPort, *dbName)
 
 	armoryService, err := armory.NewService(armory.Config{
-		DBHost:           *dbHost,
-		DBPort:           *dbPort,
-		DBUser:           *dbUser,
-		DBPassword:       *dbPass,
-		CharDB:           *dbChar,
-		WorldDB:          *dbWorld,
-		DBCDir:           *dbcDir,
+		DBHost:     *dbHost,
+		DBPort:     *dbPort,
+		DBUser:     *dbUser,
+		DBPassword: *dbPass,
+		CharDB:     *dbChar,
+		WorldDB:    *dbWorld,
+		DBCDir:     *dbcDir,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize armory service: %v", err)
 	}
 	log.Printf("[Armory] Service initialized for %s and %s", *dbChar, *dbWorld)
 
-	// Equipped-gear sweep: one aggregate character-DB query every few minutes
-	// (never per tick) feeding the roster item-level column, the armory gear
-	// panel and the per-level-band averages. Runs immediately, then on the
-	// timer; a failed sweep keeps the previous numbers.
+	// Background DB sweeps: runs immediately then every 5 minutes.
+	// 1. Equipped-gear rollup feeding roster item-level and armory.
+	// 2. Lifetime completed quests and spells backfill from character DB.
+	// 3. Counters of deleted characters are forgotten.
 	go func() {
-		const gearInterval = 5 * time.Minute
+		const sweepInterval = 5 * time.Minute
 		for {
 			stats, err := armoryService.GearRollup()
 			if err != nil {
@@ -151,13 +203,87 @@ func main() {
 				store.SetGear(stats)
 				log.Printf("[Gear] swept %d bots", len(stats))
 			}
-			time.Sleep(gearInterval)
+
+			if existing, err := armoryService.ExistingCharacters(); err != nil {
+				log.Printf("[Activity] character sweep failed: %v", err)
+			} else if n := store.ForgetDeletedBots(existing); n > 0 {
+				log.Printf("[Activity] forgot %d deleted bots", n)
+			}
+
+			quests, qErr := armoryService.CompletedQuestsRollup()
+			spells, sErr := armoryService.SpellsLearnedRollup()
+			openQuests, oErr := armoryService.OpenQuestsRollup()
+			if qErr == nil && sErr == nil && oErr == nil {
+				store.BackfillActivityFromDB(quests, spells, openQuests)
+				log.Printf("[Activity] backfilled lifetime quests (%d bots), spells (%d bots), open quests (%d bots) from DB", len(quests), len(spells), len(openQuests))
+			} else {
+				if qErr != nil {
+					log.Printf("[Activity] quest backfill failed: %v", qErr)
+				}
+				if sErr != nil {
+					log.Printf("[Activity] spell backfill failed: %v", sErr)
+				}
+				if oErr != nil {
+					log.Printf("[Activity] open quests backfill failed: %v", oErr)
+				}
+			}
+
+			time.Sleep(sweepInterval)
 		}
 	}()
+
+	commanderURL, err := state.NormalizeCommanderURL(*commanderURLRaw)
+	if err != nil {
+		log.Printf("[Commanders] ignoring commander URL: %v", err)
+		commanderURL = ""
+	} else if commanderURL != "" {
+		log.Printf("[Commanders] embedding the commander dashboard at %s", commanderURL)
+	}
+
+	mapPics, err := mapdir.New(*mapDirRaw)
+	if err != nil {
+		log.Printf("[Commanders] ignoring the map folder %q: %v", *mapDirRaw, err)
+		mapPics = nil
+	} else if mapPics != nil {
+		log.Printf("[Commanders] real map pictures served from %s", mapPics.Root())
+	}
+
+	// Dungeon runs tab: one pass over the trace folder now, then a cheap directory check every few seconds. Requests read the in-memory index.
+	dungeonIndex := dungeons.NewIndex(*traceDir)
+	dungeonIndex.Scan()
+	if m := dungeonIndex.Meta(); m.DirFound {
+		log.Printf("[Dungeons] %d dungeon runs from %s", m.Runs, m.Dir)
+	} else {
+		log.Printf("[Dungeons] no trace folder yet (%s); runs appear once `.bot trace` has written one (set -trace-dir / TBDASH_TRACE_DIR)", m.Dir)
+	}
+	if *traceScanSec < 2 {
+		*traceScanSec = 2
+	}
+	go dungeonIndex.Loop(time.Duration(*traceScanSec)*time.Second, make(chan struct{}))
+
+	agentMaps, err := agentmaps.New(*agentMapsDirRaw)
+	if err != nil {
+		log.Printf("[AgentMaps] ignoring the run-map folder %q: %v", *agentMapsDirRaw, err)
+		agentMaps = nil
+	} else if agentMaps != nil {
+		log.Printf("[AgentMaps] run maps served from %s (at most %d files, %d MiB each)", agentMaps.Root(), agentmaps.MaxFiles, agentmaps.MaxFileSize>>20)
+	}
 
 	// 5. WebSocket hub and UDP ingestion
 	hub := ws.NewHub()
 	udpListener := udp.NewListener(*udpHost, *udpPort, store, metricsRegistry, projectionEngine, hub)
+	var forwards []string
+	for _, f := range strings.Split(*forwardUDP, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			forwards = append(forwards, f)
+		}
+	}
+	if err := udpListener.SetForwards(forwards); err != nil {
+		log.Fatalf("Refusing -forward-udp: %v", err)
+	}
+	if len(forwards) > 0 {
+		log.Printf("[UDP] Forwarding every telemetry datagram to %s", strings.Join(forwards, ", "))
+	}
 	if err := udpListener.Start(); err != nil {
 		log.Fatalf("Failed to start UDP listener: %v", err)
 	}
@@ -209,7 +335,9 @@ func main() {
 	})
 
 	mux.Handle("/static/", noCache(http.FileServer(http.FS(web.FS))))
-	mux.Handle("/maps/", noCache(http.FileServer(http.FS(web.FS))))
+	mux.Handle("/maps/", noCache(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(*mapsDir, filepath.Base(r.URL.Path)))
+	})))
 	mux.Handle("/data/", noCache(http.FileServer(http.FS(web.FS))))
 	mux.Handle("/metrics", promhttp.Handler())
 
@@ -218,6 +346,11 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(loginHTML)
 	})
+
+	// Per-IP login backoff (in-memory): 5 failed logins in a row block that
+	// address for 5 minutes. Every failure — wrong password, too low a rank
+	// or a blocked address — answers with the same error text.
+	loginBackoff := auth.NewLoginBackoff()
 
 	mux.HandleFunc("/api/v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -234,13 +367,27 @@ func main() {
 			return
 		}
 
-		session, err := authService.Authenticate(req.Username, req.Password)
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
+			ip = r.RemoteAddr
+		}
+		const loginFailure = "invalid username or password"
+		if !loginBackoff.Allow(ip) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": loginFailure})
 			return
 		}
+
+		session, err := authService.Authenticate(req.Username, req.Password)
+		if err != nil {
+			loginBackoff.Fail(ip)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": loginFailure})
+			return
+		}
+		loginBackoff.Reset(ip)
 
 		token := authService.CreateSessionToken(session)
 		authService.SetSessionCookie(w, token)
@@ -253,10 +400,7 @@ func main() {
 		})
 	})
 
-	mux.HandleFunc("/api/v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
-		authService.ClearSessionCookie(w)
-		http.Redirect(w, r, "/login", http.StatusFound)
-	})
+	mux.HandleFunc("/api/v1/auth/logout", logoutHandler(authService))
 
 	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +448,14 @@ func main() {
 		writeJSON(w, store.Snapshot().Grinding)
 	}))
 
+	// Chart history: the rolling in-memory samples (one per heartbeat)
+	// behind the dashboard's 10-minute timelines. The page seeds its
+	// charts from this on load instead of starting empty after a
+	// refresh; live heartbeats then keep appending as before.
+	mux.HandleFunc("GET /api/v1/history", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, store.History())
+	}))
+
 	// Issue episodes (active + recently resolved). The dashboard fetches this
 	// on init and on Refresh to recover the issue tab/badge when a WebSocket
 	// event was missed.
@@ -348,6 +500,80 @@ func main() {
 		}
 		writeJSON(w, store.QuestFeed(f))
 	}))
+
+	mux.HandleFunc("/api/v1/activity/pvp", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		f := state.PvpFilter{Bot: q.Get("bot"), Limit: int(qUint(q.Get("limit")))}
+		if f.Limit <= 0 {
+			f.Limit = 200
+		}
+		if f.Limit > 2000 {
+			f.Limit = 2000
+		}
+		writeJSON(w, store.PvpFeed(f))
+	}))
+
+	// Commanders: the standing remote-commander bindings the module reports
+	// (COMMANDERS datagrams), plus the embedded external dashboard's URL when
+	// the operator set one. Memory only; nothing here reads a database.
+	mux.HandleFunc("/api/v1/commanders", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, struct {
+			model.CommandersView
+			ExternalURL string `json:"external_url,omitempty"`
+			RealMaps    bool   `json:"real_maps"`
+		}{store.Commanders(), commanderURL, mapPics != nil})
+	}))
+
+	// The live dungeon runs (issue #895): one entry per instance copy (map +
+	// instance id) of a dungeon or raid that has bots in it, members (bots and
+	// real players) included. Read-only: the tab draws, it never orders.
+	mux.HandleFunc("/api/v1/dungeons", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, store.Dungeons())
+	}))
+
+	// The bound bots' recent paths (a short bounded history kept in memory), so a page opened mid-run starts with the trails drawn:
+	// {"<commander>": {"<bot guid>": {"map": 209, "pts": [[x, y, unix seconds], ...]}}}, oldest point first. A point where something
+	// happened carries a fourth element: "d" the bot died here, "t" it teleported (a jump no walking explains), "r" the same while dead
+	// (spirit release or resurrection), "m" it arrived on this map. A point marked t, r or m starts a new segment: draw no line from the
+	// point before it.
+	mux.HandleFunc("/api/v1/commanders/trails", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		type trailJSON struct {
+			Map uint32  `json:"map"`
+			Pts [][]any `json:"pts"`
+		}
+		out := map[string]map[string]trailJSON{}
+		for c, bots := range store.Trails() {
+			m := make(map[string]trailJSON, len(bots))
+			for g, t := range bots {
+				pts := make([][]any, len(t.Points))
+				for i, p := range t.Points {
+					pts[i] = []any{math.Round(float64(p.X)*10) / 10, math.Round(float64(p.Y)*10) / 10, p.T}
+					if p.Kind != 0 {
+						pts[i] = append(pts[i], string(rune(p.Kind)))
+					}
+				}
+				m[strconv.FormatUint(uint64(g), 10)] = trailJSON{Map: t.Map, Pts: pts}
+			}
+			out[c] = m
+		}
+		writeJSON(w, out)
+	}))
+
+	// Real map pictures for the Commanders maps: the layer list of a map id, and the .png/.json files of the TBDASH_MAP_DIR folder
+	// (nothing else). Behind the same login as the rest of the API.
+	if mapPics != nil {
+		mux.HandleFunc(mapdir.MapsPrefix, requireAuth(mapPics.HandleLayers))
+		mux.HandleFunc(mapdir.FilePrefix, requireAuth(mapPics.HandleFile))
+	}
+
+	// Dungeon runs (GET /api/v1/dungeon-runs; the live Dungeons tab is /api/v1/dungeons above): success rate, clear times, boss kill times and wipe spots from the run trace summaries. Files only; GET only.
+	dungeonIndex.Register(mux, requireAuth)
+	// Turtle-agent run maps (issue #1102): the list and the read-only files of --agent-maps-dir, behind the same login. The folder
+	// is off by default; when it is not set no route is registered, so the tab's URLs 404 and the page hides the tab.
+	if agentMaps != nil {
+		mux.HandleFunc(agentmaps.ListPrefix, requireAuth(agentMaps.HandleList))
+		mux.HandleFunc(agentmaps.FilePrefix, requireAuth(agentMaps.HandleFile))
+	}
 
 	mux.HandleFunc("/api/v1/server-info", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		if info := store.ServerInfo(); info != nil {
@@ -421,8 +647,38 @@ func main() {
 		writeJSON(w, profile)
 	}))
 
+	// Read-only auction house view: one page per request, filtered and sorted
+	// by the database; never touches the game server.
+	mux.HandleFunc("GET /api/v1/auctions", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		quality := -1
+		if v, err := strconv.Atoi(q.Get("quality")); err == nil {
+			quality = v
+		}
+		page, err := armoryService.ListAuctions(armory.AuctionFilter{
+			Query:    q.Get("q"),
+			Quality:  quality,
+			MinLevel: qUint(q.Get("min_level")),
+			MaxLevel: qUint(q.Get("max_level")),
+			Seller:   q.Get("seller"),
+			Kind:     q.Get("kind"),
+			House:    q.Get("house"),
+			Sort:     q.Get("sort"),
+			Desc:     q.Get("dir") != "asc",
+			Page:     qUint(q.Get("page")),
+		})
+		if err != nil {
+			log.Printf("[Auctions] list failed: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, page)
+	}))
+
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		// Only the dashboard's own pages may open an authenticated stream
+		// (ws.SameOrigin); non-browser clients send no Origin and pass.
+		CheckOrigin: ws.SameOrigin,
 	}
 
 	mux.HandleFunc("/api/v1/stream", func(w http.ResponseWriter, r *http.Request) {
@@ -438,6 +694,7 @@ func main() {
 		initial := []ws.Event{
 			{Name: "snapshot", Data: store.Snapshot()},
 			{Name: "status", Data: store.Status()},
+			{Name: "commanders", Data: store.Commanders()},
 		}
 		if info := store.ServerInfo(); info != nil {
 			initial = append(initial, ws.Event{Name: "server_info", Data: info})
@@ -445,7 +702,7 @@ func main() {
 		hub.Serve(w, r, upgrader, initial...)
 	})
 
- serverAddr := fmt.Sprintf("0.0.0.0:%d", *httpPort)
+	serverAddr := net.JoinHostPort(*httpHost, strconv.Itoa(*httpPort))
 	log.Printf("[HTTP] Dashboard & API running at http://localhost:%d/dashboard", *httpPort)
 	log.Printf("[HTTP] Prometheus metrics available at http://localhost:%d/metrics", *httpPort)
 
@@ -459,6 +716,34 @@ func main() {
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server failed: %v", err)
+	}
+}
+
+// logoutHandler ends the session. Logout is POST-only: a GET or HEAD must not
+// clear the cookie, or a sandboxed page could log a GM out with a plain request.
+// POST alone is not enough: a cross-site HTML form POST is a top-level
+// navigation, so the browser would apply the clearing Set-Cookie. The request
+// must also be same-origin (Origin matches the Host, as for the WebSocket
+// stream); a missing, foreign or opaque (Origin: null) origin gets 403 and the
+// cookie is left alone. The dashboard's button posts with fetch and navigates to
+// /login itself.
+func logoutHandler(authService *auth.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// ws.SameOrigin lets a request with no Origin pass (the WebSocket stream
+		// relies on that for non-browser clients). Logout is stricter: the
+		// dashboard's button is a same-origin fetch POST, which every current
+		// browser sends with Origin, so a POST without one is refused too.
+		if r.Header.Get("Origin") == "" || !ws.SameOrigin(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		authService.ClearSessionCookie(w)
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

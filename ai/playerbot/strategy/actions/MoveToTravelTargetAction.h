@@ -1,5 +1,5 @@
 #pragma once
-#include "playerbot/ServiceTripPolicy.h"
+#include "playerbot/policy/travel/ServiceTripPolicy.h"
 #include "playerbot/PlayerbotAI.h"
 
 #include "playerbot/strategy/Action.h"
@@ -16,6 +16,7 @@ namespace ai
 
         virtual bool Execute(Event& event) override;
         virtual bool isUseful() override;
+        bool TryUndercityLift(WorldPosition const& location);
 
         // Stuck-hand-in fallback, shared with the re-pick observation in
         // ChooseTravelTargetAction::setNewTarget: records one no-progress
@@ -50,11 +51,35 @@ namespace ai
         // Returns true when the rescue fired (the drop below is skipped).
         bool TryRescueServiceTrip(TravelTarget* target, std::string const& purpose);
 
+        // On by default (AiPlayerbot.StuckTravelTeleport; 0 disables): a masterless
+        // pool bot's trip of any purpose at the failure threshold teleports to
+        // its destination (mesh landing, else the nearest route node near it)
+        // instead of dropping; unwatched, same map, once per 10 min. Logs
+        // StuckTravelTeleport. Returns true when the bot was teleported.
+        bool TryRescueStuckTravel(TravelTarget* target, std::string const& purpose);
+
         // Counts targets that fail NOPATH from one spot (TravelRepickPolicy.h)
         // and, at the threshold, runs the long-stuck rescue instead of
         // cycling targets from a spot nothing is reachable from. Returns true
         // when the rescue ran (the caller stops this tick).
-        bool TryRescueNoPathTrap(bool noPath, std::string const& purpose);
+        bool TryRescueNoPathTrap(bool noPath, bool offGraph, std::string const& purpose);
+        bool TeleportToNearestRouteNode();
+
+        // No-displacement watchdog for a move that reported success: a spline
+        // launched into geometry (or a collapsed shortcut) returns true while
+        // the bot never displaces, and each phantom success decays the retry
+        // budget, so the 6-fail drop never fires. Same anchor + window shape
+        // as MoveToLootAction::StuckOnApproach. Returns true when the bot has
+        // stood inside the radius for the whole window: the caller counts a
+        // failed move instead of decaying. A scheduled teleport-hop wait and
+        // a transport leg stand still by design and are skipped.
+        bool TravelMoveMadeNoProgress();
+        bool TryStepTowardTarget(WorldPosition const& location);
+
+        float noProgressX = 0.0f;
+        float noProgressY = 0.0f;
+        time_t noProgressSince = 0;
+        bool noProgressArmed = false;
     };
 
 }

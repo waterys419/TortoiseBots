@@ -253,10 +253,13 @@ namespace ai
 	};
 
 	//A location with rpg target(s) based on race and level
+	//Expires a minute after arrival: a pool bot gets a decision every 15-25 s, so the
+	//sell/repair/train/chat at the npc fits in it, and the default five minutes left
+	//bots standing next to a vendor or trainer they had already finished with.
 	class RpgTravelDestination : public EntryTravelDestination
 	{
 	public:
-		RpgTravelDestination(TravelDestinationPurpose purpose, uint32 /*id*/, int32 entry) : EntryTravelDestination(purpose, entry) {}
+		RpgTravelDestination(TravelDestinationPurpose purpose, uint32 /*id*/, int32 entry) : EntryTravelDestination(purpose, entry) { SetExpireFast(); }
 
 		virtual bool IsPossible(const PlayerTravelInfo& info) const override;
 		virtual bool IsActive(Player* bot, const PlayerTravelInfo& info) const override;
@@ -411,6 +414,11 @@ namespace ai
 		// the re-point budget (or the other way round).
 		void DecRetry(bool isMove) { if (isMove) { if (moveRetryCount > 0) moveRetryCount--; } else if (extendRetryCount > 0) extendRetryCount--; }
 
+		// Closest the bot has come to this target's point on this trip (< 0:
+		// not measured yet). Reset with the move budget in SetTarget; read by
+		// the hand-in progress rule (HandInTripProgressed).
+		float& HandInBestDistance() { return handInBestDistance; }
+
 		void CopyTarget(TravelTarget* const target);
 	private:
 		uint32 GetMaxTravelTime() const { return (1000.0 * Distance(bot)) / bot->GetSpeed(MOVE_RUN); }
@@ -425,6 +433,7 @@ namespace ai
 
 		uint32 extendRetryCount = 0;
 		uint32 moveRetryCount = 0;
+		float handInBestDistance = -1.0f;
 
 		TravelDestination* tDestination = nullptr;
 		std::vector<std::string> travelConditions = {};

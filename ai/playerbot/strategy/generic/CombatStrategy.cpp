@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "CombatStrategy.h"
 #include "playerbot/ServerFacade.h"
+#include "../../../../runtime/CommandedGroupQuery.h"
 
 using namespace ai;
 
@@ -62,6 +63,18 @@ float AvoidAoeStrategyMultiplier::GetValue(Action* action)
 
 void AvoidAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // Proactive strafe-to-safety: "aoe threat nearby" fires on any of the
+    // three sensors (dynobj aura, damaging trap, trigger NPC — none of
+    // which the old "has area debuff" row could see), so the bot steps out
+    // BEFORE the debuff lands. The strafe self-gates via isUseful (bot
+    // actually inside the hazard radius). Flee is deliberately NOT listed
+    // here: the sensors scan 15yd while radii are often 5-8yd, so mere
+    // proximity would full-flee, and a useful-but-unlandable strafe would
+    // win the reaction pick every tick and starve the fallback.
+    triggers.push_back(new TriggerNode(
+        "aoe threat nearby",
+        NextAction::array(0, new NextAction("avoid aoe", ACTION_EMERGENCY + 5), NULL)));
+    // Reactive fallback: once the debuff actually lands, run out.
     triggers.push_back(new TriggerNode(
         "has area debuff",
         NextAction::array(0, new NextAction("flee", ACTION_EMERGENCY + 5), NULL)));
@@ -109,13 +122,25 @@ void WaitForAttackStrategy::InitCombatMultipliers(std::list<Multiplier*>& multip
 
 bool WaitForAttackStrategy::ShouldWait(PlayerbotAI* ai)
 {
+    // The run leader's healer is held on its stand for a pull but never kept
+    // from healing: the join window gates damage, and it deals none.
+    if (ai->RunHealOnly() && PlayerbotAI::IsHeal(ai->GetBot()))
+        return false;
+
     // Only check if the bot has the strategy enabled
     if (ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT))
     {
-        // Only check if bot is in a group with a real player
+        // Only check if the bot is in a group with a real player, or in a party
+        // bound to a dungeon run while a run-leader pull holds it (a hired run
+        // party's master is its hirer, often a real player outside the group,
+        // so the first clause is usually true there; the second covers a
+        // masterless bound party). A bot's own stored "wait for attack" never
+        // holds at every fight start in a bot-only run: without a pull window
+        // there is no pull to wait for (lead decision on ta265).
         Player* bot = ai->GetBot();
         AiObjectContext* context = ai->GetAiObjectContext();
-        if (bot->GetGroup() && ai->HasRealPlayerMaster())
+        if (bot->GetGroup() && (ai->HasRealPlayerMaster() ||
+            (TortoiseBots::BotCommands::IsInRunningDungeonRun(bot) && ai->HasPullWindow())))
         {
             // Don't wait if the current target is an enemy player
             bool enemyPlayer = false;
@@ -182,4 +207,11 @@ void HealInterruptStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
 void HealInterruptStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
 {
     InitCombatTriggers(triggers);
+}
+
+void SpreadStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
+{
+    triggers.push_back(new TriggerNode(
+        "spread needed",
+        NextAction::array(0, new NextAction("raid spread", ACTION_NORMAL), NULL)));
 }

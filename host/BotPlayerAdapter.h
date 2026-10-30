@@ -12,20 +12,32 @@ public:
     BotPlayerAdapter();
     bool IsManagedBot(Player* who) override;
     uint8 GetBotRoles(Player* who) override;
+    // SM-REVIVE-PATH-2026-10-23: the core's managed-bot repop in a dungeon
+    // asks for the door; the module answers the one nearest the corpse.
+#ifdef TORTOISEBOTS_CORE_HAS_BOT_REPOP
+    uint32 GetBotRepopEntrance(Player* bot, uint32 mapId, float x, float y, float z) override;
+#endif
     void OnLogin(Player* player) override;
     void OnMapChanged(Player* player) override;
+    // Issue #1043: hands a bot's clearly misplaced pet to
+    // BotManager::CheckNewPetSpawn before the map updates creatures.
+    void OnUpdate(Player* player, uint32 diff) override;
     void OnPlayerCompleteQuest(Player* player, Quest const* quest) override;
     void OnBeforeLogout(Player* player) override;
     void OnLogout(Player* player) override;
 };
 
 // Unit lifecycle adapter to capture lethal damage events (accurate killer attribution).
+// The damage hook remembers the last non-self damager so a Spirit of
+// Redemption expiry (core self-kill, spell 27965) still logs the mob that
+// dealt the fatal blow instead of "Environment".
 class BotUnitAdapter final : public UnitScript
 {
 public:
     BotUnitAdapter();
 
     void OnUnitDeath(Unit* unit, Unit* killer) override;
+    void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override;
 };
 
 } // namespace TortoiseBots

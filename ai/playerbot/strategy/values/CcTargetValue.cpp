@@ -1,21 +1,28 @@
 
 #include "playerbot/playerbot.h"
 #include "CcTargetValue.h"
+#include "CurrentCcTargetValue.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/Action.h"
 #include "PossibleAttackTargetsValue.h"
+#include "CcMarkHoldPolicy.h"
 #include "playerbot/GroupMembers.h"
+#include "../../../../runtime/CommandedGroupQuery.h"
+#include "../../../../runtime/TotemSpellPolicy.h"
 
 using namespace ai;
 
-class FindTargetForCcStrategy : public FindTargetStrategy
+class FindTargetForCcStrategy : public FindNonCcTargetStrategy
 {
 public:
-    FindTargetForCcStrategy(PlayerbotAI* ai, std::string spell) : FindTargetStrategy(ai)
+    FindTargetForCcStrategy(PlayerbotAI* ai, std::string spell) : FindNonCcTargetStrategy(ai)
     {
         this->spell = spell;
         maxDistance = 0;
+        // Once per calculation: the bot's bound party runs a run leader
+        // (`.bot run`), whose crowd control is its ordered mark only.
+        inRun = TortoiseBots::BotCommands::IsInRunningDungeonRun(ai->GetBot());
     }
 
 public:
@@ -24,6 +31,32 @@ public:
         Player* bot = ai->GetBot();
 
         AiObjectContext* context = ai->GetAiObjectContext();
+
+        // The assigned mark wins the whole tournament: the free-pick rules
+        // below assign `result` without looking at what it holds, so an
+        // open-world candidate checked after the mark replaced it and the
+        // CC bot sheeped another mob, or alternated, instead of its mark.
+        // One read per candidate: the value re-resolves its guid through
+        // the object accessor on every Get, and the mark is the same unit
+        // the assigned branch below compares against.
+        Unit* const assignedMark = AI_VALUE(Unit*, "rti cc target");
+        if (result && CcChooserKeepsResult(result == assignedMark))
+            return;
+
+        // A totem is never crowd-controlled (immune to it). A unit an NPC
+        // summoned or created (a mob's pet, a skeleton) stays a candidate,
+        // except in a run whose plan lists it kill_first (Zul'Farrak's
+        // Greater Healing Ward 8179: a mage polymorphed one while the party
+        // was told to kill it). runtime/TotemSpellPolicy.h.
+        if (creature->IsCreature())
+        {
+            bool const totem = static_cast<Creature*>(creature)->IsTotem();
+            bool const npcSummoned = creature->GetOwnerGuid().IsCreature() || creature->GetCreatorGuid().IsCreature();
+            bool const runKillFirst = inRun && npcSummoned &&
+                TortoiseBots::BotCommands::IsRunKillFirst(bot, creature->GetEntry());
+            if (TortoiseBots::CcLeavesOut(totem, npcSummoned, inRun, runKillFirst))
+                return;
+        }
 
         // Never CC over another CC (generalized from the Fear mark-only
         // branch): a mob already held by someone's breakable/unbreakable aura
@@ -36,14 +69,37 @@ public:
 
         // A bot assigned to this raid mark may still need to close distance.
         // Keep the normal legality/resource checks, but let the mature reach
-        // prerequisite handle range for that one assigned target.
+        // prerequisite handle range for that one assigned target: it stays
+        // the "cc target" out of range or sight, and the cast itself waits
+        // until "reach cc" has it in sight and inside the range margin
+        // (CastCrowdControlSpellAction::isPossible), so a 1.5 s cast is not
+        // started on a mark that can leave range before it finishes.
 
-        const bool assignedTarget = AI_VALUE(Unit*, "rti cc target") == creature;
+        const bool assignedTarget = assignedMark && assignedMark == creature;
+
+        // In a run leader's party only the run's ordered mark is crowd-
+        // controlled (19z5: ten Polymorphs on Blood Drinkers nobody ordered).
+        if (inRun && !assignedTarget)
+            return;
+
+        // Never a free pick on a mob the group is fighting: a sheep there is
+        // broken by the next hit (Blade Flurry, a swing, a pet). Only an
+        // explicit mark may CC a mob someone is on. Holds for the legacy
+        // chooser and for "auto cc" alike.
+        if (!assignedTarget && IsGroupFighting(creature))
+            return;
+
         if (!ai->CanCastSpell(spell, creature, true, nullptr, assignedTarget, true))
             return;
 
         if (assignedTarget)
         {
+            // Never CC once only CC marks are left: the party then kills
+            // the marks last (DPS/tank kill-last fallback, same test), so
+            // re-CCing would only stall the fight or ping-pong sheep and
+            // damage. A stunned/rooted/feared unmarked mob still counts.
+            if (OnlyCcMarksLeft(creature))
+                return;
             result = creature;
             return;
         }
@@ -53,7 +109,8 @@ public:
         // runs unmarked candidates. All conditions must hold:
         // - the bot may CC at all here (group combat),
         // - the candidate hits a party healer or caster, never the tank,
-        // - NOBODY in the group is attacking it (victim + pets),
+        // - NOBODY in the group is attacking or targeting it (IsGroupFighting
+        //   above: members' victim + selection, pets' victim),
         // - it carries NO periodic damage aura from any source (else sheep is
         //   pointless — owner's words; shyalya check #8, but for every spell),
         // - it is not the only enemy in the fight (never sheep the last mob),
@@ -132,6 +189,36 @@ public:
     }
 
 private:
+    // True when a group member (this bot included) or a member's pet is
+    // fighting the mob: its victim, or another member's selected target (a
+    // bot's attack target, a player's target). This bot's own selection is
+    // skipped: a cast with no prior selection leaves it on the cast target
+    // (the sheep itself); its own victim still counts.
+    // Guid compares only, no lookups.
+    // mod-playerbots 79bd428 (CcTargetValue.cpp) skips only the bot's own
+    // current target and lets a mob with no tank on it through.
+    bool IsGroupFighting(Unit* creature)
+    {
+        Player* bot = ai->GetBot();
+        Group* group = bot->GetGroup();
+        if (!group)
+            return bot->GetVictim() == creature;
+
+        const ObjectGuid guid = creature->getObjectGuid();
+        for (Player* member : LiveGroupMembers(group))
+        {
+            if (!member || !sServerFacade.IsAlive(member) || member->GetMapId() != bot->GetMapId())
+                continue;
+            if (member->GetVictim() == creature ||
+                (member != bot && member->GetSelectionGuid() == guid))
+                return true;
+            if (Unit* pet = member->GetPet())
+                if (pet->GetVictim() == creature)
+                    return true;
+        }
+        return false;
+    }
+
     // Smart auto-CC candidacy, see the call site for the rules.
     bool IsAutoCcTarget(Unit* creature)
     {
@@ -170,18 +257,8 @@ private:
         if (!PlayerbotAI::IsHeal(victimPlayer) && !ai->IsRanged(victimPlayer))
             return false;
 
-        // Nobody in the group may be attacking it (members + their pets);
-        // this also covers the tank's target.
-        for (Player* member : LiveGroupMembers(group))
-        {
-            if (!member || member->GetMapId() != bot->GetMapId())
-                continue;
-            if (member->GetVictim() == creature)
-                return false;
-            if (Unit* pet = member->GetPet())
-                if (pet->GetVictim() == creature)
-                    return false;
-        }
+        // "Nobody in the group attacks it" (tank's target included) is the
+        // IsGroupFighting guard in CheckAttacker, already passed here.
 
         // No periodic damage aura from any source — sheep would be pointless.
         // Shyalya precedent (CcTargetValue check #8) exempted fear/banish;
@@ -197,6 +274,7 @@ private:
     }
 
     std::string spell;
+    bool inRun = false;
     float maxDistance;
 };
 
@@ -214,7 +292,7 @@ Unit* CcTargetValue::Calculate()
         if (!ai->IsSafe(add))
             continue;
 
-        if (ai->HasMyAura(qualifier, add))
+        if (ai->HasMyAura(CcAuraName(qualifier), add))
             return NULL;
 
         if (qualifier == "polymorph")

@@ -12,6 +12,7 @@
 #include "playerbot/TravelMgr.h"
 #include "TellLosAction.h"
 #include "Transports/Transport.h"
+#include "playerbot/strategy/values/LastMovementValue.h"
 
 using namespace ai;
 
@@ -243,7 +244,8 @@ inline bool TellStuck(PlayerbotAI* ai, Player* requester)
 
     if (ai->GetState() == BotState::BOT_STATE_COMBAT)
     {
-        uint32 timeSinceCombatChange = AI_VALUE2(uint32, "time since last change", "combat::self target");
+        time_t const combatStart = AI_VALUE(time_t, "combat start time");
+        uint32 timeSinceCombatChange = combatStart ? uint32(time(0) - combatStart) : 0;
 
         if (timeSinceCombatChange > 2 * MINUTE)
         {
@@ -839,6 +841,8 @@ void GoAction::UpdateStrategyPosition(const WorldPosition& position)
       stayPosition.Set(position.getX(), position.getY(), position.getZ(), position.GetMapId());
       posMap["stay"] = stayPosition;
       posMap["return"] = stayPosition;
+      // An explicit order is a fresh stay walk, even to the same spot (StayWalkOrdered).
+      TortoiseBots::StayWalkOrdered(AI_VALUE(LastMovement&, "last movement").stayWalk);
    }
    else if (ai->HasStrategy("guard", ai->GetState()))
    {

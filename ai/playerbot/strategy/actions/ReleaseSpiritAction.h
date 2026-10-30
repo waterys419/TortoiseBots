@@ -7,12 +7,14 @@
 #include "playerbot/strategy/Action.h"
 #include "runtime/BotActivityLease.h"
 #include "runtime/BotManager.h"
+#include "runtime/RunReleaseHold.h"
 #include "Group/Group.h"
 #include "MovementActions.h"
 #include "playerbot/strategy/values/LastMovementValue.h"
 #include "ReviveFromCorpseAction.h"
 #include "playerbot/TravelMgr.h"
-#include "playerbot/GraveyardTeleportPolicy.h"
+#include "playerbot/policy/travel/GraveyardTeleportPolicy.h"
+#include "playerbot/policy/rpg/GroupHygienePolicy.h"
 
 namespace ai
 {
@@ -142,8 +144,17 @@ namespace ai
             // its own resurrection while a living group member of a resurrecting class is
             // on its map; only a wipe releases. Stock bots without a player master release
             // at once, which put crew members at the graveyard outside the instance.
-            if (TortoiseBots::BotActivityLeaseManager::Instance().GetActivity(bot->GetGUIDLow()) == TortoiseBots::BotActivity::Dungeon)
-                return !DungeonCrewHasLivingResurrecter() && !DungeonCrewInCombat();
+            // A hired bot bound to an active dungeon run waits at its body until the run's
+            // regroup (or the player) releases it; once the run is over the stock rules
+            // below decide again (runtime/RunReleaseHold.h).
+            TortoiseBots::RunReleaseHold::AutoRelease const verdict = TortoiseBots::RunReleaseHold::Decide(
+                TortoiseBots::BotActivityLeaseManager::Instance().GetActivity(bot->GetGUIDLow()),
+                TortoiseBots::RunReleaseHold::HeldByRun(bot), DungeonCrewHasLivingResurrecter(), DungeonCrewInCombat(),
+                bot->GetMap() && bot->GetMap()->Instanceable());
+            if (verdict == TortoiseBots::RunReleaseHold::AutoRelease::Wait)
+                return false;
+            if (verdict == TortoiseBots::RunReleaseHold::AutoRelease::Release)
+                return true;
 
             if (!bot->GetGroup())
                 return true;
@@ -217,7 +228,9 @@ namespace ai
             }
 
 
-            if (!ai->HasRealPlayerMaster())
+            if (ai::RepopLeavesGroup(ai->HasRealPlayerMaster(),
+                    TortoiseBots::BotActivityLeaseManager::Instance().GetActivity(bot->GetGUIDLow()) ==
+                        TortoiseBots::BotActivity::Dungeon))
             {
                 if (Group* group = bot->GetGroup())
                 {
@@ -260,7 +273,11 @@ namespace ai
                 if (grave)
                 {
                     WorldPosition gravePos(grave);
-                    if (IsUsableGraveyardTarget(true, grave->map_id == bot->GetMapId(), WorldPosition(bot).fDist(gravePos)))
+                    float const graveDist = WorldPosition(bot).fDist(gravePos);
+                    // A bot already standing on its graveyard (revived there,
+                    // then nopath-trapped) would teleport onto itself and loop;
+                    // send it to spawn/homebind below instead.
+                    if (graveDist > 30.0f && IsUsableGraveyardTarget(true, grave->map_id == bot->GetMapId(), graveDist))
                     {
                         sLog.outDetail("Repop: Teleporting bot #%d %s:%d <%s> to the nearest graveyard", bot->GetGUIDLow(), bot->GetTeam() == ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName());
                         bot->TeleportTo(grave->map_id, grave->x, grave->y, grave->z, bot->GetOrientation());

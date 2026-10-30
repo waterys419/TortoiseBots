@@ -60,7 +60,7 @@ bool PullTargetEngaged(Unit* target, Player* bot)
 // Re-stamp every held party bot's combat-start clock, optionally narrowing
 // its wait window. Shared by the pull landing (once the cast lands) and the
 // pull end (when a pullback's tank is back and takes the fight over).
-void RestampPullParty(Player* tank, uint32 waitSeconds, bool narrowWindow)
+void RestampPullParty(Player* tank, uint32 waitSeconds, bool narrowWindow, bool landedNow)
 {
     if (!tank)
         return;
@@ -71,14 +71,78 @@ void RestampPullParty(Player* tank, uint32 waitSeconds, bool narrowWindow)
         PlayerbotAI* memberAi = PlayerbotAIStorage::Instance().GetAI(member);
         if (!memberAi || !memberAi->GetAiObjectContext())
             continue;
-        if (!memberAi->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT))
+        // Only the bots this pull holds: a "wait for attack" of the player's
+        // own on a bot the pull did not park keeps its own delay and clock.
+        if (!memberAi->HasPullWindow())
             continue;
         if (narrowWindow)
-            memberAi->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(static_cast<uint8>(waitSeconds));
+            memberAi->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(
+                memberAi->PullWindowLeadKeyed()
+                    ? static_cast<uint8>(std::min<uint32>(std::max<uint32>(waitSeconds, ai::kPullLeadCapSeconds), 255))
+                    : static_cast<uint8>(waitSeconds));
+        else if (landedNow && memberAi->PullWindowLeadKeyed() &&
+            memberAi->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Get() < ai::kPullLeadCapSeconds)
+            memberAi->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(ai::kPullLeadCapSeconds);
         memberAi->GetAiObjectContext()->GetValue<time_t>("combat start time")->Set(time(0));
+        // The window's own clock ("pull hold expired").
+        memberAi->RestampPullWindow(landedNow);
     }
 }
 } // namespace
+
+// Chat pullback's party hold: mirrors PausePartyDpsForPull
+// (commands/BotCommandContext.cpp), which the chat path cannot reach (it
+// lives in the command layer, not the AI). Same anchor (the requester's
+// position, falling back to the tank), same stay + "wait for attack" join
+// window with its own clock - except healers are held too: they get the
+// window but no stay, so they stand free to heal while their damage rows
+// stay vetoed (HealerShouldAttackTrigger / HealerWandAllowed, gated on
+// HasPullWindow below). Member pets go passive for the window via their own
+// AI (ParkPetForPullHold, restored by their own EndPullWindow); the tank's
+// PullStartAction already pins its own pet and PullEndAction restores it.
+// The tank is skipped here (its own pull drives it), and other tanks are
+// left alone so an off-tank can still pick up loose mobs.
+void ai::PausePartyPullHold(Player* tank, uint32 joinDelaySeconds)
+{
+    if (!tank || !tank->GetGroup())
+        return;
+    PlayerbotAI* tankAi = PlayerbotAIStorage::Instance().GetAI(tank);
+    Player* requester = (tankAi && tankAi->GetMaster()) ? tankAi->GetMaster() : tank;
+    WorldPosition anchor((requester && requester->IsInWorld() &&
+        requester->GetMapId() == tank->GetMapId()) ? requester : tank);
+    uint32 windowSeconds = std::min<uint32>(255,
+        sPlayerbotAIConfig.pullBackMaxReturnTime + joinDelaySeconds);
+    for (Player* member : LiveGroupMembers(tank->GetGroup()))
+    {
+        if (!member || member == tank)
+            continue;
+        PlayerbotAI* memberAi = PlayerbotAIStorage::Instance().GetAI(member);
+        if (!memberAi || !memberAi->GetAiObjectContext())
+            continue;
+        if (PlayerbotAI::IsTank(member, true))
+            continue;
+        bool const healer = PlayerbotAI::IsHeal(member, true);
+        if (!healer)
+        {
+            memberAi->SetMovementStrategy("stay");
+            ai::PositionMap& posMap = memberAi->GetAiObjectContext()->GetValue<ai::PositionMap&>("position")->Get();
+            ai::PositionEntry stayPos = posMap["stay"];
+            stayPos.Set(anchor.getX(), anchor.getY(), anchor.getZ(), anchor.GetMapId());
+            posMap["stay"] = stayPos;
+            ai::PositionEntry holdPos = posMap["pull hold"];
+            holdPos.Set(anchor.getX(), anchor.getY(), anchor.getZ(), anchor.GetMapId());
+            posMap["pull hold"] = holdPos;
+        }
+        memberAi->StartPullWindow(static_cast<uint8>(windowSeconds));
+        memberAi->GetAiObjectContext()->GetValue<time_t>("combat start time")->Set(time(0));
+        // Member-owned stance (PlayerbotAI::ParkPetForPullHold): saved on the
+        // member's own AI and restored by its own EndPullWindow, so a member
+        // that leaves the group, logs out or dies mid-hold still gets its
+        // pet back. Re-hold while passive keeps the original stance.
+        memberAi->ParkPetForPullHold();
+    }
+}
+
 
 Unit* PullNearestTargetAction::FindPullTarget(PlayerbotAI* ai)
 {
@@ -189,6 +253,78 @@ bool PullRequestAction::Execute(Event& event)
     return true;
 }
 
+// "pullback [seconds]" from party chat: the event param is the "[seconds]"
+// tail ("" for a bare "pullback"). Parsed like the .bot option: 0-60, or
+// -1 when the tail is not a bare number (fall back to the configured
+// pullBackDpsJoinDelay instead of refusing a chat order).
+static int ParsePullbackJoinDelay(std::string const& param)
+{
+    std::string tail = param;
+    size_t first = tail.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return -1;
+    size_t last = tail.find_last_not_of(" \t");
+    tail = tail.substr(first, last - first + 1);
+    if (tail.empty() || tail.find_first_of(" \t") != std::string::npos)
+        return -1;
+    for (char character : tail)
+    {
+        if (character < '0' || character > '9')
+            return -1;
+    }
+    long seconds = std::atol(tail.c_str());
+    return (seconds >= 0 && seconds <= 60) ? static_cast<int>(seconds) : -1;
+}
+
+bool PullbackMyTargetAction::Execute(Event& event)
+{
+    // Chat pullback: only the tank may start the shared pull path, like the
+    // chat "pull" before it. Every other bot stays held by the trigger (its
+    // "pullback my target" resolves to no action there). A plain
+    // "pull my target" here would walk the whole party at the mob.
+    if (!ai->IsTank(bot, true))
+        return false;
+
+    int seconds = ParsePullbackJoinDelay(event.GetParam());
+    uint32 joinDelay = seconds >= 0 ? static_cast<uint32>(seconds)
+        : sPlayerbotAIConfig.pullBackDpsJoinDelay;
+
+    // The command path configures the pull mode before the request action
+    // runs (BotCommands.cpp: ConfigurePullMode, then "pull my target"):
+    // RequestPull snapshots the return-leg intent and DecideOpening reads
+    // the command state, so the order must exist first. Do the same here:
+    // flip "pull back" on with the tank's real prior state, record the
+    // per-request mode, and roll everything back when the request refuses
+    // (validation failures below place no hold and touch no party bot).
+    bool hadPullBack = ai->HasStrategy("pull back", BotState::BOT_STATE_COMBAT) ||
+        ai->HasStrategy("pull back", BotState::BOT_STATE_NON_COMBAT);
+    PullStrategy::CommandState commandBefore;
+    bool hasCommandBefore = false;
+    if (PullStrategy* probe = PullStrategy::Get(ai))
+    {
+        commandBefore = probe->SaveCommand();
+        hasCommandBefore = true;
+    }
+    ai->ChangeStrategy("+pull back", BotState::BOT_STATE_ALL);
+    if (PullStrategy* strategy = PullStrategy::Get(ai))
+        strategy->BeginCommand(true, hadPullBack, joinDelay, false);
+    if (!PullRequestAction::Execute(event))
+    {
+        if (PullStrategy* strategy = PullStrategy::Get(ai))
+        {
+            if (hasCommandBefore)
+                strategy->RestoreCommand(commandBefore);
+            else
+                strategy->OnPullEnded();
+        }
+        if (!hadPullBack)
+            ai->ChangeStrategy("-pull back", BotState::BOT_STATE_ALL);
+        return false;
+    }
+    PausePartyPullHold(bot, joinDelay);
+    return true;
+}
+
 Unit* PullMyTargetAction::GetTarget(Event& event)
 {
     // Prefer the GUID snapshotted by the command (event object): the live
@@ -216,6 +352,14 @@ Unit* PullMyTargetAction::GetTarget(Event& event)
     return target;
 }
 
+Unit* PullbackMyTargetAction::GetTarget(Event& event)
+{
+    // Chat path only (the .bot commands snapshot the target GUID into the
+    // event object and use "pull my target" directly): same target, from the
+    // requester's live selection.
+    Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
+    return requester ? ai->GetUnit(requester->GetSelectionGuid()) : nullptr;
+}
 
 Unit* PullRTITargetAction::GetTarget(Event& event)
 {
@@ -240,14 +384,18 @@ bool PullStartAction::Execute(Event& event)
                     SetDuration(ai->GetAIInternalUpdateDelay());
             }
 
-            // Set the pet on passive mode during the pull
+            // Set the pet on passive mode during the pull. Save once: a
+            // re-start while the pet is already passive must not overwrite
+            // the pre-pull stance with REACT_PASSIVE (same guard as the
+            // party hold above).
             Pet* pet = bot->GetPet();
             if (pet)
             {
                 UnitAI* creatureAI = ((Creature*)pet)->AI();
                 if (creatureAI)
                 {
-                    strategy->SetPetReactState(pet->GetReactState());
+                    if (pet->GetReactState() != REACT_PASSIVE)
+                        strategy->SetPetReactState(pet->GetReactState());
                     pet->SetReactState(REACT_PASSIVE);
                 }
             }
@@ -282,6 +430,10 @@ bool PullAction::Execute(Event& event)
             const float distanceToTarget = target->GetDistance(bot);
             if (distanceToTarget > strategy->GetRange())
             {
+                // The approach is still running: sample headway so a
+                // progressing cross-room walk (issue #910) keeps its target
+                // past the flat pull window instead of timing out mid-reach.
+                strategy->NotePullApproach(distanceToTarget, sServerFacade.isMoving(bot));
                 // Retry the reach pull action
                 strategy->RequestPull(target, false);
                 ai::Event reachEvent(event.GetSource(), "", event.GetOwner());
@@ -351,7 +503,7 @@ bool PullAction::Execute(Event& event)
                     // clock so an ordinary pull holds for the full delay after
                     // the shot lands. Pullbacks keep the wide return-covering
                     // window here; the pull end narrows it to the join delay.
-                    RestampPullParty(bot, 0, false);
+                    RestampPullParty(bot, 0, false, !strategy->IsCommandPullback());
                 }
                 return true;
             }
@@ -430,19 +582,33 @@ bool PullAction::isUseful()
     return CastSpellAction::isUseful();
 }
 
+bool EndPullAction::isUseful()
+{
+    PullStrategy* strategy = PullStrategy::Get(ai);
+    return strategy && strategy->HasPullStarted();
+}
+
 bool PullEndAction::Execute(Event& event)
 {
     PullStrategy* strategy = PullStrategy::Get(ai);
     if (strategy)
     {
-        // Restore the pet react state
-        Pet* pet = bot->GetPet();
-        if (pet)
+        // Restore the tank's own pet stance. Member pets restore themselves:
+        // each held member parked its stance on its own AI and its own
+        // EndPullWindow puts it back when its window ends - including a
+        // member that left the group, logged out or died mid-hold, which
+        // this loop (current members only) can never reach.
+        ai->RestorePullHoldPet();
         {
-            UnitAI* creatureAI = ((Creature*)pet)->AI();
-            if (creatureAI)
+            Pet* pet = bot->GetPet();
+            if (pet)
             {
-                pet->SetReactState(strategy->GetPetReactState());
+                UnitAI* creatureAI = ((Creature*)pet)->AI();
+                if (creatureAI)
+                {
+                    if (pet->GetReactState() == REACT_PASSIVE)
+                        pet->SetReactState(strategy->GetPetReactState());
+                }
             }
         }
 
@@ -477,7 +643,7 @@ bool PullEndAction::Execute(Event& event)
         // arrive joinDelay after the tank is back instead of after the wide
         // return-covering window placed at the command.
         if (landed && wasCommand && wasPullback)
-            RestampPullParty(bot, strategy->GetCommandJoinDelay(), true);
+            RestampPullParty(bot, strategy->GetCommandJoinDelay(), true, true);
 
         // Remove the saved pull position
         AiObjectContext* context = ai->GetAiObjectContext();
@@ -499,16 +665,41 @@ bool PullEndAction::Execute(Event& event)
         }
         else
         {
-            // The pull failed: nothing is engaged, so there is no fight to hand
-            // over. Drop every trace of the target the request stamped on the
+            // The pull failed: nothing was engaged by the request itself. When
+            // the tank is not fighting, that means there is no fight to hand
+            // over: drop every trace of the target the request stamped on the
             // bot. A live, hostile "attack target" is what CombatEndTrigger
             // waits on, so leaving it behind kept the tank inside the combat
             // engine - no fight, no follow - for good, and (in a dungeon) also
             // blocked every later "should pull". Clearing it lets the combat
             // state end and the tank go back to following the party.
-            context->GetValue<ObjectGuid>("attack target")->Reset();
-            SET_AI_VALUE(Unit*, "current target", nullptr);
-            bot->SetSelectionGuid(ObjectGuid());
+            //
+            // When the tank is already in a live fight (intercepted by the rest
+            // of the pack while the shot was in the air), the wipe would end a
+            // fight that is happening: drop only what still names the unengaged
+            // pull target - the combat engine re-picks an attacker on its own
+            // tick (mod-playerbots' pull end clears just the current target).
+            // The held party releases either way: the fight is now, not after
+            // a join window.
+            const bool fighting = !bot->GetAttackers().empty();
+            if (fighting)
+            {
+                if (pullTarget)
+                {
+                    if (AI_VALUE(Unit*, "current target") == pullTarget)
+                        SET_AI_VALUE(Unit*, "current target", nullptr);
+                    if (AI_VALUE(ObjectGuid, "attack target") == pullTarget->getObjectGuid())
+                        context->GetValue<ObjectGuid>("attack target")->Reset();
+                    if (bot->GetSelectionGuid() == pullTarget->getObjectGuid())
+                        bot->SetSelectionGuid(ObjectGuid());
+                }
+            }
+            else
+            {
+                context->GetValue<ObjectGuid>("attack target")->Reset();
+                SET_AI_VALUE(Unit*, "current target", nullptr);
+                bot->SetSelectionGuid(ObjectGuid());
+            }
 
             // Free the party now: the wait window they were given exists to
             // cover the pull that is coming, and it is not. They release
@@ -560,10 +751,15 @@ bool PullEndAction::Execute(Event& event)
 bool ReleasePullHoldAction::Execute(Event& event)
 {
     (void)event;
-    // Dropping the wait window *is* the release: PlayerbotAI::ChangeStrategy
-    // frees the anchor hold (marker + the stay it owns) whenever "wait for
-    // attack" goes away, so the hold cannot outlive its own guard and there is
-    // one rule instead of one per caller.
-    ai->ChangeStrategy("-wait for attack", BotState::BOT_STATE_ALL);
+    // Ending the pull's window is the release: dropping its own "wait for
+    // attack" frees the anchor hold (marker + the stay it owns) with it
+    // (PlayerbotAI::ChangeStrategy), and a "wait for attack" the player set
+    // stays while only the anchor goes. The release line and the reason
+    // clear live in EndPullWindow (the single release point), so the direct
+    // callers (strategy orders, resets, preset reloads) log and clear too;
+    // the trigger's stored reason (or "order" when empty) travels as the
+    // explicit reason here.
+    std::string const reason = ai->PullReleaseReason();
+    ai->EndPullWindow(reason.empty() ? "order" : reason.c_str());
     return true;
 }

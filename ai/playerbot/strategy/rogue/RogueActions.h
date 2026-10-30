@@ -1,7 +1,10 @@
 #pragma once
 #include "playerbot/GroupMembers.h"
+#include "../../../runtime/policy/class/RogueThreatPolicy.h"
 #include "playerbot/strategy/actions/GenericActions.h"
 #include "playerbot/strategy/actions/UseItemAction.h"
+#include "playerbot/strategy/values/TargetValue.h"
+#include "playerbot/strategy/values/CcMarkHoldPolicy.h"
 
 namespace ai
 {
@@ -106,16 +109,56 @@ namespace ai
         }
     };
 
-	class CastKickAction : public CastMeleeSpellAction
+	class CastKickAction : public CastMeleeInterruptSpellAction
 	{
 	public:
-		CastKickAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "kick") {}
+		CastKickAction(PlayerbotAI* ai) : CastMeleeInterruptSpellAction(ai, "kick") {}
 	};
 
-	class CastFeintAction : public CastBuffSpellAction
+	// Feint is a target-enemy threat reduction (spell template: effect THREAT,
+	// implicit target enemy). It used to be a self-cast buff, which the
+	// harmful-self gate in PlayerbotAI::CastSpell refuses, so no feint row ever
+	// cast. Cast it on the current target. Threat type NONE: with the party
+	// "threat" back-off active a single-target action is vetoed while "high
+	// threat" is up, which is exactly when a threat drop must run.
+	class CastFeintAction : public CastMeleeSpellAction
 	{
 	public:
-		CastFeintAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "feint") {}
+		CastFeintAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "feint") {}
+
+		// Feint only sheds threat onto someone else, so every Feint row (dungeon,
+		// raid, low-health emergency) needs a living main tank (not the rogue) or a
+		// living party pet to take the mob. Solo, or right after the tank died, it
+		// would only cost 20 energy and a GCD.
+		virtual bool isUseful() override
+		{
+			Group* group = bot->GetGroup();
+			if (!group)
+				return false;
+
+			bool livingOtherTank = false;
+			Unit* tank = AI_VALUE(Unit*, "main tank");
+			if (tank && tank != bot && sServerFacade.IsAlive(tank))
+				livingOtherTank = true;
+
+			bool livingPartyPet = false;
+			if (!livingOtherTank)
+			{
+				for (Player* member : LiveGroupMembers(group))
+				{
+					Pet* pet = member ? member->GetPet() : nullptr;
+					if (pet && sServerFacade.IsAlive(pet))
+					{
+						livingPartyPet = true;
+						break;
+					}
+				}
+			}
+
+			return TortoiseBots::CanRogueFeintShedThreat(true, livingOtherTank, livingPartyPet) &&
+				CastMeleeSpellAction::isUseful();
+		}
+		virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
 	};
 
 	class CastDistractAction : public CastSpellAction
@@ -128,6 +171,11 @@ namespace ai
 	{
 	public:
 		CastVanishAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "vanish") {}
+
+        // Threat type NONE: ThreatMultiplier vetoes single-target actions while
+        // "high threat" is active (party bots with the threat strategy), which
+        // blocked the very threat-drop Vanish rows meant to run then.
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
 
         virtual bool isUseful()
         {
@@ -154,10 +202,36 @@ namespace ai
 
     MELEE_DEBUFF_ACTION_R(CastBlindAction, "blind", 10.0f);
 
+	// Blade Flurry must not run within `radius` of a crowd-controlled mob,
+	// a held CC mark, or a CC mark whose CC bot is ready to (re)sheep it
+	// (CcCancelBladeFlurry). The rogue's own victim is not counted for the
+	// first two (its proc never hits the victim, CcGuardCountsUnit); the
+	// ready-mark test counts it. Start and cancel use different radii.
+	inline bool BladeFlurryNearCc(PlayerbotAI* ai, Player* bot, float radius)
+	{
+		CcGuard ccGuard(ai);
+		bool const protectedNear = ccGuard.ProtectedEnemyNear(bot, radius, true, bot->GetVictim());
+		return CcCancelBladeFlurry(true, protectedNear,
+			!protectedNear && ccGuard.ReadyCcMarkNear(bot, radius));
+	}
+
 	class CastBladeFlurryAction : public CastBuffSpellAction
 	{
 	public:
 		CastBladeFlurryAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "blade flurry") {}
+		// Blade Flurry copies the rogue's swings onto a mob in melee reach
+		// for its whole duration. Never start it beside a sheeped mob or a
+		// CC mark the mage is about to sheep (in-game retest: it broke the
+		// sheep within a second, again and again). Same rule as the cancel
+		// ("blade flurry near cc"), so not next to a CC mark whose CC bot is
+		// ready either, but at the larger start radius (11 yd vs 8 yd) so
+		// the toggle does not flap at the edge.
+		bool isUseful() override
+		{
+			if (!CastBuffSpellAction::isUseful())
+				return false;
+			return !BladeFlurryNearCc(ai, bot, CcBladeFlurryStartRadius);
+		}
 	};
 
 	class CastAdrenalineRushAction : public CastBuffSpellAction
@@ -178,6 +252,56 @@ namespace ai
         std::string GetReachActionName() override { return "reach melee"; }
     };
 
+    // Pre-pull approach for Sap (out of combat; CastSapAction picks it).
+    // "reach melee" chases with the core chase generator, and on arrival that
+    // generator starts melee auto-attack (ChaseMovementGenerator<Player>::
+    // _reachTarget -> Attack(target, true)): the first swing broke Stealth and
+    // pulled the pack before Sap was cast (retest build 8: white hit + Instant
+    // Poison, then "Stealth fades"). The chase also aimed at Sap's own range,
+    // the bot's combat reach (1.5 yd edge to edge, chased to 0.6 yd), inside
+    // the 1.5 yd at which any mob sees a stealthed unit (CanDetectStealthOf).
+    // So walk to a point instead: on the rogue's side of the mob, 2.5 yd from
+    // its edge, inside Sap's melee reach.
+    class ReachSapAction : public ReachTargetAction
+    {
+    public:
+        ReachSapAction(PlayerbotAI* ai) : ReachTargetAction(ai, "reach sap") {}
+
+        bool RequiresAttackableTarget() const override { return true; }
+
+        void Qualify(const std::string& qualifier) override
+        {
+            ReachTargetAction::Qualify(qualifier);
+            // Done when Sap reaches (isUseful), not at a range; 0 also makes
+            // the give-up check measure melee reach.
+            range = 0.0f;
+        }
+
+        bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            if (target && bot->CanReachWithMeleeAutoAttack(target) && bot->IsWithinLOSInMap(target, true))
+                return false;
+
+            return ReachTargetAction::isUseful();
+        }
+
+        bool MoveIntoRange(Unit* target, float /*distance*/) override
+        {
+            const float edgeGap = 2.5f;
+            float standDist = bot->GetObjectBoundingRadius() + target->GetObjectBoundingRadius() + edgeGap;
+            standDist = std::min(standDist, bot->GetCombatReach(target, false, 0.0f) - 1.0f);
+
+            const float angle = target->GetAngle(bot);
+            WorldPosition stand(target->GetMapId(),
+                target->GetPositionX() + standDist * std::cos(angle),
+                target->GetPositionY() + standDist * std::sin(angle),
+                target->GetPositionZ());
+            stand.setZ(stand.GetHeight());
+            return MoveTo(stand.GetMapId(), stand.getX(), stand.getY(), stand.getZ());
+        }
+    };
+
     class CastSapAction : public CastMeleeSpellAction
     {
     public:
@@ -185,12 +309,33 @@ namespace ai
         bool IsCrowdControlAction() const override { return true; }
         std::string GetCrowdControlSpellName() const override { return "sap"; }
 
+        // Before the pull the marked mob is not fighting anyone, so "cc
+        // target" (built from the group's attackers) cannot hold it: out of
+        // combat Sap the bot's assigned CC mark instead ("sap cc mark"
+        // trigger, `.bot action cc`). The reach prerequisite is named after
+        // GetTargetName, so it walks to the same mob.
         Value<Unit*>* GetTargetValue() override
         {
+            if (!sServerFacade.IsInCombat(bot))
+                return context->GetValue<Unit*>("rti cc target");
+
             return context->GetValue<Unit*>("cc target", getName());
         }
 
         virtual bool isUseful() override { return true; }
+
+    protected:
+        std::string GetTargetName() override
+        {
+            return sServerFacade.IsInCombat(bot) ? "current target" : "rti cc target";
+        }
+
+        // Before the pull: a point move that stops in Sap reach (ReachSapAction),
+        // never the auto-attacking melee chase.
+        std::string GetReachActionName() override
+        {
+            return sServerFacade.IsInCombat(bot) ? "reach melee" : "reach sap";
+        }
     };
 
     class CastGarroteAction : public CastMeleeSpellAction
@@ -418,10 +563,12 @@ namespace ai
                                 if (spellInfo)
                                 {
                                     BotUseItemSpell* spell = new BotUseItemSpell(bot, spellInfo, (count > 0) ? TRIGGERED_OLD_TRIGGERED : TRIGGERED_NONE);
+                                    // NOTE: no manual cooldown here (see
+                                    // UseAction::UseItemInternal): the core
+                                    // applies it in Spell::SendSpellCooldown
+                                    // after validation.
                                     if (spell->ForceSpellStart(&targets) == SPELL_CAST_OK)
                                     {
-                                        bot->RemoveSpellCooldown(spellInfo->Id, false);
-                                        bot->AddSpellAndCategoryCooldowns(spellInfo, poisonProto->ItemId);
                                         SetDuration(3000);
                                     }
                                     else

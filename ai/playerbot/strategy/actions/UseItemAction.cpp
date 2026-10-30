@@ -1,6 +1,13 @@
 
 #include "playerbot/playerbot.h"
 #include "UseItemAction.h"
+#include "UseItemNamePolicy.h"
+#include "playerbot/DoorLockPolicy.h"
+#include <sstream>
+// Trail (mage-mana-2): item-cast outcome logging needs the AI handle and
+// the action log; both already used the same way from Engine.cpp.
+#include "playerbot/BotActionLog.h"
+#include "../../runtime/PlayerbotAIStorage.h"
 
 #include "playerbot/PlayerbotAIConfig.h"
 #include "Database/DBCStore.h"
@@ -11,7 +18,11 @@
 #include "TellLosAction.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 #include "playerbot/strategy/values/ItemCountValue.h"
+#include "playerbot/ProtectionPotionPolicy.h"
 #include "playerbot/TravelMgr.h"
+
+// The "opening object/lock" spell target flag in this core; the shim's old 0x100 was TARGET_FLAG_UNIT_UNK.
+static_assert(TARGET_FLAG_LOCKED == 0x4000, "TARGET_FLAG_LOCKED must be the core's lock-opening flag (0x4000)");
 
 using namespace ai;
 
@@ -63,6 +74,13 @@ SpellCastResult BotUseItemSpell::ForceSpellStart(SpellCastTargets const* targets
 
     if (failed)
     {
+        // Trail: item casts queue silently (no CAST_START line, unlike the
+        // CastSpell path), so a pre-cast refusal (GCD, cooldown, missing
+        // item) was invisible next to the engine's bare FAILED verdict.
+        // Log spell + result code; the prepare path below logs its own.
+        if (Player* botPlayer = m_caster ? m_caster->ToPlayer() : nullptr)
+            if (PlayerbotAI* botAi = PlayerbotAIStorage::Instance().GetAI(botPlayer))
+                botdiag::BotActionLog::LogCastResult(botAi, m_spellInfo->Id, result, "ITEM-PREPARE");
         SendCastResult(result);
         finish(false);
         // No SpellEvent owns this Spell, so the standard destruction path
@@ -71,9 +89,17 @@ SpellCastResult BotUseItemSpell::ForceSpellStart(SpellCastTargets const* targets
         return result;
     }
 
+    // Trail: the queued cast runs a tick later in Spell::cast(), where the
+    // core re-validates (power, cooldown, items) with no module-visible
+    // signal. Record the queue so a later silent fizzle is attributable.
+    if (Player* botPlayer = m_caster ? m_caster->ToPlayer() : nullptr)
+        if (PlayerbotAI* botAi = PlayerbotAIStorage::Instance().GetAI(botPlayer))
+            botdiag::BotActionLog::LogCastStart(botAi, m_spellInfo->Id,
+                targets ? targets->getUnitTargetGuid() : ObjectGuid(), 0);
     // Hand off to Spell::prepare which creates exactly one SpellEvent and
     // becomes the sole owner of this Spell.
     return prepare(*targets, triggeredByAura);
+
 }
 
 bool BotUseItemSpell::OpenLockCheck()
@@ -320,7 +346,7 @@ bool UseAction::Execute(Event& event)
         for (const ObjectGuid& goGUID : nearestGOs)
         {
             GameObject* go = ai->GetGameObject(goGUID);
-            if (go && std::string(go->GetName()).find(useName))
+            if (go && UseNameMatchesObject(std::string(go->GetName()), useName))
             {
                 const float distance = bot->GetDistance(go);
                 if (distance < closest)
@@ -366,6 +392,34 @@ bool UseAction::Execute(Event& event)
 
     ai->TellPlayerNoFacing(requester, "No items or game objects available");
     return false;
+}
+
+bool CommanderUseAction::Execute(Event& event)
+{
+    Player* requester = event.GetOwner();
+    std::istringstream in(event.GetParam());
+    uint32 itemId = 0;
+    std::string kind;
+    uint64 raw = 0;
+    in >> itemId >> kind >> raw;
+    if (in.fail())
+        return false;
+
+    MakeVerbose(false);
+    ObjectGuid const guid(raw);
+    if (kind == "go")
+    {
+        GameObject* go = ai->GetGameObject(guid);
+        if (!go)
+            return false;
+        return itemId ? UseItem(requester, itemId, go) : UseGameObject(requester, event, go);
+    }
+    if (kind == "unit")
+    {
+        Unit* unit = ai->GetUnit(guid);
+        return unit && itemId && UseItem(requester, itemId, unit);
+    }
+    return itemId && UseItem(requester, itemId, static_cast<Unit*>(nullptr));
 }
 
 bool UseAction::UseItem(Player* requester, uint32 itemId, Unit* target)
@@ -581,7 +635,18 @@ bool UseAction::UseItemInternal(Player* requester, uint32 itemId, Unit* unit, Ga
             }
         }
 
-        if ((spellTargets & TARGET_FLAG_GAMEOBJECT || spellTargets & TARGET_FLAG_LOCKED) && !validTarget)
+        // A key item on a locked object: Targets carries TARGET_FLAG_LOCKED (0x4000), and the effect
+        // targets a game object; either one, given a game object, takes this branch.
+        bool goEffect = false;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            if (spellInfo->EffectImplicitTargetA[i] == TARGET_GAMEOBJECT)
+            {
+                goEffect = true;
+            }
+        }
+
+        if ((spellTargets & TARGET_FLAG_GAMEOBJECT || spellTargets & TARGET_FLAG_LOCKED || (goEffect && gameObject)) && !validTarget)
         {
             if (gameObject && gameObject->isSpawned())
             {
@@ -662,17 +727,18 @@ bool UseAction::UseItemInternal(Player* requester, uint32 itemId, Unit* unit, Ga
             {
                 successCast = true;
             }
+            if (!successCast)
+                ai->NoteCastCheckFail(result);
 
             if (successCast)
             {
-                if (itemUsed == nullptr && ai->HasCheat(BotCheatMask::item))
-                {
-                    if (!HasItemCooldown(itemId))
-                    {
-                        bot->RemoveSpellCooldown(spellInfo->Id, false);
-                        bot->AddSpellAndCategoryCooldowns(spellInfo, proto->ItemId);
-                    }
-                }
+                // NOTE: no manual cooldown on the item-cheat path. The core
+                // applies spell + category cooldowns itself in
+                // Spell::SendSpellCooldown, after the cast passes validation.
+                // Pre-applying them here poisoned the deferred SpellEvent:
+                // prepare() only queues it, and the re-validation in cast()
+                // then saw our own cooldown (NOT_READY) and cancelled the cast
+                // it had just started (e.g. every healthstone use failed).
 
                 if (IsFood(proto) || IsDrink(proto))
                 {
@@ -767,6 +833,14 @@ bool UseAction::UseGameObject(Player* requester, Event& event, GameObject* gameO
     if (!sServerFacade.isSpawned(gameObject) || gameObject->getLootState() == GO_ACTIVATED || gameObject->GetGoState() != GO_STATE_READY)
     {
         std::ostringstream out; out << "I can't use " << chat->formatGameobject(gameObject);
+        ai->TellPlayerNoFacing(requester, out.str(), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+        return false;
+    }
+
+    // The core refuses a use of a no-interact object too (SpellHandler); the key branch below calls Use() directly.
+    if (gameObject->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NO_INTERACT))
+    {
+        std::ostringstream out; out << "I can't interact with " << chat->formatGameobject(gameObject);
         ai->TellPlayerNoFacing(requester, out.str(), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         return false;
     }
@@ -882,9 +956,21 @@ bool UseAction::UseGameObject(Player* requester, Event& event, GameObject* gameO
                 }
             }
 
-            std::ostringstream out; out << "I can't open " << chat->formatGameobject(gameObject);
-            ai->TellPlayerNoFacing(requester, out.str(), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
-            return false;
+            // A lock that needs no key and no skill (Uldaman's Temple Doors, lock 86: quick open) opens on a
+            // plain use, as a player's click does (an allowlist of lock types: TortoiseBots::DoorLock::OpensOnPlainUse): on to the packet below.
+            uint32 lockTypes[TortoiseBots::DoorLock::kLockSlots];
+            uint32 lockIndex[TortoiseBots::DoorLock::kLockSlots];
+            for (int j = 0; j < TortoiseBots::DoorLock::kLockSlots; ++j)
+            {
+                lockTypes[j] = lockInfo->Type[j];
+                lockIndex[j] = lockInfo->Index[j];
+            }
+            if (!TortoiseBots::DoorLock::OpensOnPlainUse(lockTypes, lockIndex))
+            {
+                std::ostringstream out; out << "I can't open " << chat->formatGameobject(gameObject);
+                ai->TellPlayerNoFacing(requester, out.str(), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
+                return false;
+            }
         }
     }
     else if (gameObject->GetGoType() == GAMEOBJECT_TYPE_QUESTGIVER)
@@ -989,7 +1075,10 @@ bool UseAction::HasItemCooldown(uint32 itemId) const
         uint32 spellId = 0;
         for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
         {
-            if (proto->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+            // Same trigger set as isPossible and UseItemInternal: usable
+            // spells fire on use or on no-delay use.
+            if (proto->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE &&
+                proto->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_NO_DELAY_USE)
             {
                 continue;
             }
@@ -1135,6 +1224,44 @@ bool UseItemIdAction::isUseful()
     }
 
     return false;
+}
+
+uint32 ai::FindBossProtectionPotion(PlayerbotAI* ai, uint32* buffSpellId)
+{
+    // The bot's own cached attacker list: a listed boss only shows up once
+    // its pull has started, so trash pulls never spend the potion.
+    AiObjectContext* context = ai->GetAiObjectContext();
+    const std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
+    for (const ObjectGuid& attackerGuid : attackers)
+    {
+        Unit* attacker = ai->GetUnit(attackerGuid);
+        if (!attacker || !sServerFacade.IsAlive(attacker))
+            continue;
+
+        const ProtectionPotion potion = BossProtectionPotion(attacker->GetEntry());
+        if (potion.itemId)
+        {
+            if (buffSpellId)
+                *buffSpellId = potion.buffSpellId;
+            return potion.itemId;
+        }
+    }
+
+    return 0;
+}
+
+bool UseBossProtectionPotionAction::isUseful()
+{
+    // All three Greater Protection Potions need level 48 (same gate as the
+    // fire potion action above).
+    if (bot->GetLevel() < 48)
+        return false;
+
+    uint32 buffSpellId = 0;
+    if (!FindBossProtectionPotion(ai, &buffSpellId))
+        return false;
+
+    return UseItemIdAction::isUseful() && !bot->HasAura(buffSpellId);
 }
 
 bool UseSpellItemAction::isUseful()

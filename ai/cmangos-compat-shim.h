@@ -714,8 +714,11 @@ inline char const* GetSpellCastResultString(SpellCastResult res)
 }
 
 // === TARGET_FLAG_LOCKED / SPELL_STATE_TARGETING (cmangos) ===
+// In this core (vMaNGOS lineage) the "opening object/lock" target flag is TARGET_FLAG_UNK1 (0x4000,
+// DBCEnums.h; e.g. spell 11434 has Targets 16384). The cmangos donor's 0x100 is TARGET_FLAG_UNIT_UNK here.
+// UseItemAction.cpp static_asserts the value; tools/test_target_flag_locked.py pins this line.
 #ifndef TARGET_FLAG_LOCKED
-#define TARGET_FLAG_LOCKED 0x100
+#define TARGET_FLAG_LOCKED TARGET_FLAG_UNK1
 #endif
 #ifndef SPELL_STATE_TARGETING
 #define SPELL_STATE_TARGETING 0
@@ -759,11 +762,10 @@ inline char const* GetSpellCastResultString(SpellCastResult res)
 #endif
 
 // === SEC_GAMEMASTER alias ===
-// Penqle has no intermediate GM rank: SEC_ADMINISTRATOR is the first elevated
-// account level. Native command ownership deliberately uses that level for
-// the documented GM override.
+// Penqle has no GM rank of its own; its GM accounts are rank 3 (developer),
+// so the module's GM-only commands start there.
 #ifndef SEC_GAMEMASTER
-#define SEC_GAMEMASTER SEC_ADMINISTRATOR
+#define SEC_GAMEMASTER SEC_DEVELOPER
 #endif
 
 // === FORCED_MOVEMENT_RUN / ForcedMovement (cmangos) ===

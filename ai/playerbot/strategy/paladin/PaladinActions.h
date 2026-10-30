@@ -28,7 +28,7 @@ namespace ai
 	MELEE_DEBUFF_ACTION_R(CastJudgementOfJusticeAction, "judgement of justice", 10.0f);
 
 	SPELL_ACTION(CastHolyShockAction, "holy shock");
-	HEAL_PARTY_ACTION(CastHolyShockOnPartyAction, "holy shock");
+	HEAL_PARTY_ACTION_E(CastHolyShockOnPartyAction, "holy shock", 25, HealManaEfficiency::LOW);
 
 	// consecration
 	class CastConsecrationAction : public CastSpellAction
@@ -54,7 +54,7 @@ namespace ai
 	BUFF_ACTION(CastDivineFavorAction, "divine favor");
 
 	// blessings
-	BUFF_ACTION(CastBlessingOfFreedomAction, "blessing of freedom");
+	BUFF_ACTION(CastBlessingOfFreedomAction, "hand of freedom");
 	// fury
 	BUFF_ACTION(CastRighteousFuryAction, "righteous fury");
 
@@ -63,6 +63,23 @@ namespace ai
 	{
 	public:
 		CastCrusaderStrikeAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "crusader strike") {}
+	};
+
+	// Holy melee-weave: Crusader Strike only when already in melee reach,
+	// never a reason to walk in. Live Alliance raid (Patchwerk): the reach
+	// prerequisite pulled every holy paladin to the boss ~48 times a fight,
+	// where the healer's "enemy too close for spell" row fled it back out.
+	class CastCrusaderStrikeInReachAction : public CastCrusaderStrikeAction
+	{
+	public:
+		CastCrusaderStrikeInReachAction(PlayerbotAI* ai) : CastCrusaderStrikeAction(ai) {}
+		bool isUseful() override
+		{
+			Unit* target = GetTarget();
+			return target && bot->CanReachWithMeleeAutoAttack(target) && CastCrusaderStrikeAction::isUseful();
+		}
+	protected:
+		std::string GetReachActionName() override { return ""; }
 	};
 
 	class CastHolyStrikeAction : public CastMeleeSpellAction
@@ -95,7 +112,7 @@ namespace ai
 	public:
 		CastPaladinAuraAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "paladin aura") {}
 		virtual bool isPossible() { return true; }
-		virtual bool isUseful() override { return true; }
+		virtual bool isUseful() override;
 		virtual bool Execute(Event& event);
 	};
 
@@ -216,10 +233,12 @@ namespace ai
     {
     public:
         CastBlessingOnPartyAction(PlayerbotAI* ai, std::string name, bool greater) : CastSpellAction(ai, name), greater(greater) {}
+        bool Execute(Event& event) override;
 
     private:
         Unit* GetTarget() override;
         bool isPossible() override;
+        bool isUseful() override;
         virtual std::string GetBlessingForTarget(Unit* target);
 
     protected:
@@ -460,7 +479,7 @@ namespace ai
     class CastHolyLightOnPartyAction : public HealPartyMemberAction
     {
     public:
-        CastHolyLightOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "holy light") {}
+        CastHolyLightOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "holy light", 50, HealManaEfficiency::MEDIUM) {}
     };
 
     class CastFlashOfLightAction : public CastHealingSpellAction
@@ -472,7 +491,7 @@ namespace ai
     class CastFlashOfLightOnPartyAction : public HealPartyMemberAction
     {
     public:
-        CastFlashOfLightOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "flash of light") {}
+        CastFlashOfLightOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "flash of light", 15, HealManaEfficiency::HIGH) {}
     };
 
     class CastLayOnHandsAction : public CastHealingSpellAction
@@ -481,10 +500,29 @@ namespace ai
         CastLayOnHandsAction(PlayerbotAI* ai) : CastHealingSpellAction(ai, "lay on hands") {}
     };
 
+    // Lay on Hands drains all of the caster's mana (1 h cooldown), so one
+    // per target is enough: the cast claims the target and other paladins
+    // stand down while the claim is live. Live Alliance raid (Patchwerk,
+    // pull 17): a tank hit critical health 8 s in and all five holy
+    // paladins cast it on him in the same second, going from 100 % to ~5 %
+    // mana for the rest of the fight.
     class CastLayOnHandsOnPartyAction : public HealPartyMemberAction
     {
     public:
         CastLayOnHandsOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "lay on hands") {}
+        bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            if (target && BuffClaimRegistry::IsTargetClaimedByOther(bot, target, "lay on hands"))
+                return false;
+            return HealPartyMemberAction::isUseful();
+        }
+        bool Execute(Event& event) override
+        {
+            if (Unit* target = GetTarget())
+                BuffClaimRegistry::Claim(bot->GetObjectGuid(), target->GetObjectGuid(), "lay on hands");
+            return HealPartyMemberAction::Execute(event);
+        }
     };
 
 	class CastDivineProtectionAction : public CastBuffSpellAction
@@ -548,6 +586,19 @@ namespace ai
 	{
 	public:
 		CastHandOfReckoningAction(PlayerbotAI* ai) : CastSpellAction(ai, "hand of reckoning") {}
+	};
+
+	// Taunt the mob picked by "attacker of non-tank target"; the cast reads
+	// its real range from the spell and the reach prerequisite walks the
+	// paladin in.
+	class CastHandOfReckoningOnAttackerAction : public CastHandOfReckoningAction
+	{
+	public:
+		CastHandOfReckoningOnAttackerAction(PlayerbotAI* ai) : CastHandOfReckoningAction(ai) {}
+
+	protected:
+		virtual std::string GetTargetName() override { return "attacker of non-tank target"; }
+		virtual std::string getName() override { return "hand of reckoning on attacker"; }
 	};
 
 	class CastRighteousDefenseAction : public CastSpellAction
@@ -633,13 +684,13 @@ namespace ai
 	class CastBlessingOfSacrificeAction : public BuffOnPartyAction
 	{
 	public:
-		CastBlessingOfSacrificeAction(PlayerbotAI* ai) : BuffOnPartyAction(ai, "blessing of sacrifice") {}
+		CastBlessingOfSacrificeAction(PlayerbotAI* ai) : BuffOnPartyAction(ai, "hand of sacrifice") {}
 	};
 
     class CastBlessingOfFreedomOnPartyAction : public CastSpellAction
     {
     public:
-		CastBlessingOfFreedomOnPartyAction(PlayerbotAI* ai) : CastSpellAction(ai, "blessing of freedom") {}
+		CastBlessingOfFreedomOnPartyAction(PlayerbotAI* ai) : CastSpellAction(ai, "hand of freedom") {}
         bool isUseful() override { return CastSpellAction::isUseful() && !ai->HasAura(GetSpellName(), GetTarget()); }
         std::string GetReachActionName() override { return "reach spell"; }
         std::string GetTargetName() override { return "party member to remove roots"; }
@@ -648,11 +699,11 @@ namespace ai
     class CastBlessingOfProtectionOnPartyAction : public CastProtectSpellAction
     {
     public:
-        CastBlessingOfProtectionOnPartyAction(PlayerbotAI* ai) : CastProtectSpellAction(ai, "blessing of protection") {}
+        CastBlessingOfProtectionOnPartyAction(PlayerbotAI* ai) : CastProtectSpellAction(ai, "hand of protection") {}
         bool isUseful() override
         {
             Unit* target = GetTarget();
-            if(target && target->IsPlayer() && !ai->IsTank((Player*)target))
+            if(target && target->IsPlayer() && !ai->IsTank((Player*)target) && !ai->HasAura("forbearance", target))
             {
                 return CastProtectSpellAction::isUseful();
             }

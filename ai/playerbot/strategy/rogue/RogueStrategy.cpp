@@ -38,12 +38,20 @@ public:
     RogueStealthStrategyActionNodeFactory()
     {
         creators["ambush"] = &ambush;
+        creators["garrote"] = &garrote;
         creators["backstab"] = &backstab;
         creators["cheap shot"] = &cheap_shot;
     }
 
 private:
-    ACTION_NODE_A(ambush, "ambush", "backstab");
+    // Ambush needs a dagger in the main hand. Garrote (stealth + behind, no
+    // weapon) is the next opener when Ambush cannot be cast, which is every
+    // rogue without a dagger; Backstab (also a dagger) and Cheap Shot stay as
+    // the tail. Same ambush -> garrote step as mod-playerbots
+    // StealthedRogueStrategy (CombatRogueStrategy.cpp:223-231).
+    ACTION_NODE_A(ambush, "ambush", "garrote");
+
+    ACTION_NODE_A(garrote, "garrote", "backstab");
 
     ACTION_NODE_A(backstab, "backstab", "cheap shot");
 
@@ -70,15 +78,31 @@ void RogueStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassStrategy::InitCombatTriggers(triggers);
 
+    // A running Blade Flurry copies swings onto a sheep that landed beside
+    // the rogue after the buff started: drop the buff (instant, no GCD)
+    // before the next swing. Above Kick so it is never queued behind it.
+    triggers.push_back(new TriggerNode(
+        "blade flurry near cc",
+        NextAction::array(0, new NextAction("remove blade flurry", ACTION_INTERRUPT + 5), NULL)));
+
     triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("blind", ACTION_EMERGENCY + 2),
                              new NextAction("vanish", ACTION_EMERGENCY + 1),
                              new NextAction("vanish", ACTION_EMERGENCY), NULL)));
 
+    // Vanish sits between evasion and feint: evasion keeps the kill when it is
+    // ready, but on its 5-minute cooldown (death loops, back-to-back pulls)
+    // the bot used to feint - a threat drop with no tank to take over - and
+    // die. Vanish breaks combat for a real disengage instead (donor
+    // DpsRogueStrategy.cpp:141 vanishes on medium threat, far earlier than
+    // our critical-health chain, which pool telemetry shows never executes:
+    // zero vanish casts against hundreds of evasion casts while rogues die
+    // evading). Feint stays last for grouped rogues with a tank to save.
     triggers.push_back(new TriggerNode(
         "low health",
         NextAction::array(0, new NextAction("evasion", ACTION_EMERGENCY),
+                             new NextAction("vanish", ACTION_EMERGENCY),
                              new NextAction("feint", ACTION_EMERGENCY), NULL)));
 
     triggers.push_back(new TriggerNode(
@@ -103,6 +127,17 @@ void RogueStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
         "off hand weapon no enchant",
         NextAction::array(0, new NextAction("apply deadly poison off hand", 19.0f),
                              new NextAction("apply instant poison off hand", 18.0f), NULL)));
+
+    // Sap before the pull (dungeon guide, `.bot action cc <mark>`): stealth,
+    // sneak to the assigned CC mark and Sap it while the party is still out
+    // of combat. Same order as mod-playerbots RogueCcStrategy (stealth, then
+    // sap), but in the non-combat engine, the only place where both the rogue
+    // and the mob are out of combat. Above follow (ACTION_NORMAL) and the
+    // stealth upkeep (ACTION_HIGH) so the approach is not pulled back.
+    triggers.push_back(new TriggerNode(
+        "sap cc mark",
+        NextAction::array(0, new NextAction("stealth", ACTION_HIGH + 2),
+                             new NextAction("sap", ACTION_HIGH + 1), NULL)));
 }
 
 void RogueStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
@@ -154,6 +189,22 @@ void RoguePvpStrategy::InitDeadTriggers(std::list<TriggerNode*>& triggers)
 void RoguePveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassPveStrategy::InitCombatTriggers(triggers);
+
+    // Opt-in (AiPlayerbot.RogueDungeonThreatDrops): shed threat in a 5-man
+    // dungeon the way the raid rows do. Feint first (DISPEL), Vanish only as
+    // the queued fallback below it (HIGH + 5), so a ready Feint is always
+    // tried first. Rows exist only with the toggle on; each trigger also
+    // gates on a grouped dungeon with a living tank (RogueThreatPolicy.h).
+    if (sPlayerbotAIConfig.rogueDungeonThreatDrops)
+    {
+        triggers.push_back(new TriggerNode(
+            "rogue dungeon feint",
+            NextAction::array(0, new NextAction("feint", ACTION_DISPEL), NULL)));
+
+        triggers.push_back(new TriggerNode(
+            "rogue dungeon vanish",
+            NextAction::array(0, new NextAction("vanish", ACTION_HIGH + 5), NULL)));
+    }
 }
 
 void RoguePveStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -180,7 +231,7 @@ void RogueRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         NextAction::array(0, new NextAction("feint", ACTION_DISPEL), NULL)));
 
     triggers.push_back(new TriggerNode(
-        "high threat",
+        "rogue raid vanish",
         NextAction::array(0, new NextAction("vanish", ACTION_EMERGENCY), NULL)));
 }
 
@@ -551,7 +602,9 @@ public:
             (actionName == "dps assist") ||
             (actionName == "select new target") ||
             (actionName == "follow") ||
+            (actionName == "release pull hold") ||
             (actionName == "reach melee") ||
+            (actionName == "reach sap") ||
             (actionName == "set behind") ||
             (actionName == "set combat state") ||
             (actionName == "set non combat state") ||
@@ -576,6 +629,7 @@ public:
             (actionName == "bg check objective") ||
             (actionName == "bg check flag") ||
             (actionName == "attack enemy flag carrier") ||
+            (actionName == "attack enemy player") || // stealthed approach: the order walks to the player
             (actionName == "travel") ||
             (actionName == "move to suppression device") ||
             (actionName == "disarm suppression device"))

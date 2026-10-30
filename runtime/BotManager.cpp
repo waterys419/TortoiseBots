@@ -1,16 +1,23 @@
 #include "../ai/playerbot/GroupMembers.h"
 #include "BotManager.h"
 #include "BotActivityLease.h"
+#include "BotGuidKey.h"
 #include "PlayerBotClassification.h"
 #include "HunterPetPolicy.h"
+#include "PetSpawnPolicy.h"
 #include "ProfessionGrantPolicy.h"
 #include "HireLifecycle.h"
+#include "ClaimLifecycle.h"
+#include "AltBotService.h"
+#include "DowntimeService.h"
 #include "PlayerbotAIAdapter.h"
 #include "PlayerbotAIStorage.h"
 #include "RandomBotAccountRegistry.h"
 #include "StartZoneBalance.h"
 #include "GearSeedingGuard.h"
 #include "../ai/playerbot/PlayerbotAI.h"
+#include "../ai/playerbot/BotActionLog.h"
+#include "../ai/playerbot/strategy/actions/MovementActions.h"
 #include "../ai/playerbot/RandomBotFacade.h"
 #include "../ai/playerbot/PlayerbotFactory.h"
 #include "../host/BotSessionAdapter.h"
@@ -25,6 +32,7 @@
 #include "Log.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "World.h"
+#include "Timer.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "ObjectMgr.h"
 #include "AccountMgr.h"
@@ -38,18 +46,63 @@
 #include "../ai/playerbot/TravelMgr.h"
 #include "../ai/playerbot/WorldPosition.h"
 #include "../ai/playerbot/strategy/values/TravelValues.h"
+#include "../ai/playerbot/strategy/values/PossibleTargetsValue.h"
 #include "../ai/playerbot/LowbieGraveyardPolicy.h"
-
+// Full Corpse type for SweepDeadBots (IsWithinDistInMap on the reclaim check).
+#include "Objects/Corpse.h"
+#include "Pet.h"
 #include "Database/DatabaseEnv.h"
 #include "../host/ModuleLog.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <ctime>
 
 namespace TortoiseBots {
 
 namespace {
+// Upper bound on the elapsed time one AI update may consume; a bot parked
+// for minutes (teleport, load) resumes as if 10 s passed.
+constexpr uint32_t kMaxAiElapsedMs = 10000;
+// A single bot update at least this long is logged as SLOWBOT.
+constexpr uint32_t kSlowBotUpdateMs = 50;
+// Travel-pipeline follow-ups: a pool bot gets at most this many immediate
+// turns in a row (due again next tick) while a travel step waits on it.
+constexpr uint8_t kMaxFollowUps = 4;
+
+// A travel target waiting on the bot's next decision: a search to pick up
+// (PREPARE) or a chosen destination to start walking to (READY). Each step used
+// to cost a full rotation visit (15-25 s with 2000 bots), so a bot stood for
+// minutes before its first step. Read the fresh status, not the last executed
+// action: that one is not cleared by a visit that executed nothing.
+bool AwaitsTravelStep(PlayerbotAI* ai)
+{
+    ai::TravelTarget* target = ai->GetAiObjectContext()->GetValue<ai::TravelTarget*>("travel target")->Get();
+    if (!target)
+        return false;
+
+    ai::TravelStatus const status = target->GetStatus();
+    return status == ai::TravelStatus::TRAVEL_STATUS_PREPARE || status == ai::TravelStatus::TRAVEL_STATUS_READY;
+}
+
+// The situation that caps how long a pool bot may wait for its next turn
+// (BotTurnScheduler.h). Takes the FindPlayerNotInWorld lookup, so a bot
+// mid-teleport is still seen; no player at all (logging in/out) waits as Normal.
+// The AI's combat state counts as combat too (one member read; ai may be null).
+TurnSituation TurnSituationOf(::Player* player, PlayerbotAI* ai)
+{
+    if (!player)
+        return TurnSituation::Normal;
+    TurnFacts facts;
+    facts.teleporting = player->IsBeingTeleported();
+    facts.alive = player->IsAlive();
+    facts.coreCombat = player->IsInCombat();
+    facts.aiCombat = ai && ai->GetState() == BotState::BOT_STATE_COMBAT;
+    facts.battleground = player->InBattleGround();
+    return TurnSituationFrom(facts);
+}
+
 // One-shot headless RNDBOT scatter using persisted GenericRpg destinations.
 // Fail-closed: any validation miss retains original position. No DB scan,
 // no GenerateTravelNodes, no homebind update.
@@ -140,6 +193,10 @@ ai::WorldPosition const* PickLevelFittingPoint(::Player* bot)
                 continue;
             if (point->IsEnemyHomeZoneFor(info.GetTeam()))
                 continue;
+            // Never land a bot among hostile town guards: the hostile-town
+            // death-loop rescue below would otherwise move it into another one.
+            if (sPlayerbotAIConfig.avoidHostileTowns && point->IsGuardedHostileTownFor(bot, 120.0f, false))
+                continue;
             int32 areaLevel;
             if (!travelMgr.TryGetValidatedAreaLevel(area->Id, areaLevel))
                 continue;
@@ -206,6 +263,19 @@ bool TryRandomTeleport(::Player* bot, BotRecord const& record)
 }
 } // namespace
 
+bool BotManager::TeleportToLevelFittingZone(::Player* bot)
+{
+    if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() || !bot->IsAlive() || bot->GetLevel() < 10)
+        return false;
+    ai::WorldPosition const* chosen = PickLevelFittingPoint(bot);
+    if (!chosen)
+        return false;
+    bool ok = bot->TeleportTo(chosen->getMapId(), chosen->getX(), chosen->getY(), chosen->getZ(), bot->GetOrientation(), 0);
+    TB_LOG_DETAIL("TortoiseBots: level-zone teleport bot %s level %u to map %u %.1f %.1f %.1f: %s", bot->GetName(),
+        bot->GetLevel(), chosen->getMapId(), chosen->getX(), chosen->getY(), chosen->getZ(), ok ? "ok" : "failed");
+    return ok;
+}
+
 namespace {
 // Fail-closed eligibility shared by death-driven and time-driven rescue: a
 // random masterless ungrouped headless bot standing in a zone its level
@@ -240,8 +310,11 @@ bool MisplacedBotEligible(::Player* bot, int32& areaLevelOut, std::string* why =
     if (GroupHasRealPlayer(bot))
         return no("in a group with a player");
     BotRecord* record = BotManager::Instance().FindBot(bot->GetObjectGuid());
-    if (!record || !record->random || record->lifecycle != BotLifecycle::InWorld)
-        return no(!record ? "no bot record" : !record->random ? "not a random bot" : "record not in world");
+    // Issue #872: autonomous alts get stuck-recovery like the pool.
+    if (!record || (!record->random && !AltBotService::Instance().IsAutonomous(bot->GetObjectGuid())) ||
+        record->lifecycle != BotLifecycle::InWorld)
+        return no(!record ? "no bot record" :
+            record->lifecycle != BotLifecycle::InWorld ? "record not in world" : "not a random bot");
     if (!record->masterGuid.IsEmpty())
         return no("has a master");
     if (sRandomBotFacade.IsPinnedBot(bot->GetGUIDLow()))
@@ -258,6 +331,34 @@ bool MisplacedBotEligible(::Player* bot, int32& areaLevelOut, std::string* why =
         return true;
     }
 
+    // Bots caught in hostile guarded towns (Grom'gol, Southshore, Brackenwall, Feathermoon, Revantusk, etc.)
+    // are hopelessly misplaced and camped by level 55 guards.
+    if (sPlayerbotAIConfig.avoidHostileTowns && ai::WorldPosition(bot).IsGuardedHostileTownFor(bot))
+    {
+        areaLevelOut = 55;
+        return true;
+    }
+
+    // Bots those guards keep killing revive outside the town - the spirit
+    // healer often stands just beyond them (Horde at the Redridge graveyard
+    // beside Lakeshire) - and their travel target walks them straight back in.
+    // Two such deaths in half an hour count as hopeless too (PlayerbotAI::OnDeath).
+    if (sPlayerbotAIConfig.avoidHostileTowns)
+    {
+        ::PlayerbotAI* townAi = PlayerbotAIStorage::Instance().GetAI(bot);
+        if (townAi && townAi->GetRecentHostileTownDeaths() >= ::PlayerbotAI::kHostileTownLoopDeaths)
+        {
+            // The bot's real area level when the cache knows it, else 0 (logged as
+            // n/a). RelocateHopelessBot skips its death minimum for a town loop, so
+            // the number only feeds the log line.
+            int32 loopAreaLevel = 0;
+            if (!MaNGOS::Singleton<ai::TravelMgr>::Instance().TryGetValidatedAreaLevel(bot->GetAreaId(), loopAreaLevel) || loopAreaLevel < 0)
+                loopAreaLevel = 0;
+            areaLevelOut = loopAreaLevel;
+            return true;
+        }
+    }
+
     auto& travelMgr = MaNGOS::Singleton<ai::TravelMgr>::Instance();
     int32 areaLevel = 0;
     if (!travelMgr.TryGetValidatedAreaLevel(bot->GetAreaId(), areaLevel) || areaLevel <= 0)
@@ -272,6 +373,14 @@ bool MisplacedBotEligible(::Player* bot, int32& areaLevelOut, std::string* why =
 // after uninterrupted stranding, so briefly passing through is never caught.
 constexpr uint32_t STRANDED_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 constexpr time_t STRANDED_GRACE_SEC = 15 * 60;
+
+// Dead-bot sweep cadence and patience: release a stuck corpse quickly (its AI
+// may be starved by the pool budget), revive a stalled ghost only after it sat
+// through the whole grace window. Own sweep clock so neither depends on an AI
+// tick of the dead bot itself.
+constexpr uint32_t DEAD_SWEEP_INTERVAL_MS = 30 * 1000;
+constexpr time_t DEAD_RELEASE_GRACE_SEC = 30;
+constexpr time_t DEAD_REVIVE_GRACE_SEC = 90;
 
 // Shared destination leg: below level 10 the bot belongs at its race start
 // (a capital the picker would choose lies behind zones it cannot cross
@@ -322,12 +431,249 @@ bool TeleportMisplacedBot(::Player* bot, int32 areaLevel, const std::string& cau
     {
         if (auto* deathCountValue = ai->GetAiObjectContext()->GetValue<uint32>("death count"))
             deathCountValue->Reset();
+        ai->ClearHostileTownDeaths();
     }
-    sLog.outString("TortoiseBots: relocated %s %s level %u from area level %d",
-        cause.c_str(), bot->GetName(), bot->GetLevel(), areaLevel);
+    if (areaLevel > 0)
+        sLog.outString("TortoiseBots: relocated %s %s level %u from area level %d",
+            cause.c_str(), bot->GetName(), bot->GetLevel(), areaLevel);
+    else
+        sLog.outString("TortoiseBots: relocated %s %s level %u from area level n/a",
+            cause.c_str(), bot->GetName(), bot->GetLevel());
     return true;
 }
 } // namespace
+
+void BotManager::SweepDeadBots(uint32_t diff)
+{
+    m_deadSweepElapsedMs += diff;
+    if (m_deadSweepElapsedMs < DEAD_SWEEP_INTERVAL_MS)
+        return;
+    m_deadSweepElapsedMs = 0;
+    // At most a handful of releases/revives per sweep: a sweep that revived
+    // 189 in one tick is the freeze this cap exists to prevent. The rest keep
+    // their timers for the next 30s sweep.
+    // Releases and in-place revives are cheap; teleports (corpse moves) keep
+    // the small cap so a sweep never moves a batch.
+    constexpr uint32_t kMaxReleasesPerSweep = 30;
+    constexpr uint32_t kMaxRevivesPerSweep = 30;
+    constexpr uint32_t kMaxMovesPerSweep = 8;
+    uint32_t released = 0, revived = 0, watched = 0, moved = 0;
+    uint32_t skipNotRandom = 0, skipHasMaster = 0, skipNoPlayer = 0, skipNotHeadless = 0;
+    uint32_t skipNotInWorld = 0, skipTeleport = 0, skipBattleground = 0, skipGrouped = 0;
+    uint32_t skipHired = 0, skipDungeon = 0, skipPinned = 0, skipAlive = 0;
+    uint32_t stuckTeleport = 0;
+    std::vector<std::string> stuckSamples;
+    time_t now = time(nullptr);
+    for (auto& [key, entry] : m_bots)
+    {
+        BotRecord& rec = entry.record;
+        // Issue #872: autonomous alts get the dead sweep like the pool.
+        if (!rec.random && !AltBotService::Instance().IsAutonomous(key))
+        {
+            ++skipNotRandom;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (rec.lifecycle != BotLifecycle::InWorld)
+        {
+            // Transient: a bot logging in or draining removal keeps its timer.
+            ++skipNotInWorld;
+            continue;
+        }
+        if (!rec.masterGuid.IsEmpty())
+        {
+            ++skipHasMaster;
+            m_deadSince.erase(key);
+            continue;
+        }
+        ::Player* p = sObjectAccessor.FindPlayer(rec.characterGuid);
+        if (!p)
+        {
+            // Transient: roster flicker must not reset the 30s/90s timers.
+            ++skipNoPlayer;
+            continue;
+        }
+        if (!p->GetSession() || !p->GetSession()->IsHeadless())
+        {
+            ++skipNotHeadless;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (!p->IsInWorld())
+        {
+            // Transient: same as no_player, the timer survives.
+            ++skipNotInWorld;
+            continue;
+        }
+        if (p->IsBeingTeleported())
+        {
+            // Transient: a bot flickering through teleport keeps its timer.
+            ++skipTeleport;
+            auto [since, fresh] = m_teleportSince.emplace(key, now);
+            if (!fresh && now - since->second >= 60)
+            {
+                ++stuckTeleport;
+                if (stuckSamples.size() < 3)
+                {
+                    char buf[256];
+                    WorldLocation const& dest = p->GetTeleportDest();
+                    snprintf(buf, sizeof(buf), "%s(%lds near=%d far=%d alive=%d ghost=%d map=%u acks=%u ignored=%u "
+                        "pos=%.0f,%.0f dest=%u:%.0f,%.0f)", p->GetName(),
+                        static_cast<long>(now - since->second), p->IsBeingTeleportedNear() ? 1 : 0,
+                        p->IsBeingTeleportedFar() ? 1 : 0, p->IsAlive() ? 1 : 0,
+                        p->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST) ? 1 : 0, p->GetMapId(),
+                        entry.teleportAcks, entry.teleportAcksIgnored, p->GetPositionX(), p->GetPositionY(),
+                        dest.mapId, dest.x, dest.y);
+                    stuckSamples.push_back(buf);
+                }
+            }
+            continue;
+        }
+        m_teleportSince.erase(key);
+        if (p->InBattleGround())
+        {
+            ++skipBattleground;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (GroupHasRealPlayer(p))
+        {
+            ++skipGrouped;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (HireLifecycle::Instance().IsHired(rec.characterGuid))
+        {
+            ++skipHired;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (BotActivityLeaseManager::Instance().GetActivity(key) == BotActivity::Dungeon)
+        {
+            ++skipDungeon;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (sRandomBotFacade.IsPinnedBot(key))
+        {
+            ++skipPinned;
+            m_deadSince.erase(key);
+            continue;
+        }
+        if (p->IsAlive())
+        {
+            ++skipAlive;
+            m_deadSince.erase(key);
+            continue;
+        }
+        auto it = m_deadSince.find(key);
+        if (it == m_deadSince.end())
+        {
+            m_deadSince.emplace(key, now);
+            continue;
+        }
+        time_t deadFor = now - it->second;
+        if (deadFor < 0)
+        {
+            m_deadSince.erase(it);
+            continue;
+        }
+        ++watched;
+        bool const isGhost = p->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST);
+        // Stuck corpse (ghost or not): the AI release never ran, e.g. its tick
+        // was starved by the pool budget. HandleRepopRequestOpcode needs only
+        // "dead and not a ghost", a corpse object may well exist, so no
+        // GetCorpse() precondition here (that hole stranded the 11:50 wave).
+        // Mirror AutoReleaseSpiritAction (dungeon crew waits for its own rez).
+        if (!isGhost)
+        {
+            if (deadFor < DEAD_RELEASE_GRACE_SEC)
+                continue;
+            // Capped: the rest keep their timers for the next sweep.
+            if (released >= kMaxReleasesPerSweep)
+                continue;
+            m_deadSince.erase(it);
+            WorldPacket packet(CMSG_REPOP_REQUEST);
+            packet << uint8(0);
+            p->GetSession()->HandleRepopRequestOpcode(packet);
+            if (p->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST))
+                ++released;
+            continue;
+        }
+        // Ghost standing on its corpse: the reclaim never fires (starved AI
+        // tick or a dropped reclaim). Same rescue the AI spirit-healer path
+        // runs, without needing the AI: resurrect at half health, spawn bones,
+        // clear the corpse run so the next death starts clean.
+        if (p->GetCorpse() &&
+            p->GetCorpse()->IsWithinDistInMap(p, (float)CORPSE_RECLAIM_RADIUS, true))
+        {
+            if (deadFor < DEAD_REVIVE_GRACE_SEC)
+                continue;
+            // Capped: the rest keep their timers for the next sweep.
+            if (revived >= kMaxRevivesPerSweep)
+                continue;
+            m_deadSince.erase(it);
+            p->ResurrectPlayer(0.5f, false);
+            p->SpawnCorpseBones();
+            p->SaveToDB();
+            ++revived;
+            continue;
+        }
+        // Ghost not on its corpse after 3 minutes is not walking the run:
+        // the AI tick that would walk it is starved. Move one bot onto its
+        // corpse and let the next sweep revive it. No corpse: only the
+        // existing hopeless/lowbie relocate, never a resurrect in place.
+        // Own small cap (kMaxMovesPerSweep) so a sweep cannot teleport a batch.
+        constexpr time_t kGhostMoveGraceSec = 180;
+        if (deadFor >= kGhostMoveGraceSec && moved < kMaxMovesPerSweep)
+        {
+            if (Corpse* corpse = p->GetCorpse())
+            {
+                if (p->TeleportTo(corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(),
+                        corpse->GetPositionZ(), p->GetOrientation(), 0))
+                    ++moved;
+                continue;
+            }
+            if (RelocateHopelessBot(p) || SendStrandedLowbieHome(p))
+            {
+                m_deadSince.erase(it);
+                ++revived;
+            }
+        }
+    }
+    for (auto it = m_deadSince.begin(); it != m_deadSince.end();)
+    {
+        if (m_bots.find(it->first) == m_bots.end())
+            it = m_deadSince.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = m_teleportSince.begin(); it != m_teleportSince.end();)
+    {
+        if (m_bots.find(it->first) == m_bots.end())
+            it = m_teleportSince.erase(it);
+        else
+            ++it;
+    }
+    // One counted line per sweep (outString is visible at default log level;
+    // outDetail is not, which left the first version of this sweep blind).
+    // The skip counters explain a 0-watched sweep instead of hiding it.
+    sLog.outString("TortoiseBots: dead sweep: watching %u dead, released %u, revived %u, moved %u, "
+        "skip not_random=%u has_master=%u no_player=%u not_headless=%u not_in_world=%u teleport=%u "
+        "battleground=%u grouped=%u hired=%u dungeon=%u pinned=%u alive=%u",
+        watched, released, revived, moved,
+        skipNotRandom, skipHasMaster, skipNoPlayer, skipNotHeadless, skipNotInWorld, skipTeleport,
+        skipBattleground, skipGrouped, skipHired, skipDungeon, skipPinned, skipAlive);
+    // A teleport should end within a few seconds; one still open after a
+    // minute leaves the bot without AI (UpdateBots only acks it).
+    if (stuckTeleport)
+    {
+        std::string samples;
+        for (std::string const& sample : stuckSamples)
+            samples += " " + sample;
+        sLog.outString("TortoiseBots: dead sweep: %u bots in teleport for 60s+:%s", stuckTeleport, samples.c_str());
+    }
+}
 
 bool BotManager::RelocateHopelessBot(::Player* bot)
 {
@@ -351,13 +697,32 @@ bool BotManager::RelocateHopelessBot(::Player* bot)
     uint32 minDeaths = ((bot->GetLevel() < 10 && areaLevel >= 20) ||
         (!sPlayerbotAIConfig.allowIsolatedCustomStartingZones &&
          (PlayerbotAIConfig::IsIsolatedCustomZone(bot->GetAreaId()) || PlayerbotAIConfig::IsIsolatedCustomZone(bot->GetZoneId())))) ? 1 : 2;
-    if (deathCount < minDeaths)
+    // A hostile-town loop counts its own deaths: an XP tick between two guard
+    // deaths resets "death count" but not the loop.
+    bool const townLoop = sPlayerbotAIConfig.avoidHostileTowns &&
+        ai->GetRecentHostileTownDeaths() >= ::PlayerbotAI::kHostileTownLoopDeaths;
+    if (deathCount < minDeaths && !townLoop)
     {
         TB_LOG_DEBUG("TortoiseBots: hopeless check %s level %u zone %u area %u (level %d) deaths %u: below %u, not yet",
             bot->GetName(), bot->GetLevel(), bot->GetZoneId(), bot->GetAreaId(), areaLevel, deathCount, minDeaths);
         return false;
     }
-    return TeleportMisplacedBot(bot, areaLevel, "hopeless bot (" + std::to_string(deathCount) + " deaths)");
+    if (!TeleportMisplacedBot(bot, areaLevel, townLoop ? std::string("hostile-town death loop") :
+            "hopeless bot (" + std::to_string(deathCount) + " deaths)"))
+        return false;
+    // The travel target that led the bot through the guards would walk it back
+    // from wherever it lands: drop it so the next pick starts from the new spot.
+    if (townLoop)
+    {
+        auto* travelHolder = ai->GetAiObjectContext()->GetValue<ai::TravelTarget*>("travel target");
+        if (ai::TravelTarget* target = travelHolder ? travelHolder->Get() : nullptr)
+        {
+            MaNGOS::Singleton<ai::TravelMgr>::Instance().SetNullTravelTarget(target);
+            target->SetStatus(ai::TravelStatus::TRAVEL_STATUS_EXPIRED);
+            target->SetExpireIn(1000);
+        }
+    }
+    return true;
 }
 
 bool BotManager::RelocateStrandedBot(::Player* bot)
@@ -379,7 +744,9 @@ bool BotManager::SendStrandedLowbieHome(::Player* bot)
     if (GroupHasRealPlayer(bot))
         return false;
     BotRecord* record = BotManager::Instance().FindBot(bot->GetObjectGuid());
-    if (!record || !record->random || record->lifecycle != BotLifecycle::InWorld)
+    // Issue #872: autonomous alts get stuck-recovery like the pool.
+    if (!record || (!record->random && !AltBotService::Instance().IsAutonomous(bot->GetObjectGuid())) ||
+        record->lifecycle != BotLifecycle::InWorld)
         return false;
     if (!record->masterGuid.IsEmpty())
         return false;
@@ -449,7 +816,8 @@ void BotManager::SweepStrandedBots(uint32_t diff)
     {
         BotRecord& rec = entry.record;
         ::Player* p = nullptr;
-        bool stranded = rec.random && rec.lifecycle == BotLifecycle::InWorld && rec.masterGuid.IsEmpty() &&
+        bool stranded = (rec.random || AltBotService::Instance().IsAutonomous(key)) &&
+            rec.lifecycle == BotLifecycle::InWorld && rec.masterGuid.IsEmpty() &&
             (p = sObjectAccessor.FindPlayer(rec.characterGuid)) != nullptr &&
             p->GetSession() && p->GetSession()->IsHeadless() && p->IsInWorld() &&
             !GroupHasRealPlayer(p) && !p->InBattleGround() && !p->IsBeingTeleported() &&
@@ -556,6 +924,17 @@ namespace
 // player-owned when a live real player masters it or its account is not a
 // registered RNDBOT pool account.
 PlayerBotClassificationInputs ClassifyBot(BotEntry const& entry);
+
+// The registry entry of a guid, by its registry key (BotGuidKey.h): end() for
+// a guid that is not a player's, whatever its counter.
+template <typename Map>
+auto FindByGuid(Map& bots, ::ObjectGuid const& guid) -> decltype(bots.end())
+{
+    uint32_t key = 0;
+    if (!BotRegistryKey(guid.GetRawValue(), key))
+        return bots.end();
+    return bots.find(key);
+}
 } // namespace
 
 void BotManager::OnPlayerLogin(::Player* player)
@@ -641,38 +1020,49 @@ void BotManager::OnPlayerLogin(::Player* player)
     // restores the per-session equip flags those spells carry.
     PlayerbotFactory::EnsureSkillRewardedSpells(player);
 
+    // The same spellbook invariant for talents: a talent rank spell the core
+    // marked dependent is never written to character_spell. The load path
+    // re-derives that flag on every login (a known trainer rank of the same
+    // spell chain teaches the talent rank below it as dependent), so without
+    // this the talent row would be deleted by the first save after the login
+    // while the live spellbook keeps the spell - a 51-point shaman tank read
+    // 15/35 in the armory instead of 15/36. Idempotent and O(spellbook).
+    PlayerbotFactory::EnsureTalentSpellsSaved(player);
+
+    // Helmet and cloak display on pool bots (RandomBotShowHelmet/ShowCloak):
+    // the flags live in PLAYER_FLAGS, so re-applying them each login keeps
+    // existing characters in step after a config change. Hired companions and
+    // claimed bots read their visibility settings on the master's login path;
+    // their characters are never touched here.
+    if (record.random && !HireLifecycle::Instance().IsHired(player->GetObjectGuid()) &&
+        !ClaimLifecycle::Instance().IsClaimed(player->GetGUIDLow()))
+    {
+        if (sPlayerbotAIConfig.randomBotShowHelmet)
+            player->RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_HELM);
+        else
+            player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_HELM);
+
+        if (sPlayerbotAIConfig.randomBotShowCloak)
+            player->RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_CLOAK);
+        else
+            player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_HIDE_CLOAK);
+    }
+
     // Normalize Goblin and High Elf (and any random bot in custom isolated
-    // starting zones lacking navmesh/transport to mainland) to standard faction starting zones.
-    // With RandomBotEvenStartZones the destination is the least-populated
-    // standard start of the bot's faction (one bounded characters-table count
-    // per normalization); otherwise goblins go to Valley of Trials and high
-    // elves to Northshire as before.
+    // starting zones lacking navmesh/transport to mainland) to standard faction
+    // starting zones: Valley of Trials and Northshire. RandomBotEvenStartZones
+    // counts goblins toward Durotar and high elves toward Elwynn when it picks
+    // the race, so landing them anywhere else unbalanced the spread it made
+    // (live 2026-10-09: the high elves sent to Dun Morogh/Teldrassil left
+    // Elwynn with humans only).
     if (record.random && !sPlayerbotAIConfig.allowIsolatedCustomStartingZones)
     {
         uint32 zoneId = player->GetZoneId();
         uint32 areaId = player->GetAreaId();
         if (PlayerbotAIConfig::IsIsolatedCustomZone(zoneId) || PlayerbotAIConfig::IsIsolatedCustomZone(areaId))
         {
-            StartZoneSpawn const* spawn = nullptr;
             bool horde = player->GetTeam() == HORDE;
-            if (sPlayerbotAIConfig.randomBotEvenStartZones)
-            {
-                uint32_t counts[kStartZoneCount] = {};
-                std::unique_ptr<QueryResult> rows(CharacterDatabase.PQuery(
-                    "SELECT `race` FROM `characters` WHERE `deleteDate` IS NULL AND `level` = 1"));
-                if (rows)
-                {
-                    do
-                    {
-                        int zone = StartZoneIndexForRace(rows->Fetch()[0].GetUInt32());
-                        if (zone >= 0 && zone < int(kStartZoneCount))
-                            ++counts[zone];
-                    } while (rows->NextRow());
-                }
-                spawn = &kStartZoneSpawns[LeastPopulatedStartZone(counts, horde)];
-            }
-            else
-                spawn = horde ? &kStartZoneSpawns[0] : &kStartZoneSpawns[3];
+            StartZoneSpawn const* spawn = horde ? &kStartZoneSpawns[0] : &kStartZoneSpawns[3];
             player->TeleportTo(spawn->map, spawn->x, spawn->y, spawn->z, spawn->o);
             player->SetHomebindToLocation(WorldLocation(spawn->map, spawn->x, spawn->y, spawn->z, spawn->o), spawn->area);
             player->SaveToDB();
@@ -751,8 +1141,16 @@ void BotManager::OnPlayerLogin(::Player* player)
         if (player->GetLevel() < seedLevel)
         {
             player->GiveLevel(seedLevel);
+            // A bot born at level N never walked levels 1..N-1, so it never
+            // bought their spells: pool mages seeded at 50+ knew no Fireball or
+            // Frostbolt and went 0.3 kills to 8.4 deaths (Oct 2026 pool). Give
+            // the seeded level's spells once, like a hired companion gets them;
+            // every later level is still trained at a trainer.
+            size_t const spellsBefore = player->GetSpellMap().size();
+            PlayerbotFactory(player, seedLevel).LearnSeedLevelSpells();
             sRandomBotFacade.SetValue(player->GetGUIDLow(), "levelSeeded", 1);
-            TB_LOG_DETAIL("TortoiseBots: seeded fresh bot %s to level %u.", player->GetName(), seedLevel);
+            TB_LOG_DETAIL("TortoiseBots: seeded fresh bot %s to level %u (+%u spells).", player->GetName(), seedLevel,
+                uint32(player->GetSpellMap().size() - spellsBefore));
         }
     }
 
@@ -774,14 +1172,15 @@ void BotManager::OnPlayerLogin(::Player* player)
 
     bool freshBot = TortoiseBots::NeedsInitialGearSeeding(
         player->GetTotalPlayedTime(), sRandomBotFacade.GetValue(botGuidLow, "seeded"));
-    if (record.random && !hired && sPlayerbotAIConfig.randomGearUpgradeEnabled && player->GetLevel() >= 5 && freshBot)
+    bool const claimed = ClaimLifecycle::Instance().IsClaimed(botGuidLow);
+    if (record.random && !hired && !claimed && sPlayerbotAIConfig.randomGearUpgradeEnabled && player->GetLevel() >= 5 && freshBot)
     {
         sRandomBotFacade.UpdateGearSpells(player);
         sRandomBotFacade.SetValue(botGuidLow, "seeded", 1);
         TB_LOG_DETAIL("TortoiseBots: seeded starter gear for fresh bot %s.", player->GetName());
     }
 
-    // Skills are separate from gear seeding. With DisableRandomLevels=1 a bot never passes
+    // Skills are separate from gear seeding. A level-1 pool bot never passes
     // through a level pipeline: it would keep weapon
     // skill 1 for good and never get a profession, so grind, craft and gather have
     // nothing to work with. Give such a bot the level-bound skill set once, at any
@@ -812,6 +1211,8 @@ void BotManager::OnPlayerLogin(::Player* player)
     {
         PlayerbotFactory tools(player, player->GetLevel());
         tools.AddTools();
+        if (player->GetLevel() >= 18)
+            tools.InitMounts();
         // Issue #401 backstop for the live pool: free bots created before the
         // starter set get it on login, not only at creation. Hired companions
         // and owned alts are never touched: their kit is the player's business
@@ -827,6 +1228,18 @@ void BotManager::OnPlayerLogin(::Player* player)
     // Must run AFTER gear seeding and skills so the bot is fully initialized before any map transfer.
     TryRandomTeleport(player, record);
 
+    // Pool bots opt into PvP everywhere: the /pvp preference survives the
+    // server's PvP flag timer, a plain SetPvP does not. Re-applied on every
+    // login because relog clears the preference. Owned and hired bots stay
+    // untouched. War Mode is not used, so no XP bonus rides along.
+    if (record.random && ::sPlayerbotAIConfig.randomBotForcePvp &&
+        !HireLifecycle::Instance().IsHired(player->GetObjectGuid()) &&
+        !player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_PVP_DESIRED))
+    {
+        player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_PVP_DESIRED);
+        player->UpdatePvP(true);
+    }
+
     TB_LOG_DETAIL("TortoiseBots: bot %s entered world through native PlayerScript", player->GetName());
 }
 
@@ -837,8 +1250,14 @@ void BotManager::OnPlayerBeforeLogout(::Player* player)
 
     ::WorldSession* session = player->GetSession();
     if (!session || !session->IsHeadless())
+    {
+        AltBotService::Instance().OnOwnerLogout(player);
+        TortoiseBots::DowntimeService::OnOwnerLogout(player);
         DetachOwnedBots(player);
-
+    }
+    else
+        AltBotService::Instance().OnBotLogout(player);
+    TortoiseBots::DowntimeService::OnBotLogout(player);
     auto it = m_bots.find(player->GetObjectGuid().GetCounter());
     if (it == m_bots.end())
         return;
@@ -918,16 +1337,21 @@ void BotManager::RebindOwnedBots(::Player* master)
             continue;
 
         uint32 botOwner = entry.record.ownerAccountId ? entry.record.ownerAccountId : entry.record.accountId;
-        bool isOwner = (botOwner == masterAccountId || master->GetSession()->GetSecurity() >= SEC_GAMEMASTER);
+        bool isOwner = botOwner == masterAccountId;
+        bool isGm = master->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
 
+        // An alt-bot keeps playing on its own; `.bot add` takes it back.
+        if (AltBotService::Instance().IsAutonomous(entry.record.characterGuid))
+            continue;
+
+        // A GM takes over bots of his own group only: every masterless pool
+        // bot would otherwise follow and whisper to him on login.
         bool shouldRebind = (entry.record.masterGuid == masterGuid);
-        if (!shouldRebind && isOwner)
-        {
-            if (masterGroup && masterGroup->IsMember(entry.record.characterGuid))
-                shouldRebind = true;
-            else if (entry.record.masterGuid.IsEmpty() || !sObjectAccessor.FindPlayer(entry.record.masterGuid))
-                shouldRebind = true;
-        }
+        if (!shouldRebind && (isOwner || isGm) && masterGroup && masterGroup->IsMember(entry.record.characterGuid))
+            shouldRebind = true;
+        else if (!shouldRebind && isOwner &&
+                 (entry.record.masterGuid.IsEmpty() || !sObjectAccessor.FindPlayer(entry.record.masterGuid)))
+            shouldRebind = true;
 
         if (!shouldRebind)
             continue;
@@ -972,6 +1396,7 @@ void BotManager::ReleaseToClient(::Player* player)
         it->second.aiAdapter->Shutdown();
 
     TB_LOG_DETAIL("TortoiseBots: releasing module control of %s to a network client", player->GetName());
+    AltBotService::Instance().OnReclaimed(player);
     uint32_t guidLow = player->GetObjectGuid().GetCounter();
     m_bots.erase(it);
     sRandomBotFacade.MarkNativePlayersDirty();
@@ -979,6 +1404,17 @@ void BotManager::ReleaseToClient(::Player* player)
     // active cleanup, then drop the master lock so no ghost lease lingers.
     BotActivityLeaseManager::Instance().ClaimForMaster(guidLow);
     BotActivityLeaseManager::Instance().ReleaseMaster(guidLow);
+}
+
+void BotManager::Shutdown()
+{
+    std::vector<::ObjectGuid> guids;
+    guids.reserve(m_bots.size());
+    for (auto const& pair : m_bots)
+        guids.push_back(pair.second.record.characterGuid);
+
+    for (auto const& guid : guids)
+        RemoveBot(guid, true);
 }
 
 bool BotManager::RunPendingAddRemoveTest(uint32_t accountId, ::ObjectGuid guid)
@@ -1020,7 +1456,12 @@ bool BotManager::AddRandomBot(uint32_t accountId, ::ObjectGuid guid)
 
 bool BotManager::AddBotWithMaster(uint32_t accountId, ::ObjectGuid guid, ::ObjectGuid masterGuid)
 {
-    uint32_t key = guid.GetCounter();
+    uint32_t key = 0;
+    if (!BotRegistryKey(guid.GetRawValue(), key))
+    {
+        TB_LOG_DETAIL("TortoiseBots: AddBot guid %s is not a player guid", guid.GetString().c_str());
+        return false;
+    }
     auto it = m_bots.find(key);
     if (it != m_bots.end())
     {
@@ -1141,7 +1582,9 @@ std::vector<OwnedCharacter> BotManager::GetOwnedCharacters(uint32_t ownerAccount
 
 bool BotManager::RemoveBot(::ObjectGuid guid, bool save)
 {
-    uint32_t key = guid.GetCounter();
+    uint32_t key = 0;
+    if (!BotRegistryKey(guid.GetRawValue(), key))
+        return false;
     auto it = m_bots.find(key);
     if (it == m_bots.end())
         return false;
@@ -1207,9 +1650,15 @@ bool BotManager::RemoveBot(::ObjectGuid guid, bool save)
     return true;
 }
 
+// Every lookup by an ObjectGuid goes through the registry key (BotGuidKey.h):
+// a guid that is not a player's (a creature, a charmed summon's pet guid) is
+// never a bot, though its counter may equal a bot character's.
 BotRecord* BotManager::FindBot(::ObjectGuid guid)
 {
-    auto it = m_bots.find(guid.GetCounter());
+    uint32_t key = 0;
+    if (!BotRegistryKey(guid.GetRawValue(), key))
+        return nullptr;
+    auto it = m_bots.find(key);
     if (it == m_bots.end())
         return nullptr;
     return &it->second.record;
@@ -1217,12 +1666,16 @@ BotRecord* BotManager::FindBot(::ObjectGuid guid)
 
 bool BotManager::IsBot(::ObjectGuid guid) const
 {
-    return m_bots.find(guid.GetCounter()) != m_bots.end();
+    uint32_t key = 0;
+    return BotRegistryKey(guid.GetRawValue(), key) && m_bots.find(key) != m_bots.end();
 }
 
 bool BotManager::IsRandomBot(::ObjectGuid guid) const
 {
-    auto it = m_bots.find(guid.GetCounter());
+    uint32_t key = 0;
+    if (!BotRegistryKey(guid.GetRawValue(), key))
+        return false;
+    auto it = m_bots.find(key);
     return it != m_bots.end() && it->second.record.random;
 }
 
@@ -1288,12 +1741,12 @@ bool BotManager::BindBotMaster(::ObjectGuid botGuid, ::ObjectGuid masterGuid)
     if (masterGuid.IsEmpty() || botGuid == masterGuid)
         return false;
 
-    auto it = m_bots.find(botGuid.GetCounter());
+    auto it = FindByGuid(m_bots, botGuid);
     if (it == m_bots.end())
         return false;
 
     ::Player* master = sObjectAccessor.FindPlayer(masterGuid);
-    auto masterEntry = m_bots.find(masterGuid.GetCounter());
+    auto masterEntry = FindByGuid(m_bots, masterGuid);
     bool moduleHeadlessMaster = master && masterEntry != m_bots.end() &&
         IsLiveHeadlessBot(masterEntry->second, master);
     if (!master || !master->IsInWorld() || !master->GetSession() ||
@@ -1333,6 +1786,7 @@ bool BotManager::BindBotMaster(::ObjectGuid botGuid, ::ObjectGuid masterGuid)
     it->second.record.masterGuid = masterGuid;
     if (ai)
         it->second.aiAdapter->RebindMaster(master);
+    AltBotService::Instance().OnMasterBound(bot, master);
     // Human claim wins (issue #89): evict any background lease with active
     // cleanup, then lock to PlayerMaster. Non-binding whispers never reach
     // here; only master-binding paths (.bot add, invite, follow) do.
@@ -1343,7 +1797,7 @@ bool BotManager::BindBotMaster(::ObjectGuid botGuid, ::ObjectGuid masterGuid)
 
 bool BotManager::ClearBotMaster(::ObjectGuid botGuid)
 {
-    auto it = m_bots.find(botGuid.GetCounter());
+    auto it = FindByGuid(m_bots, botGuid);
     if (it == m_bots.end())
         return false;
 
@@ -1386,7 +1840,7 @@ bool BotManager::SetBotFollow(::ObjectGuid botGuid, ::ObjectGuid masterGuid)
     if (!BindBotMaster(botGuid, masterGuid))
         return false;
 
-    auto it = m_bots.find(botGuid.GetCounter());
+    auto it = FindByGuid(m_bots, botGuid);
     if (it == m_bots.end())
         return false;
 
@@ -1474,12 +1928,63 @@ PlayerBotClassificationInputs ClassifyBot(BotEntry const& entry)
 }
 } // namespace
 
+void BotManager::CheckNewPetSpawn(::Player* bot, ::PlayerbotAI* ai)
+{
+    if (!bot || !ai || !bot->IsInWorld() || bot->IsBeingTeleported() || bot->GetTransport())
+        return;
+    ObjectGuid const petGuid = bot->GetPetGuid();
+    if (!IsUncheckedPet(petGuid.GetRawValue(), ai->lastSpawnCheckedPetGuid))
+        return;
+    // Map lookup, not Player::GetPet: that one clears the owner's pet guid
+    // when the pet is not on the map yet.
+    Pet* pet = bot->GetMap()->GetPet(petGuid);
+    if (!pet || !pet->IsInWorld() || pet->GetMap() != bot->GetMap())
+        return; // not placed yet: checked on a later turn
+    ai->lastSpawnCheckedPetGuid = petGuid.GetRawValue();
+
+    PetSpawnCheckInputs inputs;
+    inputs.dx = pet->GetPositionX() - bot->GetPositionX();
+    inputs.dy = pet->GetPositionY() - bot->GetPositionY();
+    inputs.dz = pet->GetPositionZ() - bot->GetPositionZ();
+    inputs.ownerSeesPet = bot->IsWithinLOSInMap(pet);
+    if (!ShouldPullNewPetToOwner(inputs))
+        return;
+
+    TB_LOG_DETAIL("TortoiseBots: pet of %s appeared %.1f yd off (dz %.1f, los %u); moved to its owner",
+        bot->GetName(), std::sqrt(inputs.dx * inputs.dx + inputs.dy * inputs.dy + inputs.dz * inputs.dz),
+        inputs.dz, inputs.ownerSeesPet ? 1u : 0u);
+    pet->NearTeleportTo(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), bot->GetOrientation());
+}
+
 void BotManager::UpdateBots(uint32_t diff)
 {
+    // Per-bot action log retention (AiPlayerbot.ActionLogMaxAgeDays/MaxTotalMB):
+    // one clock compare per world update; the folder is listed at startup, then
+    // hourly. Runs before the pass timer so BOTPERF stays the pass's own cost.
+    ai::botdiag::BotActionLog::Maintain();
+
     // Module-side pass cost. Left in permanently: with a large pool the
     // periodic BOTPERF line is the only direct measure of how much of the
     // world tick this pass owns.
     auto const passStart = std::chrono::steady_clock::now();
+
+    // Self-tuning tick budget: feed the measured previous world tick (diff)
+    // and the previous pool turn loop inside it before the passes read their
+    // budgets (the controller only cuts when the pool is what keeps the tick
+    // over target, see AdaptiveBudget.h). Re-sync when the operator's
+    // target or ceilings change (restart-only keys). When the controller is
+    // off (target 0) it holds the ceilings, which is the old static path.
+    if (sPlayerbotAIConfig.targetWorldTickMs != m_adaptiveTargetMs ||
+        sPlayerbotAIConfig.poolTickBudgetUs != m_adaptivePoolCeilingUs ||
+        sPlayerbotAIConfig.combatTickBudgetUs != m_adaptiveCombatCeilingUs)
+    {
+        m_adaptiveTargetMs = sPlayerbotAIConfig.targetWorldTickMs;
+        m_adaptivePoolCeilingUs = sPlayerbotAIConfig.poolTickBudgetUs;
+        m_adaptiveCombatCeilingUs = sPlayerbotAIConfig.combatTickBudgetUs;
+        m_adaptiveBudget = AdaptiveBudget(m_adaptiveTargetMs,
+            static_cast<uint32_t>(m_adaptivePoolCeilingUs), static_cast<uint32_t>(m_adaptiveCombatCeilingUs));
+    }
+    m_adaptiveBudget.Update(diff, m_lastPoolTurnsMs);
 
     // Guard: AI updates below can request (their own or another bot's) removal.
     // RemoveBot defers the session stop while this is set; the queue drains
@@ -1521,17 +2026,6 @@ void BotManager::UpdateBots(uint32_t diff)
             poolGuids.push_back(kv.first);
     }
 
-    // Round-robin order for the pool pass. Rebuilt only when the live
-    // membership changes, so the cursor points at the same place in the same
-    // rotation between ticks: a bot that misses a pass is served on a later
-    // one, never skipped permanently.
-    m_poolRotation.Refresh(poolGuids, [this](uint32_t guidLow)
-    {
-        auto it = m_bots.find(guidLow);
-        return it != m_bots.end() && it->second.record.lifecycle == BotLifecycle::InWorld &&
-            !IsPlayerOwnedBot(ClassifyBot(it->second));
-    });
-
     auto updateOneBot = [this, diff](uint32_t guidLow)
     {
         auto it = m_bots.find(guidLow);
@@ -1544,6 +2038,10 @@ void BotManager::UpdateBots(uint32_t diff)
         // a bot whose session stop is pending.
         if (entry.record.lifecycle != BotLifecycle::InWorld)
             return;
+
+        // Next pool turn for every path below that returns before the AI runs
+        // (teleport still pending, adapter not usable yet): retry at the cap.
+        entry.turnDueMs = WorldTimer::getMSTime() + TurnMaxWaitMs(entry.turnSituation);
 
         // Headless players have no client to acknowledge a core near/far
         // teleport. The donor PlayerbotMgr drove this acknowledgement from its
@@ -1561,14 +2059,80 @@ void BotManager::UpdateBots(uint32_t diff)
             // transfer; acknowledging the pending marker would reset state
             // before the destination has been installed.
             PlayerbotAI* ai = entry.aiAdapter->GetAI();
-            if ((player->IsBeingTeleportedNear() || player->IsBeingTeleportedFar()) && ai)
+            bool const nearTeleport = player->IsBeingTeleportedNear();
+            if ((nearTeleport || player->IsBeingTeleportedFar()) && ai)
+            {
                 ai->HandleTeleportAck();
-            return;
+                ++entry.teleportAcks;
+                if (player->IsBeingTeleportedNear())
+                    ++entry.teleportAcksIgnored;
+            }
+            // A near teleport completes inside the ack, so the bot may act in
+            // this same visit. Returning here let anything that re-arms a
+            // teleport between visits keep the bot's AI off for good (the
+            // per-second graveyard repop did that to ~700 ghosts).
+            if (!nearTeleport || player->IsBeingTeleported() || !player->IsInWorld())
+                return;
         }
 
         if (entry.aiAdapter && entry.aiAdapter->IsUsable())
         {
-            entry.aiAdapter->Update(diff);
+            // The AI counts its delays (GCD, react, rpg, sit...) down by the
+            // elapsed time it is given. A budgeted pool bot is visited once
+            // every N ticks, so it must get the time since ITS last update,
+            // not one world tick, or every delay stretches N times.
+            uint32_t const nowMs = WorldTimer::getMSTime();
+            uint32_t const elapsed = entry.lastAiUpdateMs
+                ? std::min(WorldTimer::getMSTimeDiff(entry.lastAiUpdateMs, nowMs), kMaxAiElapsedMs)
+                : diff;
+            entry.lastAiUpdateMs = nowMs ? nowMs : 1;
+            ++entry.aiVisits;
+            entry.aiAdapter->Update(elapsed);
+            // Issue #1043: a pet the AI turn just brought back (the resummon
+            // after a teleport ack) is checked before the maps update, so its
+            // own first update cannot unsummon it for being out of range. An
+            // idle bot on a continent may skip Player::Update entirely.
+            if (PlayerbotAI* petAi = entry.aiAdapter->GetAI())
+                CheckNewPetSpawn(petAi->GetBot(), petAi);
+
+            // Next pool turn: when the AI asked to think again, capped by the
+            // bot's situation after this turn. A travel-pipeline step (pick a
+            // destination, then start walking) goes again next tick, up to
+            // kMaxFollowUps times in a row, so it does not wait a full turn.
+            if (PlayerbotAI* stepAi = entry.aiAdapter->GetAI())
+            {
+                uint32_t aiDelayMs = stepAi->GetAIInternalUpdateDelay();
+                if (!AwaitsTravelStep(stepAi))
+                    entry.followUps = 0;
+                else if (entry.followUps < kMaxFollowUps)
+                {
+                    ++entry.followUps;
+                    aiDelayMs = 0;
+                }
+                entry.turnSituation = TurnSituationOf(sObjectAccessor.FindPlayerNotInWorld(entry.record.characterGuid), stepAi);
+                entry.turnDueMs = TurnNextDueMs(WorldTimer::getMSTime(), aiDelayMs, entry.turnSituation);
+            }
+
+            // One bot's update is never cut by the budget, so a single slow
+            // one lands whole in the tick every player waits on. Name it, at
+            // most once a minute per bot. Re-resolve the player: the update
+            // just ran arbitrary AI code.
+            uint32_t const doneMs = WorldTimer::getMSTime();
+            uint32_t const tookMs = WorldTimer::getMSTimeDiff(nowMs, doneMs);
+            if (tookMs >= kSlowBotUpdateMs &&
+                (!entry.lastSlowLogMs || WorldTimer::getMSTimeDiff(entry.lastSlowLogMs, doneMs) >= 60000))
+            {
+                ::Player* slow = sObjectAccessor.FindPlayer(entry.record.characterGuid);
+                PlayerbotAI* botAi = slow && entry.aiAdapter ? entry.aiAdapter->GetAI() : nullptr;
+                if (slow && botAi)
+                {
+                    entry.lastSlowLogMs = doneMs ? doneMs : 1;
+                    ai::Action const* last = botAi->GetLastExecutedAction(botAi->GetState());
+                    TB_LOG_BASIC("TortoiseBots: SLOWBOT %s took %u ms (state %u, last action %s, map %u)",
+                        slow->GetName(), tookMs, static_cast<uint32_t>(botAi->GetState()),
+                        last ? const_cast<ai::Action*>(last)->getName().c_str() : "-", slow->GetMapId());
+                }
+            }
         }
     };
 
@@ -1576,24 +2140,77 @@ void BotManager::UpdateBots(uint32_t diff)
     for (uint32_t guidLow : playerGuids)
         updateOneBot(guidLow);
 
-    // Pass 2: the pool, resuming at the rotation cursor. The budget is checked
-    // between bots (so a pass can overshoot by one bot's work, the
-    // AhMarketService convention) and only engages once the previous world
-    // tick ran long; a healthy tick gives the pool the same full pass it
-    // always got.
+    // Pass 2: the random pool, one turn queue (BotTurnScheduler.h). A bot is
+    // due when its AI asked to think again, capped by its situation (combat,
+    // dead, battleground, teleport or anything else), and a change of
+    // situation makes it due at once. Due bots run most overdue first relative
+    // to that cap until the budget is spent; whoever is left is later still on
+    // the next tick and so runs first. The budget is checked before starting
+    // each bot, so a pass never starts new work over budget. PoolTickBudgetUs
+    // and CombatTickBudgetUs add up to the one budget (0 in either: no budget).
     uint32_t const playerBots = static_cast<uint32_t>(playerGuids.size());
-    uint32_t const poolBots = m_poolRotation.Size();
-    uint64_t const budgetUs = sPlayerbotAIConfig.poolTickBudgetUs;
+    uint32_t const poolBots = static_cast<uint32_t>(poolGuids.size());
+    uint64_t const budgetUs = (m_adaptiveBudget.PoolUs() == 0 || m_adaptiveBudget.CombatUs() == 0)
+        ? 0 : m_adaptiveBudget.PoolUs() + m_adaptiveBudget.CombatUs();
     uint32 const gateMs = sPlayerbotAIConfig.poolBudgetWhenTickOverMs;
     bool const budgetActive = budgetUs > 0 && (gateMs == 0 || diff > gateMs);
-    bool budgetHit = false;
-    uint32_t const poolProcessed = m_poolRotation.Run(budgetActive, budgetUs,
-        []()
+
+    uint32_t const turnNowMs = WorldTimer::getMSTime();
+    m_dueTurns.clear();
+    for (uint32_t guidLow : poolGuids)
+    {
+        auto it = m_bots.find(guidLow);
+        if (it == m_bots.end() || it->second.record.lifecycle != BotLifecycle::InWorld)
+            continue;
+        BotEntry& entry = it->second;
+        TurnSituation const situation = TurnSituationOf(sObjectAccessor.FindPlayerNotInWorld(entry.record.characterGuid),
+            entry.aiAdapter ? entry.aiAdapter->GetAI() : nullptr);
+        if (situation != entry.turnSituation || entry.turnDueMs == 0)
         {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-        },
-        updateOneBot, budgetHit);
+            entry.turnSituation = situation;
+            entry.turnDueMs = turnNowMs;
+        }
+        if (TurnIsDue(turnNowMs, entry.turnDueMs))
+            m_dueTurns.push_back({guidLow, entry.turnDueMs, situation});
+    }
+    OrderDueTurns(m_dueTurns, turnNowMs);
+
+    auto const nowUs = []()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    uint64_t const turnsStartUs = nowUs();
+    uint32_t poolProcessed = 0;
+    bool budgetHit = false;
+    uint64_t const turnLoopStartUs = nowUs();
+    for (DueTurn const& turn : m_dueTurns)
+    {
+        if (budgetActive && nowUs() - turnsStartUs >= budgetUs)
+        {
+            budgetHit = true;
+            break;
+        }
+        uint32_t const lateMs = static_cast<uint32_t>(turnNowMs - turn.dueMs);
+        m_perfLateMsSum += lateMs;
+        m_perfLateMsMax = std::max(m_perfLateMsMax, lateMs);
+        ++m_perfTurns;
+        if (turn.situation == TurnSituation::Combat)
+        {
+            m_perfCombatLateMsSum += lateMs;
+            ++m_perfCombatTurns;
+        }
+        else
+        {
+            m_perfOtherLateMsSum += lateMs;
+            ++m_perfOtherTurns;
+        }
+        updateOneBot(turn.guidLow);
+        ++poolProcessed;
+    }
+    m_perfTurnLoopUsSum += nowUs() - turnLoopStartUs;
+    // The cuttable share of this tick, fed to the controller next pass.
+    m_lastPoolTurnsMs = static_cast<uint32_t>((nowUs() - turnsStartUs) / 1000);
 
     m_inBotUpdate = false;
 
@@ -1618,19 +2235,60 @@ void BotManager::UpdateBots(uint32_t diff)
     m_perfElapsedMs += diff;
     if (m_perfElapsedMs >= 30000)
     {
-        TB_LOG_BASIC("TortoiseBots: BOTPERF passUs=%llu playerBots=%u ownedBots=%u masterBots=%u poolBots=%u poolProcessed=%u budgetHit=%u maxUs=%llu ticks=%u",
+        // coreMs: average world tick minus the average bot pass, i.e. what the
+        // core and other services spend per tick that bots cannot give back.
+        uint64_t const tickUsAvg = (static_cast<uint64_t>(m_perfElapsedMs) * 1000) / m_perfPassCount;
+        uint64_t const passUsAvg = m_perfPassUsSum / m_perfPassCount;
+        uint64_t const coreMs = tickUsAvg > passUsAvg ? (tickUsAvg - passUsAvg) / 1000 : 0;
+        // ResolveMovePath calls in this window that were answered from the cached route (routeReuse) or planned the route again (routeRebuild).
+        uint32_t const routeReuse = ai::MovementAction::routeReuseCount.exchange(0, std::memory_order_relaxed);
+        uint32_t const routeRebuild = ai::MovementAction::routeRebuildCount.exchange(0, std::memory_order_relaxed);
+        // Creature aura keep-out: grid visits made for the shared hazard snapshots in this window.
+        uint32_t const keepoutScans = ai::PossibleTriggersValue::hazardSnapshotRefreshCount.exchange(0, std::memory_order_relaxed);
+        // Lookups due a refresh after the world update's refresh budget was spent (stale reuse or live list only).
+        uint32_t const keepoutBudgetMiss = ai::PossibleTriggersValue::hazardSnapshotBudgetMissCount.exchange(0, std::memory_order_relaxed);
+        TB_LOG_BASIC("TortoiseBots: BOTPERF passUs=%llu playerBots=%u ownedBots=%u masterBots=%u poolBots=%u poolProcessed=%u due=%u budgetHit=%u maxUs=%llu ticks=%u poolBudgetUs=%llu combatBudgetUs=%llu turnLateAvgMs=%u turnLateMaxMs=%u turns=%u usPerTurn=%u coreMs=%u combatTurns=%u combatLateAvgMs=%u otherTurns=%u otherLateAvgMs=%u routeReuse=%u routeRebuild=%u keepoutScans=%u keepoutBudgetMiss=%u",
             static_cast<unsigned long long>(m_perfPassUsSum / m_perfPassCount),
-            playerBots, ownedAccountBots, masterBots, poolBots, poolProcessed, budgetHit ? 1u : 0u,
-            static_cast<unsigned long long>(m_perfPassUsMax), m_perfPassCount);
+            playerBots, ownedAccountBots, masterBots, poolBots, poolProcessed,
+            static_cast<uint32_t>(m_dueTurns.size()), budgetHit ? 1u : 0u,
+            static_cast<unsigned long long>(m_perfPassUsMax), m_perfPassCount,
+            static_cast<unsigned long long>(m_adaptiveBudget.PoolUs()),
+            static_cast<unsigned long long>(m_adaptiveBudget.CombatUs()),
+            m_perfTurns ? static_cast<uint32_t>(m_perfLateMsSum / m_perfTurns) : 0u, m_perfLateMsMax,
+            m_perfTurns, m_perfTurns ? static_cast<uint32_t>(m_perfTurnLoopUsSum / m_perfTurns) : 0u,
+            static_cast<uint32_t>(coreMs),
+            m_perfCombatTurns, m_perfCombatTurns ? static_cast<uint32_t>(m_perfCombatLateMsSum / m_perfCombatTurns) : 0u,
+            m_perfOtherTurns, m_perfOtherTurns ? static_cast<uint32_t>(m_perfOtherLateMsSum / m_perfOtherTurns) : 0u,
+            routeReuse, routeRebuild, keepoutScans, keepoutBudgetMiss);
         m_perfPassUsSum = 0;
         m_perfPassUsMax = 0;
         m_perfPassCount = 0;
         m_perfElapsedMs = 0;
+        m_perfTurns = 0;
+        m_perfLateMsSum = 0;
+        m_perfLateMsMax = 0;
+        m_perfTurnLoopUsSum = 0;
+        m_perfCombatTurns = 0;
+        m_perfCombatLateMsSum = 0;
+        m_perfOtherTurns = 0;
+        m_perfOtherLateMsSum = 0;
+    }
+
+    // Cumulative action-count snapshot every 5 minutes of tick time. The dump
+    // itself gates on AiPlayerbot.ActionCountsLog, so the off path is one
+    // branch plus an integer add per tick.
+    m_actionCountsElapsedMs += diff;
+    if (m_actionCountsElapsedMs >= 5 * 60 * 1000)
+    {
+        m_actionCountsElapsedMs = 0;
+        ai::botdiag::DumpActionCounts();
     }
 }
 
 void BotManager::OnWorldUpdate(uint32_t diff)
 {
+    AltBotService::Instance().Update();
+    TortoiseBots::DowntimeService::Instance().Update();
     // Core owns Headless session lifecycle (queue, LoginPlayer dispatch, reclaim).
     // Module only tracks BotRecord and polls adapter state. No pending promotion.
     for (auto it = m_bots.begin(); it != m_bots.end(); )
@@ -1766,12 +2424,17 @@ void BotManager::OnWorldUpdate(uint32_t diff)
         ++it;
     }
 
+    // Creature aura keep-out: a fresh hazard-snapshot refresh budget for this
+    // world update, before anything here can run bot AI.
+    ai::PossibleTriggersValue::BeginKeepoutTick();
+
     // Mature PlayerbotAI still exposes a donor-shaped population view for
     // perception/social queries. Refresh it from the authoritative native
     // records immediately before any AI update; it never owns sessions.
     PlayerbotAI::ProcessDelayedPackets();
     sRandomBotFacade.SyncNativePlayers();
     UpdateBots(diff);
+    SweepDeadBots(diff);
     SweepStrandedBots(diff);
 
     if (m_autoTestEnabled)
@@ -1779,6 +2442,32 @@ void BotManager::OnWorldUpdate(uint32_t diff)
 
     if (m_packetTestEnabled)
         UpdatePacketBridgeTest(diff);
+
+    PublishMasterView();
+}
+
+void BotManager::PublishMasterView()
+{
+    // Same filter as GetBotsForMaster, evaluated here on the world thread.
+    // Only bots with a master are visited past the first compare, so the
+    // random pool costs one guid test per record.
+    MasterBotView::Map view;
+    for (auto const& entry : m_bots)
+    {
+        ObjectGuid const masterGuid = entry.second.record.masterGuid;
+        if (masterGuid.IsEmpty())
+            continue;
+
+        ::Player* player = sObjectAccessor.FindPlayer(entry.second.record.characterGuid);
+        if (IsLiveHeadlessBot(entry.second, player))
+            view[masterGuid.GetRawValue()].push_back(entry.second.record.characterGuid.GetRawValue());
+    }
+    m_masterView.Publish(std::move(view));
+}
+
+std::vector<uint64_t> BotManager::GetBotGuidsForMasterAnyThread(::ObjectGuid masterGuid) const
+{
+    return m_masterView.BotsFor(masterGuid.GetRawValue());
 }
 
 void BotManager::UpdatePacketBridgeTest(uint32_t diff)
@@ -2165,3 +2854,14 @@ void BotManager::UpdateAutoTest(uint32_t diff)
 }
 
 } // namespace TortoiseBots
+
+void TortoiseBots::BotManager::GetAiVisitInfo(uint32_t guidLow, uint32_t& visits, uint32_t& ageMs) const
+{
+    visits = 0;
+    ageMs = 0;
+    auto it = m_bots.find(guidLow);
+    if (it == m_bots.end() || !it->second.lastAiUpdateMs)
+        return;
+    visits = it->second.aiVisits;
+    ageMs = WorldTimer::getMSTimeDiff(it->second.lastAiUpdateMs, WorldTimer::getMSTime());
+}

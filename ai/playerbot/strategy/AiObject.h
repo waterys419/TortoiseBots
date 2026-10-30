@@ -309,6 +309,22 @@ class clazz : public super \
         clazz(PlayerbotAI* ai) : CastSpellAction(ai, spell) {} \
     }
 
+// Interrupt rows: cast at the "interrupt target" pick, not the current
+// target. Pair only with an InterruptSpellTrigger row.
+#define MELEE_INTERRUPT_ACTION(clazz, spell) \
+    class clazz : public CastMeleeInterruptSpellAction \
+    { \
+    public: \
+        clazz(PlayerbotAI* ai) : CastMeleeInterruptSpellAction(ai, spell) {} \
+    }
+
+#define INTERRUPT_SPELL_ACTION(clazz, spell) \
+    class clazz : public CastInterruptSpellAction \
+    { \
+    public: \
+        clazz(PlayerbotAI* ai) : CastInterruptSpellAction(ai, spell) {} \
+    }
+
 #define SPELL_ACTION_U(clazz, spell, useful) \
     class clazz : public CastSpellAction \
     { \
@@ -332,19 +348,20 @@ class clazz : public super \
         virtual bool isUseful() override { return useful; } \
     }
 
-#define HEAL_PARTY_ACTION(clazz, spell) \
+#define HEAL_PARTY_ACTION_E(clazz, spell, est, eff) \
     class clazz : public HealPartyMemberAction \
     { \
     public: \
-        clazz(PlayerbotAI* ai) : HealPartyMemberAction(ai, spell) {} \
+        clazz(PlayerbotAI* ai) : HealPartyMemberAction(ai, spell, est, eff) {} \
     }
 
-#define HEAL_HOT_PARTY_ACTION(clazz, spell) \
+#define HEAL_HOT_PARTY_ACTION_E(clazz, spell, est, eff) \
     class clazz : public HealHotPartyMemberAction \
     { \
     public: \
-        clazz(PlayerbotAI* ai) : HealHotPartyMemberAction(ai, spell) {} \
+        clazz(PlayerbotAI* ai) : HealHotPartyMemberAction(ai, spell, est, eff) {} \
     }
+
 
 #define AOE_HEAL_ACTION(clazz, spell) \
     class clazz : public CastAoeHealSpellAction \
@@ -524,6 +541,13 @@ class clazz : public CastSpellAction \
         { \
         public: \
         clazz(PlayerbotAI* ai) : CastSpellAction(ai, name) {} \
+
+// Interrupt rows: see CastInterruptSpellAction.
+#define BEGIN_INTERRUPT_SPELL_ACTION(clazz, name) \
+class clazz : public CastInterruptSpellAction \
+        { \
+        public: \
+        clazz(PlayerbotAI* ai) : CastInterruptSpellAction(ai, name) {} \
 
 
 #define END_SPELL_ACTION() \

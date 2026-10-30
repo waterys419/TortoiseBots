@@ -2,16 +2,18 @@
 #include "playerbot/playerbot.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "RandomItemMgr.h"
+#include "../../runtime/policy/provision/GearBlacklistPolicy.h"
 #include "Maps/Map.h"
 #include "Database/DatabaseEnv.h"
 
 #include "playerbot/ServerFacade.h"
 #include "strategy/values/LootValues.h"
-#include "strategy/values/RogueWeaponPolicy.h"
+#include "policy/gear/RogueWeaponPolicy.h"
 #include "ItemEnchantmentMgr.h"
 
 #include "strategy/values/SharedValueContext.h"
-#include "strategy/values/SpecWeaponPolicy.h"
+#include "policy/gear/SpecWeaponPolicy.h"
+#include "../../runtime/policy/provision/AmmoCachePolicy.h"
 
 char * strstri (const char* str1, const char* str2);
 
@@ -98,6 +100,26 @@ RandomItemMgr::RandomItemMgr()
     ItemStatLink[STAT_SPIRIT] = "spi";
 
 
+}
+
+// The duplicate-copy condition reads the index built in BuildItemInfoCache,
+// which Init runs before the other cache builds; the two clone conditions
+// need no index at all.
+bool RandomItemMgr::IsTransmogClone(ItemPrototype const* proto) const
+{
+    if (!proto)
+        return false;
+
+    TortoiseBots::TransmogCloneFacts facts;
+    facts.destItemSet = proto->DestItemId != 0;
+    facts.idIsCloneId = sObjectMgr.GetItemTransmogrifyTemplate(proto->ItemId) != nullptr;
+    facts.duplicateCopy = gearDuplicateItems.IsDuplicate(proto->ItemId);
+    return TortoiseBots::IsTransmogClone(facts);
+}
+
+bool RandomItemMgr::IsTransmogClone(uint32 itemId) const
+{
+    return IsTransmogClone(sObjectMgr.GetItemPrototype(itemId));
 }
 
 void RandomItemMgr::Init()
@@ -220,6 +242,9 @@ void RandomItemMgr::BuildRandomItemCache()
         {
             ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
             if (!proto)
+                continue;
+
+            if (IsTransmogClone(proto))
                 continue;
 
             if (proto->Duration & 0x80000000)
@@ -436,6 +461,13 @@ bool RandomItemMgr::ShouldEquipArmorForSpec(uint8 playerclass, uint8 spec, ItemP
     }
     case CLASS_SHAMAN:
     {
+        if (m_weightScales[spec].info.name == "shamantank")
+        {
+            // Shaman tank: shield always (its armor is the prized stat); the
+            // leather/mail level split stays in CanEquipArmor, not here.
+            resultArmorSubClass = { ITEM_SUBCLASS_ARMOR_TOTEM, ITEM_SUBCLASS_ARMOR_LEATHER, ITEM_SUBCLASS_ARMOR_MAIL, ITEM_SUBCLASS_ARMOR_SHIELD };
+            break;
+        }
         if (m_weightScales[spec].info.name == "enhance" && proto->InventoryType == INVTYPE_HOLDABLE)
             return false;
 
@@ -655,7 +687,16 @@ bool RandomItemMgr::ShouldEquipWeaponForSpec(uint8 playerclass, uint8 spec, Item
     }
     case CLASS_SHAMAN:
     {
-        if (m_weightScales[spec].info.name == "resto")
+        if (m_weightScales[spec].info.name == "shamantank")
+        {
+            // Shaman tank: slow 1H main hand (mace/axe/fist - no daggers, no
+            // 2H), shield off hand, totem ranged. Speed preference lives in
+            // the factory seed filter and the mledps weight, not here.
+            mh_weapons = { ITEM_SUBCLASS_WEAPON_AXE, ITEM_SUBCLASS_WEAPON_MACE, ITEM_SUBCLASS_WEAPON_FIST };
+            oh_weapons = { ITEM_SUBCLASS_ARMOR_SHIELD };
+            r_weapons = { ITEM_SUBCLASS_ARMOR_TOTEM };
+        }
+        else if (m_weightScales[spec].info.name == "resto")
         {
             mh_weapons = { ITEM_SUBCLASS_WEAPON_STAFF, ITEM_SUBCLASS_WEAPON_DAGGER, ITEM_SUBCLASS_WEAPON_AXE, ITEM_SUBCLASS_WEAPON_MACE, ITEM_SUBCLASS_WEAPON_FIST };
             oh_weapons = { ITEM_SUBCLASS_ARMOR_MISC, ITEM_SUBCLASS_ARMOR_SHIELD };
@@ -730,9 +771,10 @@ bool RandomItemMgr::ShouldEquipWeaponForSpec(uint8 playerclass, uint8 spec, Item
 
 bool RandomItemMgr::ShouldEquipWeaponForSlot(uint8 playerclass, uint8 spec, ItemPrototype const* proto, uint8 slot, bool canDualWield)
 {
-    // Only warriors and paladins have a slot-aware policy; every other
-    // class keeps the plain any-slot answer (fail-open).
-    if (playerclass != CLASS_WARRIOR && playerclass != CLASS_PALADIN)
+    // Only shield specs have a slot-aware policy (protection warrior /
+    // paladin, shaman tank); every other class keeps the plain any-slot
+    // answer (fail-open).
+    if (playerclass != CLASS_WARRIOR && playerclass != CLASS_PALADIN && playerclass != CLASS_SHAMAN)
         return ShouldEquipWeaponForSpec(playerclass, spec, proto, canDualWield);
 
     if (!spec)
@@ -743,6 +785,7 @@ bool RandomItemMgr::ShouldEquipWeaponForSlot(uint8 playerclass, uint8 spec, Item
 
     // The policy header owns the sets (single source of truth with the
     // standalone test); the scale id maps back to the spec name it loaded.
+    // Non-tank shaman specs stay fail-open inside the policy.
     return ai::SpecWeaponAllowed(playerclass, m_weightScales[spec].info.name,
         proto->Class, proto->SubClass, slot, canDualWield);
 }
@@ -826,6 +869,7 @@ void RandomItemMgr::BuildItemInfoCache()
         if (itemInfo)
             delete itemInfo;
 
+    slotItemIds.clear();
     uint32 maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
 
     for (uint32 i = 0; i <= MAX_STAT_SCALES; ++i)
@@ -968,6 +1012,23 @@ void RandomItemMgr::BuildItemInfoCache()
 
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
         if (!proto)
+            continue;
+
+        // Transmog clones must be skipped BEFORE the duplicate registration:
+        // a clone carries the base item's name and would otherwise flag a
+        // higher-id original instead of itself.
+        if (IsTransmogClone(proto))
+            continue;
+
+        // Custom-id duplicate copies (e.g. 1983153 copying "Might of Menethil"
+        // 22798): registered here, then cut from every gear pool — no
+        // itemInfoCache row, so stat weights, the equip cache, the slot
+        // backstop and upgrade suggestions never see them. A bot already
+        // wearing a copy scores it 0, so autogear replaces it with the real
+        // item. The walk is ascending, so the lowest-id instance (the real
+        // item) wins and stays eligible.
+        gearDuplicateItems.Add(proto->ItemId, proto->Name1.c_str());
+        if (gearDuplicateItems.IsDuplicate(proto->ItemId))
             continue;
 
         // skip non armor/weapon
@@ -1350,7 +1411,7 @@ void RandomItemMgr::BuildItemInfoCache()
                 if (cacheInfo->slot == EQUIPMENT_SLOT_TRINKET1 ||
                     cacheInfo->slot == EQUIPMENT_SLOT_TRINKET2)
                 {
-                    if (statW == 0 && proto->AllowableClass == uint32(clazz) && proto->Spells[0].SpellId)
+                    if (statW == 0 && proto->AllowableClass == (1u << (clazz - 1)) && proto->Spells[0].SpellId)
                     {
                         statW = (uint32)(proto->Quality + proto->ItemLevel);
                     }
@@ -1411,6 +1472,13 @@ void RandomItemMgr::BuildItemInfoCache()
         stmt.Execute();
 
         itemInfoCache[cacheInfo->itemId] = cacheInfo;
+        // Rings and trinkets occupy two slots; cacheInfo->slot keeps only one, so index every viable slot.
+        for (uint8 s = 0; s < EQUIPMENT_SLOT_END; ++s)
+        {
+            std::set<InventoryType> const& slots = viableSlots[(EquipmentSlots)s];
+            if (slots.find((InventoryType)proto->InventoryType) != slots.end())
+                slotItemIds[s].push_back(cacheInfo->itemId);
+        }
     }
 
     CharacterDatabase.CommitTransaction();
@@ -1431,7 +1499,7 @@ uint32 RandomItemMgr::CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPro
     bool isHealingItem = false;
     bool isSpellDamageItem = false;
     bool hasInt = false;
-    bool noCaster = (Classes)playerclass == CLASS_WARRIOR || (Classes)playerclass == CLASS_ROGUE || (Classes)playerclass == CLASS_HUNTER || spec == 30 || spec == 32 || spec == 21 || spec == 6;
+    bool noCaster = (Classes)playerclass == CLASS_WARRIOR || (Classes)playerclass == CLASS_ROGUE || (Classes)playerclass == CLASS_HUNTER || ai::SpecScoresAsNonCaster(spec);
     bool hasMana = !((Classes)playerclass == CLASS_WARRIOR || (Classes)playerclass == CLASS_ROGUE);
 
     if ((Classes)playerclass == CLASS_HUNTER && proto->SubClass == ITEM_SUBCLASS_WEAPON_THROWN)
@@ -1460,10 +1528,9 @@ uint32 RandomItemMgr::CalculateStatWeight(uint8 playerclass, uint8 spec, ItemPro
         return proto->Quality + proto->ItemLevel;
     }
 
-    bool isWhitelist = false;
-    // whitelist
-    if (std::find(sPlayerbotAIConfig.randomGearWhitelist.begin(), sPlayerbotAIConfig.randomGearWhitelist.end(), proto->ItemId) != sPlayerbotAIConfig.randomGearWhitelist.end())
-        isWhitelist = true;
+    bool isWhitelist = TortoiseBots::GearWhitelistApplies(sPlayerbotAIConfig.randomGearBlacklist,
+        std::find(sPlayerbotAIConfig.randomGearWhitelist.begin(), sPlayerbotAIConfig.randomGearWhitelist.end(), proto->ItemId) != sPlayerbotAIConfig.randomGearWhitelist.end(),
+        proto->ItemId);
 
     // whitelist pvp items, as thei have wierd stats
     if (proto->RequiredHonorRank)
@@ -2587,9 +2654,24 @@ void RandomItemMgr::BuildSourceTierIndex()
             } while (recipes->NextRow());
         }
     }
+    // PvP set index (issue #490 R4): one walk over the prototype rows
+    // (O(rows)). Any set holding a NO_DISENCHANT or honor-rank sibling marks
+    // the whole set: the Turtle custom ladders only flag their entry pieces
+    // (e.g. 713 Combatant's: 3 of 6 flagged; 715 Veteran's: boots only), so
+    // the unflagged siblings would otherwise pass as base gear. Only sets
+    // with a flagged member enter; plain dungeon/tier sets never do.
+    pvpItemSets.clear();
+    for (uint32 itemId = 0; itemId < sItemStorage.GetMaxEntry(); ++itemId)
+    {
+        ItemPrototype const* setProto = sObjectMgr.GetItemPrototype(itemId);
+        if (!setProto || !setProto->ItemSet)
+            continue;
+        if ((setProto->Flags & ITEM_FLAG_NO_DISENCHANT) || setProto->RequiredHonorRank)
+            pvpItemSets.insert(setProto->ItemSet);
+    }
 
-    sLog.outDetail("RandomItemMgr: source-tier index holds %zu creature spawns, %zu gameobject spawns, %zu loot items (%zu direct base), %zu recipe tiers (%zu rep-gated)",
-        creatureSpawnTier.size(), gameObjectSpawnTier.size(), itemLootTier.size(), itemDirectBaseLoot.size(), recipeTier.size(), repRecipeItems.size());
+    sLog.outDetail("RandomItemMgr: source-tier index holds %zu creature spawns, %zu gameobject spawns, %zu loot items (%zu direct base), %zu recipe tiers (%zu rep-gated), %zu pvp sets",
+        creatureSpawnTier.size(), gameObjectSpawnTier.size(), itemLootTier.size(), itemDirectBaseLoot.size(), recipeTier.size(), repRecipeItems.size(), pvpItemSets.size());
 }
 
 
@@ -2605,7 +2687,64 @@ ItemSourceTier RandomItemMgr::RecipeLootTier(uint32 recipeItemId)
 }
 
 
-bool RandomItemMgr::IsRaidQuest(Quest const* quest)
+// Raid-exclusive item: raid-sourced, with raid loot as its only source. A
+// shared drop (materials, or a raid item also sold, crafted or rewarded by a
+// non-raid quest) is not exclusive, so it never taints a quest chain.
+bool RandomItemMgr::IsRaidExclusiveItem(uint32 itemId)
+{
+    if (!itemId || !IsRaidSourcedItem(itemId))
+        return false;
+    auto memo = raidExclusiveMemo.find(itemId);
+    if (memo != raidExclusiveMemo.end())
+        return memo->second;
+    // Cycle guard: a reward quest's own start item re-enters this function.
+    raidExclusiveMemo[itemId] = false;
+    if (!sourceTierIndexed)
+        BuildSourceTierIndex();
+    bool exclusive = true;
+    auto loot = itemLootTier.find(itemId);
+    if (loot == itemLootTier.end() || loot->second != ITEM_SOURCE_TIER_RAID)
+        exclusive = false;
+    else if (recipeTier.find(itemId) != recipeTier.end())
+        exclusive = false;
+    else if (!GAI_VALUE2(std::list<int32>, "item vendor list", itemId).empty())
+        exclusive = false;
+    else
+    {
+        for (uint32 questId : GetQuestIdsForItem(itemId))
+        {
+            if (!IsDirectRaidQuest(sObjectMgr.GetQuestTemplate(questId)))
+            {
+                exclusive = false;
+                break;
+            }
+        }
+    }
+    raidExclusiveMemo[itemId] = exclusive;
+    return exclusive;
+}
+
+// Map a quest's explicit zone to its map: ZoneOrSort > 0 is an area id whose
+// map is the quest's map; negative ZoneOrSort is a QuestSort.dbc sort id, not a map.
+static MapEntry const* CompletionMap(Quest const* quest)
+{
+    int32 zoneOrSort = quest->GetZoneOrSort();
+    if (zoneOrSort <= 0)
+        return nullptr;
+    AreaEntry const* area = AreaEntry::GetById((uint32)zoneOrSort);
+    if (!area)
+        return nullptr;
+    return sMapStorage.LookupEntry<MapEntry>(area->MapId);
+}
+
+// Raid map completion (see CompletionMap).
+static bool CompletesOnRaidMap(Quest const* quest)
+{
+    MapEntry const* mapEntry = CompletionMap(quest);
+    return mapEntry && mapEntry->IsRaid();
+}
+
+bool RandomItemMgr::IsDirectRaidQuest(Quest const* quest)
 {
     if (!quest)
         return false;
@@ -2615,22 +2754,52 @@ bool RandomItemMgr::IsRaidQuest(Quest const* quest)
     // Raid-scale group content.
     if (quest->GetSuggestedPlayers() > 5)
         return true;
-    // Raid map completion: ZoneOrSort > 0 is an area id whose map is the
-    // raid; negative ZoneOrSort is a QuestSort.dbc sort id, not a map.
-    int32 zoneOrSort = quest->GetZoneOrSort();
-    if (zoneOrSort > 0)
+    // Raid map completion (see CompletesOnRaidMap).
+    if (CompletesOnRaidMap(quest))
+        return true;
+    // Quest started by a raid-exclusive item (item_template.start_quest).
+    if (IsRaidExclusiveItem(quest->GetSrcItemId()))
+        return true;
+    return false;
+}
+
+// Chain source: a quest whose raid status spreads to the quests after it.
+// Raid-scale quests are raid but never taint their successors; raid-type quests
+// taint only when filed under a quest sort.
+bool RandomItemMgr::IsRaidChainSource(Quest const* quest)
+{
+    if (!quest)
+        return false;
+    return TortoiseBots::TaintsChain(CompletesOnRaidMap(quest), IsRaidExclusiveItem(quest->GetSrcItemId()),
+        quest->GetType() == QUEST_TYPE_RAID, quest->GetZoneOrSort());
+}
+
+// Quest-chain raid rule: a quest is raid when it is a direct raid quest, or
+// when an earlier quest in its chain is a chain source. Chain links are indexed once.
+bool RandomItemMgr::IsRaidQuest(Quest const* quest)
+{
+    if (!quest)
+        return false;
+    return TortoiseBots::ReachesRaidQuest(quest->GetQuestId(),
+        [this](uint32 questId) { return IsDirectRaidQuest(sObjectMgr.GetQuestTemplate(questId)); },
+        [this](uint32 questId) { return IsRaidChainSource(sObjectMgr.GetQuestTemplate(questId)); },
+        GetQuestPredecessors());
+}
+
+TortoiseBots::QuestPredecessors const& RandomItemMgr::GetQuestPredecessors()
+{
+    // Quest templates never change after load, so the chain links are indexed once.
+    if (!questPredecessorsIndexed)
     {
-        AreaEntry const* area = AreaEntry::GetById((uint32)zoneOrSort);
-        if (area)
+        questPredecessorsIndexed = true;
+        for (auto const& entry : sObjectMgr.GetQuestTemplates())
         {
-            if (MapEntry const* mapEntry = sMapStorage.LookupEntry<MapEntry>(area->MapId))
-            {
-                if (mapEntry->IsRaid())
-                    return true;
-            }
+            Quest const* quest = entry.second.get();
+            TortoiseBots::RecordQuestChainLinks(questPredecessorsMemo, quest->GetQuestId(),
+                quest->GetPrevQuestId(), quest->GetNextQuestId(), quest->GetNextQuestInChain());
         }
     }
-    return false;
+    return questPredecessorsMemo;
 }
 
 bool RandomItemMgr::IsRaidQuestItem(uint32 itemId)
@@ -2738,6 +2907,13 @@ void RandomItemMgr::ClassifySourceTier(ItemPrototype const* proto, ItemInfoEntry
     // PVP flag: NO_DISENCHANT reward blues or honor rank gear.
     if ((proto->Flags & ITEM_FLAG_NO_DISENCHANT) || proto->RequiredHonorRank)
         cacheInfo->sourceFlags |= ITEM_SOURCE_FLAG_PVP;
+    // PVP flag via set sibling (issue #490 R4): the Turtle custom PvP ladders
+    // (Combatant's/Partisan's/Veteran's/...) only carry NO_DISENCHANT or an
+    // honor rank on their entry pieces, so the unflagged siblings share the
+    // set with a flagged one. `proto->ItemSet` is the DBC set id (0 = none);
+    // the index above holds every set with a flagged sibling. O(1) lookup.
+    if (proto->ItemSet && pvpItemSets.count(proto->ItemSet))
+        cacheInfo->sourceFlags |= ITEM_SOURCE_FLAG_PVP;
 
     // Rare world epic marker (§6): BoE epic, no set, weapon/armor, attested
     // by a direct world-map (0/1) creature-loot row.
@@ -2806,7 +2982,18 @@ std::string RandomItemMgr::GetPlayerSpecName(Player* player)
         if (tab == 2)
             specName = "resto";
         else if (tab == 1)
-            specName = "enhance";
+        {
+            // A shaman bot is a tank iff PlayerbotAI::IsTank says so (forced
+            // role TANK or the tank strategy; the tank build still lives on
+            // tab 1, so the tab alone cannot tell it apart from Enhancement
+            // DPS). Tank bots score gear with the `shamantank` scale; when the
+            // scale row is absent (DB not migrated) the id lookup below
+            // returns 0 and every caller falls back as before.
+            if (PlayerbotAI::IsTank(player))
+                specName = "shamantank";
+            else
+                specName = "enhance";
+        }
         else
             specName = "elem";
         break;
@@ -2908,6 +3095,14 @@ std::string RandomItemMgr::GetSpecName(uint32 specId)
     return itr->second.info.name;
 }
 
+uint32 RandomItemMgr::GetSpecIdFor(uint8 playerclass, std::string const& specName)
+{
+    for (auto const& itr : m_weightScales)
+        if (itr.second.info.id && itr.second.info.classId == playerclass && itr.second.info.name == specName)
+            return itr.second.info.id;
+    return 0;
+}
+
 uint32 RandomItemMgr::GetUpgrade(Player* player, std::string spec, uint8 slot, uint32 quality, uint32 itemId)
 {
     if (!player)
@@ -2958,8 +3153,7 @@ uint32 RandomItemMgr::GetUpgrade(Player* player, std::string spec, uint8 slot, u
         if (info->weights[specId] == 0)
             continue;
 
-        // owner-configured exclusion list: never suggest these items
-        if (std::find(sPlayerbotAIConfig.randomGearBlacklist.begin(), sPlayerbotAIConfig.randomGearBlacklist.end(), info->itemId) != sPlayerbotAIConfig.randomGearBlacklist.end())
+        if (TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, info->itemId))
             continue;
 
         // skip higher lvl
@@ -3081,8 +3275,7 @@ std::vector<uint32> RandomItemMgr::GetUpgradeList(Player* player, uint32 specId,
         if (info->weights[specId] == 0)
             continue;
 
-        // owner-configured exclusion list: never suggest these items
-        if (std::find(sPlayerbotAIConfig.randomGearBlacklist.begin(), sPlayerbotAIConfig.randomGearBlacklist.end(), info->itemId) != sPlayerbotAIConfig.randomGearBlacklist.end())
+        if (TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, info->itemId))
             continue;
 
         // skip higher lvl
@@ -3533,6 +3726,11 @@ void RandomItemMgr::BuildEquipCache()
             uint32 quality = fields[4].GetUInt32();
             uint32 itemId = fields[5].GetUInt32();
 
+            // Persisted rows predate the duplicate-copy rule; a copy cached
+            // before the fix must not re-enter the pools on load.
+            if (IsTransmogClone(itemId))
+                continue;
+
             BotEquipKey key(level, clazz, spec, slot, quality);
             equipCache[key].push_back(itemId);
             count++;
@@ -3619,6 +3817,11 @@ void RandomItemMgr::BuildEquipCache()
         {
             ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
             if (!proto)
+                continue;
+
+            // Covers the shirt/tabard lists too: they skip the itemInfoCache
+            // lookup below, so the copy check sits on the walk itself.
+            if (IsTransmogClone(proto))
                 continue;
 
             // Reject everything no key could ever accept, cheapest test first.
@@ -3799,6 +4002,13 @@ RandomItemList RandomItemMgr::Query(uint32 level, uint8 clazz, uint8 spec, uint8
     return equipCache[key];
 }
 
+RandomItemList const& RandomItemMgr::GetSlotItemIds(uint32 slot)
+{
+    static RandomItemList const none;
+    auto found = slotItemIds.find(slot);
+    return found == slotItemIds.end() ? none : found->second;
+}
+
 void RandomItemMgr::BuildAmmoCache()
 {
     uint32 maxLevel = sPlayerbotAIConfig.randomBotMaxLevel;
@@ -3806,36 +4016,55 @@ void RandomItemMgr::BuildAmmoCache()
         maxLevel = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
 
     sLog.outBasic("Building ammo cache for %d levels", maxLevel);
-	int counter1 = 0;
+    // Every white row of the class and subclass a bot of `level` can use; the
+    // pick (deprecated rows out, best damage per second, then required level,
+    // then lowest entry) is ai::PickAmmo, so it never depends on row order.
+    auto pickAmmo = [](uint32 itemClass, uint32 subClass, uint32 level) -> uint32
+    {
+        auto rows = WorldDatabase.PQuery(
+            "select entry, required_level, flags, name, dmg_min1, dmg_max1, delay from item_template"
+            " where class = '%u' and subclass = '%u' and required_level <= '%u' and quality = '%u'",
+            itemClass, subClass, level, ITEM_QUALITY_NORMAL);
+        if (!rows)
+            return 0;
+
+        std::vector<ai::AmmoCandidate> candidates;
+        do
+        {
+            Field* fields = rows->Fetch();
+            ai::AmmoCandidate candidate;
+            candidate.entry = fields[0].GetUInt32();
+            candidate.requiredLevel = fields[1].GetUInt32();
+            candidate.flags = fields[2].GetUInt32();
+            candidate.name = fields[3].GetString();
+            candidate.dmgMin = fields[4].GetFloat();
+            candidate.dmgMax = fields[5].GetFloat();
+            candidate.delayMs = fields[6].GetUInt32();
+            candidates.push_back(candidate);
+        } while (rows->NextRow());
+
+        // Reads plain item_template rows: runtime clones are never rows
+        // there, but the materialised duplicate-copy rows are.
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                              [](ai::AmmoCandidate const& c) { return sRandomItemMgr.IsTransmogClone(c.entry); }),
+            candidates.end());
+        return ai::PickAmmo(candidates, level);
+    };
+
+    int counter1 = 0;
     for (uint32 level = 1; level <= maxLevel+1; level+=10)
     {
         for (uint32 subClass = ITEM_SUBCLASS_ARROW; subClass <= ITEM_SUBCLASS_BULLET; subClass++)
         {
-            auto results = WorldDatabase.PQuery(
-                    "select entry, required_level from item_template where class = '%u' and subclass = '%u' and required_level <= '%u' and quality = '%u' order by required_level desc",
-                    ITEM_CLASS_PROJECTILE, subClass, level, ITEM_QUALITY_NORMAL);
-            if (!results)
-                return;
-
-            Field* fields = results->Fetch();
-            if (fields)
+            if (uint32 entry = pickAmmo(ITEM_CLASS_PROJECTILE, subClass, level))
             {
-                uint32 entry = fields[0].GetUInt32();
                 ammoCache[level / 10][subClass] = entry;
-				counter1++;
+                counter1++;
             }
         }
 
-        auto results = WorldDatabase.PQuery(
-            "select entry, required_level from item_template where class = '%u' and subclass = '%u' and required_level <= '%u' and quality = '%u' order by required_level desc",
-            ITEM_CLASS_WEAPON, ITEM_SUBCLASS_WEAPON_THROWN, level, ITEM_QUALITY_NORMAL);
-        if (!results)
-            return;
-
-        Field* fields = results->Fetch();
-        if (fields)
+        if (uint32 entry = pickAmmo(ITEM_CLASS_WEAPON, ITEM_SUBCLASS_WEAPON_THROWN, level))
         {
-            uint32 entry = fields[0].GetUInt32();
             ammoCache[level / 10][ITEM_SUBCLASS_WEAPON_THROWN] = entry;
             counter1++;
         }
@@ -3913,8 +4142,14 @@ void RandomItemMgr::BuildPotionCache()
                 if (!proto)
                     continue;
 
+                if (IsTransmogClone(proto))
+                    continue;
+
+                // Turtle 1.18.1 combat potions live under subclass 0
+                // (ITEM_SUBCLASS_CONSUMABLE); see FindPotionVisitor. The
+                // spell-effect loop below still restricts to heal/energize.
                 if (proto->Class != ITEM_CLASS_CONSUMABLE ||
-                    (proto->SubClass != ITEM_SUBCLASS_POTION && proto->SubClass != ITEM_SUBCLASS_FLASK) ||
+                    (proto->SubClass != ITEM_SUBCLASS_CONSUMABLE && proto->SubClass != ITEM_SUBCLASS_POTION && proto->SubClass != ITEM_SUBCLASS_FLASK) ||
                     proto->Bonding != NO_BIND)
                     continue;
 
@@ -3982,6 +4217,9 @@ void RandomItemMgr::BuildFoodCache()
             {
                 ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
                 if (!proto)
+                    continue;
+
+                if (IsTransmogClone(proto))
                     continue;
 
                 if (proto->Class != ITEM_CLASS_CONSUMABLE ||
@@ -4096,6 +4334,9 @@ void RandomItemMgr::BuildTradeCache()
         {
             ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
             if (!proto)
+                continue;
+
+            if (IsTransmogClone(proto))
                 continue;
 
             if (proto->Class != ITEM_CLASS_TRADE_GOODS || proto->Bonding != NO_BIND)
@@ -4355,6 +4596,14 @@ uint32 RandomItemMgr::CalculateBestBotEnchantId(Player* bot, uint32 specId, Item
         // Slot/item-type mask fit: mirrors EnchantItemT's own check so
         // mismatches are skipped silently instead of spamming error logs
         // (e.g. Fiery Weapon onto a shield, scope onto a thrown weapon).
+        // The item class must match first: a shield is armor subclass 6,
+        // which is the polearm bit in a weapon enchant's subclass mask.
+        // 13419 (Enchant Cloak - Minor Agility) has a weapon class in the
+        // spell data; the core's Item::IsFitToSpellRequirements exempts it.
+        bool const minorAgilityCloak = candidate.spellId == 13419 && proto->InventoryType == INVTYPE_CLOAK;
+        if (!minorAgilityCloak && spellInfo->EquippedItemClass >= 0 &&
+            int32(proto->Class) != spellInfo->EquippedItemClass)
+            continue;
         if (!((1 << proto->SubClass) & spellInfo->EquippedItemSubClassMask) &&
             !((1 << proto->InventoryType) & spellInfo->EquippedItemInventoryTypeMask))
             continue;

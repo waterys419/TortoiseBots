@@ -4,7 +4,7 @@ import "time"
 
 // ProtocolVersion is bumped whenever the C++ -> Go datagram layout changes in
 // a way the daemon must understand. It is carried in every datagram.
-const ProtocolVersion = 8
+const ProtocolVersion = 12
 
 // Anomaly types accepted from the game server. Anything else is rejected so
 // that Prometheus label cardinality stays bounded. STUCK is counter-only
@@ -18,11 +18,24 @@ var AcceptedAnomalyTypes = map[string]bool{
 	"BOT_DEATH":          true,
 }
 
-// BotSnapshot represents an active bot's live state in the world.
+// BotSnapshot represents one live row of the world roster: an active bot
+// or (Player == true) a real online player. Players carry the same
+// list/map/detail fields that make sense for them (name, level, class, zone,
+// position, group) and leave bot-only detail empty; GroupID is the core
+// group id (0 = ungrouped).
 type BotSnapshot struct {
 	Name     string  `json:"name"`
 	GUID     uint32  `json:"guid"`
+	Player   bool    `json:"player,omitempty"`
+	// Alt marks an autonomous owned alt-bot (Issue #872). Additive since
+	// protocol v10; an older module omits it and it reads false.
+	Alt      bool    `json:"alt,omitempty"`
+	// Kind is the dashboard kind label (Issue #872): pool, hired, claimed,
+	// alt, companion or player. Additive since protocol v11; an older module
+	// omits it and readers fall back to player/alt/pool from the flags.
+	Kind     string  `json:"kind,omitempty"`
 	Class    string  `json:"class"`
+	GroupID  uint32  `json:"group,omitempty"`
 	Role     string  `json:"role"`
 	Level    uint32  `json:"level"`
 	XP       uint32  `json:"xp,omitempty"`      // PLAYER_XP: progress into the current level
@@ -32,8 +45,19 @@ type BotSnapshot struct {
 	Power     uint32 `json:"power"`
 	MaxPower  uint32 `json:"max_power"`
 	PowerType string `json:"power_type,omitempty"` // mana, rage, energy, focus, happiness
+	// Guild is the guild name the unit carries (additive: an older module
+	// omits it and it reads empty). Empty = guildless.
+	Guild    string  `json:"guild,omitempty"`
 	MapID     uint32 `json:"map"`
 	ZoneID   uint32  `json:"zone"`
+	// Instance is the instance copy the unit is in (v12, issue #895): 0 in
+	// the open world, non-zero inside a dungeon, raid or battleground copy.
+	// A pointer so a pre-v12 module (field absent, nil) and a new one
+	// reporting the open world (present, 0) stay distinguishable: the old
+	// module's dungeon units fall back to one run per map. SubGroup is the
+	// unit's raid subgroup (0 outside a raid or group).
+	Instance *uint32 `json:"instance,omitempty"`
+	SubGroup uint32  `json:"subgroup,omitempty"`
 	X        float64 `json:"x"`
 	Y        float64 `json:"y"`
 	Z        float64 `json:"z"`
@@ -42,12 +66,31 @@ type BotSnapshot struct {
 	TargetLevel uint32 `json:"target_level,omitempty"` // selected-unit target level (0 = none/self)
 	Strategy    string `json:"strategy"`
 	State       string `json:"state"` // "combat", "moving", "busy", "stalled", "resting", "dead", "idle"
+	Killer      string `json:"killer,omitempty"`
+	KillerLevel uint32 `json:"killer_level,omitempty"`
 	LastAction  string `json:"last_action,omitempty"`
 	LastTrigger string `json:"last_trigger,omitempty"`
 	// TravelPurpose/TravelTo describe the active travel destination ("grind",
 	// "vendor", ... + title); empty when the bot is not travelling.
 	TravelPurpose string `json:"travel_purpose,omitempty"`
 	TravelTo      string `json:"travel_to,omitempty"`
+	// TravelStatus is the travel target state ("travel", "work",
+	// "cooldown", ...); TravelDist the yards left (-1 when idle).
+	TravelStatus string `json:"travel_status,omitempty"`
+	TravelDist   int32  `json:"travel_dist,omitempty"`
+	// AiVisits counts AI updates since login; AiAgeMs is ms since the last.
+	AiVisits uint32 `json:"ai_visits,omitempty"`
+	AiAgeMs  uint32 `json:"ai_age_ms,omitempty"`
+	// Pvp is "bg" inside a battleground, "queue" when queued, else empty.
+	Pvp string `json:"pvp,omitempty"`
+	// PvpBg names the battleground (or the queued ones, comma separated).
+	PvpBg string `json:"pvp_bg,omitempty"`
+	// WorldPvpSeeker marks a bot holding the open-world PvP seek role.
+	WorldPvpSeeker bool `json:"world_pvp_seeker,omitempty"`
+	// WorldPvpFighting names the enemy the bot is fighting right now in the
+	// open world (empty when none): the target of its last engage event,
+	// cleared on kill/death or after a minute without a new event.
+	WorldPvpFighting string `json:"world_pvp_fighting,omitempty"`
 
 	// XpPerHour is daemon-derived from successive XP samples (level-up
 	// aware), not on the wire. XpGainAgeSec is seconds since the last
@@ -73,6 +116,27 @@ type BotSnapshot struct {
 	// the character DB every few minutes (never per tick). Nil until the first
 	// gear sweep completes.
 	Gear *BotGear `json:"gear,omitempty"`
+}
+// Kind constants for BotSnapshot.Kind (Issue #872).
+const (
+	KindPool      = "pool"
+	KindHired     = "hired"
+	KindClaimed   = "claimed"
+	KindAlt       = "alt"
+	KindCompanion = "companion"
+	KindPlayer    = "player"
+)
+
+// KindFromFlags reads the kind off the pre-v11 player/alt flags: player,
+// then alt, else pool (hired/claimed/companion need the v11 kind field).
+func KindFromFlags(player, alt bool) string {
+	if player {
+		return KindPlayer
+	}
+	if alt {
+		return KindAlt
+	}
+	return KindPool
 }
 
 // BotGear is one bot's equipped-gear summary: the average item level of the
@@ -114,6 +178,9 @@ type BotEvent struct {
 	Buy     uint32 `json:"buy,omitempty"`
 	// Money is the bot's copper at event time (0 = unknown).
 	Money uint64 `json:"money,omitempty"`
+	// TargetLevel is the other side's level for world PvP events
+	// (0 = unknown, e.g. from an older module build).
+	TargetLevel uint32 `json:"target_level,omitempty"`
 }
 
 // BotEventsPayload delivers the activity events emitted during one snapshot
@@ -148,6 +215,9 @@ type BotActivity struct {
 	MoneySpent      uint64   `json:"money_spent"`
 	Kills           int      `json:"kills"`
 	Deaths          int      `json:"deaths"`
+	PvpEngagements  int      `json:"pvp_engagements"`
+	PvpKills        int      `json:"pvp_kills"`
+	PvpDeaths       int      `json:"pvp_deaths"`
 	GhostSeconds    float64  `json:"ghost_seconds"`
 	TrainerVisits   int      `json:"trainer_visits"`
 	SpellsLearned   int      `json:"spells_learned"`
@@ -209,6 +279,25 @@ type QuestFeedItem struct {
 	Event   string `json:"event"`
 	Quest   string `json:"quest"`
 	QuestID uint32 `json:"quest_id"`
+}
+
+// PvpFeedItem is one row of the pool-wide world PvP feed: who fought whom,
+// when and where. Event is engage, kill or death (from the bot's view);
+// TargetKind is "bot" or "player" for engages (empty on rows from older
+// module builds, which carry only the name and level).
+type PvpFeedItem struct {
+	At          int64  `json:"at"`
+	TimeStr     string `json:"time_str,omitempty"`
+	Bot         string `json:"bot"`
+	GUID        uint32 `json:"guid"`
+	Class       string `json:"class"`
+	Level       uint32 `json:"level"`
+	MapID       uint32 `json:"map"`
+	ZoneID      uint32 `json:"zone"`
+	Event       string `json:"event"`
+	Target      string `json:"target"`
+	TargetKind  string `json:"target_kind,omitempty"`
+	TargetLevel uint32 `json:"target_level,omitempty"`
 }
 
 // ActivityLevelItem is one level-up observed across the pool, used for the
@@ -291,6 +380,10 @@ type HeartbeatPayload struct {
 	Type        string           `json:"type"`
 	Uptime      uint32           `json:"uptime"`
 	TickDiffMs  float64          `json:"diff"`
+	TickAvgMs   float64          `json:"diff_avg,omitempty"`
+	TickWorstMs float64          `json:"diff_worst,omitempty"`
+	LagP50Ms    float64          `json:"lag_p50,omitempty"`
+	LagP95Ms    float64          `json:"lag_p95,omitempty"`
 	WindowSecs  uint32           `json:"window_secs,omitempty"`
 	HumansCount uint32           `json:"humans"`
 	BotsCount   uint32           `json:"bots"`
@@ -346,6 +439,7 @@ type GrindingSummary struct {
 	TotalXpHour   float64        `json:"total_xp_hour"`
 	DeathsPerMin  float64        `json:"deaths_per_min"`
 	PctDied5Min   float64        `json:"pct_died_5min"`
+	WorldPvpSeekers int          `json:"world_pvp_seekers"`
 	// StateCounts is the single authoritative per-state census (roster
 	// states, not the 3-min rolling ratios): combat/moving/busy/stalled/
 	// resting/dead/idle counts. The dashboard Activity block renders counts
@@ -375,6 +469,10 @@ type ServerStatus struct {
 	Seq                 uint64      `json:"seq"`
 	Uptime              uint32      `json:"uptime"`
 	TickDiffMs          float64     `json:"diff"`
+	TickAvgMs           float64     `json:"diff_avg,omitempty"`
+	TickWorstMs         float64     `json:"diff_worst,omitempty"`
+	LagP50Ms            float64     `json:"lag_p50,omitempty"`
+	LagP95Ms            float64     `json:"lag_p95,omitempty"`
 	WindowSecs          uint32      `json:"window_secs,omitempty"`
 	Humans              uint32      `json:"humans"`
 	Bots                uint32      `json:"bots"`
@@ -447,6 +545,28 @@ type AnomalyPayload struct {
 	ReceivedAt time.Time `json:"-"`
 }
 
+// HistorySample is one daemon-side chart observation: the values the
+// dashboard's 10-minute timelines draw, sampled once per heartbeat
+// (~2 s) so a page refresh can seed its charts instead of starting
+// empty. At is a unix-millis timestamp (the browser's own Date.now
+// scale); Issues reuse the IssueSnapshot per-type active counts.
+type HistorySample struct {
+	At       int64          `json:"at"`
+	Bots     uint32         `json:"bots"`
+	Humans   uint32         `json:"humans"`
+	LagP50Ms float64        `json:"lag_p50"`
+	LagP95Ms float64        `json:"lag_p95"`
+	Issues   map[string]int `json:"issues"`
+}
+
+// HistoryResponse is the payload of GET /api/v1/history: the rolling
+// in-memory chart history, oldest first. Daemon restarts clear it;
+// game-server restarts clip it to the current session (see Since).
+type HistoryResponse struct {
+	Samples []HistorySample `json:"samples"`
+	Since   int64           `json:"since"`
+}
+
 // AnomalyTotals is the cumulative per-session anomaly count behind
 // GET /api/v1/anomalies/totals. The incident feed (/api/v1/anomalies) is a
 // rolling 1000-row window, so whole-run counts (e.g. ACTION_LOOP rows for
@@ -472,4 +592,276 @@ type ZoneBoundingBox struct {
 	LocRight  float64 `json:"loc_right"`  // y2
 	LocTop    float64 `json:"loc_top"`    // x1
 	LocBottom float64 `json:"loc_bottom"` // x2
+}
+
+// CommandersPayload is the COMMANDERS datagram: the standing remote-commander
+// bindings (a commander that leads a bot-only party from anywhere) with the
+// bound bots and the commander's last orders. Sent every snapshot cycle while
+// a binding stands, and once with an empty list when the last one ends. It
+// describes what the module knows, for any client of the commander protocol.
+type CommandersPayload struct {
+	V          int                `json:"v"`
+	Session    uint64             `json:"session"`
+	Seq        uint64             `json:"seq"`
+	TS         int64              `json:"ts"`
+	Type       string             `json:"type"`
+	Commanders []CommanderBinding `json:"commanders"`
+}
+
+// CommanderBinding is one commander's standing binding.
+type CommanderBinding struct {
+	Commander     string           `json:"commander"`
+	CommanderGUID uint32           `json:"commander_guid,omitempty"` // the commander character's guid (low part; absent from an older module): opens its detail view
+	Online        bool             `json:"online"`                   // the commander has a network session
+	View          bool             `json:"view"`                     // its TBM:VIEW perception feed is on
+	Group         uint32           `json:"group"`
+	Lead          string           `json:"lead"`
+	Bots          []CommanderBot   `json:"bots"`
+	Orders        []CommanderOrder `json:"orders"` // oldest first
+
+	// Map data, from a module that reports it (all absent from an older one; the dashboard then greys the layers out).
+	CommanderPos *CommanderPos  `json:"commander_pos,omitempty"` // where the commander stands, when online and in the world
+	MobsMap      uint32         `json:"mobs_map,omitempty"`      // the map the mobs are on (the lead's)
+	Mobs         []CommanderMob `json:"mobs"`                    // hostile units near the lead; null = not reported, [] = reported, none near
+	BoundAt      int64          `json:"bound_at,omitempty"`      // unix seconds the binding was first seen standing (the run timer starts here); absent from an older module
+	Run          *CommanderRun  `json:"run,omitempty"`           // the run leader's run of this binding ("observe" mode); absent when it has none or from an older module
+
+	// Doors, chests, altars and gongs the bots have seen near them (on the map of MobsMap), capped; null = not reported, [] = reported, none seen.
+	Objects []CommanderObject `json:"objects"`
+}
+
+// CommanderObject is a game object a bot of the binding has seen near it. IDs are decimal strings, as the mobs' are.
+type CommanderObject struct {
+	ID    string  `json:"id"`
+	Entry uint32  `json:"entry"`
+	Name  string  `json:"name"`
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
+	Type  string  `json:"type"`  // d door, c chest, b button or lever, g goober (gong, altar, switch), r ritual, o other
+	State string  `json:"state"` // r ready (closed, untouched), a active (open, pressed), u used (looted or spent)
+}
+
+// CommanderRunStep is one step of the run's plan in the current section: where it is and what it is for.
+type CommanderRunStep struct {
+	Index   uint32  `json:"i"` // 1-based position in the plan (the run's "step" counts the same way)
+	Kind    string  `json:"k"` // move, move_direct, pull, boss, loot, open, use_item, wait_object, wait_clear, rest, ritual
+	X       float64 `json:"x"`
+	Y       float64 `json:"y"`
+	Radius  float64 `json:"r,omitempty"`  // pull, boss, wait_clear: the area the step cares about
+	Entry   uint32  `json:"e,omitempty"`  // the creature or object the step is about
+	Name    string  `json:"n,omitempty"`  // its name when the module knows it
+	Skipped bool    `json:"sk,omitempty"` // left out with `.bot run skip`
+}
+
+// CommanderRun is where the run leader (`.bot run`) stands in a dungeon plan for one binding.
+type CommanderRun struct {
+	Plan    string `json:"plan"`
+	State   string `json:"state"`   // running, paused or done
+	Step    uint32 `json:"step"`    // 1-based step shown (0 before the first)
+	Steps   uint32 `json:"steps"`   // steps in the plan
+	Leg     string `json:"leg"`     // the current leg's name: the section
+	Kind    string `json:"kind"`    // move, pull, boss, loot, open ...
+	Phase   string `json:"phase"`   // what the step is doing
+	Note    string `json:"note"`    // what it does now, or why it paused
+	Changed int64  `json:"changed"` // unix seconds the step, phase, state or note last changed
+
+	// The plan's steps of the current section (the next ~20), from a module that reports them; absent otherwise.
+	PlanSteps []CommanderRunStep `json:"plan_steps,omitempty"`
+}
+
+// CommanderPos is the commander character's own position.
+type CommanderPos struct {
+	MapID uint32  `json:"map"`
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
+}
+
+// CommanderMob is a unit near the lead of a binding. IDs are decimal strings: a creature guid is 64 bits, more than a JSON
+// number holds in a browser.
+type CommanderMob struct {
+	ID       string  `json:"id"`
+	Entry    uint32  `json:"entry"`
+	Name     string  `json:"name"`
+	HP       uint32  `json:"hp"` // percent
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+	Victim   string  `json:"victim,omitempty"`   // guid of the unit it targets; matches a bot's id
+	Reaction string  `json:"reaction"`           // h hostile, n neutral, f friendly (to the bound bots)
+	Kind     string  `json:"kind,omitempty"`     // k critter, v civilian, g guard, u unattackable; empty: an ordinary unit
+	Level    uint32  `json:"lvl,omitempty"`      // absent: unknown
+	Rank     string  `json:"rank,omitempty"`     // b boss, e elite, r rare; empty: an ordinary unit
+	CC       string  `json:"cc,omitempty"`       // s stunned, c confused (polymorph, sleep), f fleeing, r rooted; empty: free
+	Cast     string  `json:"cast,omitempty"`     // the spell it is casting right now
+}
+
+// CommanderBot is a bot of a bound party.
+type CommanderBot struct {
+	Name      string  `json:"name"`
+	GUID      uint32  `json:"guid"`
+	Class     string  `json:"class"`
+	Role      string  `json:"role"`
+	Level     uint32  `json:"level"`
+	HP        uint32  `json:"hp"`
+	MaxHP     uint32  `json:"max_hp"`
+	Power     uint32  `json:"power"`
+	MaxPower  uint32  `json:"max_power"`
+	PowerType string  `json:"power_type"`
+	Alive     bool    `json:"alive"`
+	Lead      bool    `json:"lead"`
+	MapID     uint32  `json:"map"`
+	ZoneID    uint32  `json:"zone"`
+	X         float64 `json:"x"`
+	Y         float64 `json:"y"`
+	Z         float64 `json:"z"`
+	ID        string  `json:"id,omitempty"`     // the bot's guid as a decimal string (what a mob's victim and a bot's target name)
+	Target    string  `json:"target,omitempty"` // guid of its target, absent when it has none
+
+	// Activity, from a newer module (all absent from an older one).
+	State      string `json:"st,omitempty"`    // the AI's state: c combat, n non-combat, d dead, r reaction
+	Action     string `json:"act,omitempty"`   // the engine's newest action name
+	Result     string `json:"res,omitempty"`   // that action's verdict: O ok, F failed, I impossible, U useless, P prereq, V vetoed, - none
+	Cast       string `json:"cast,omitempty"`  // the spell it is casting right now
+	CastTarget string `json:"ctgt,omitempty"`  // guid (decimal string) of the unit that spell is aimed at: a healer's heal target, a caster's crowd-controlled mob
+	CC         string `json:"cc,omitempty"`    // s stunned, c confused, f fleeing, r rooted; empty: free
+	Rest       string `json:"rest,omitempty"`  // d drinking, e eating
+	Moving     bool   `json:"mv,omitempty"`
+	TargetName string `json:"tname,omitempty"` // name of its target
+}
+
+// CommanderOrder is one order of the commander and the module's answer.
+type CommanderOrder struct {
+	At     int64  `json:"at"` // unix seconds
+	Verb   string `json:"verb"`
+	Detail string `json:"detail"`
+	OK     bool   `json:"ok"`
+	Result string `json:"result"`
+}
+
+// CommandersView is what GET /api/v1/commanders and the "commanders" stream
+// event carry.
+type CommandersView struct {
+	Commanders []CommanderBinding `json:"commanders"`
+	// UpdatedAt is the unix time of the last COMMANDERS datagram (0: none yet).
+	UpdatedAt int64 `json:"updated_at"`
+	// AgeSec is how old that datagram is; Fresh is false past the stale limit,
+	// when Commanders is empty whatever the last datagram said.
+	AgeSec float64 `json:"age_sec"`
+	Fresh  bool    `json:"fresh"`
+}
+
+// DungeonMobsPayload is the DUNGEON_MOBS datagram (issue #1101): the mobs,
+// member ids and member targets of every live dungeon run, sent once per
+// snapshot cycle before the BOT_BATCH datagrams. It is additive: an older
+// dashboard drops the unknown type, and a run without one keeps working.
+type DungeonMobsPayload struct {
+	V       int              `json:"v"`
+	Session uint64           `json:"session"`
+	Seq     uint64           `json:"seq"`
+	TS      int64            `json:"ts"`
+	Type    string           `json:"type"`
+	Part    int              `json:"part"`  // 0-based part of this cycle; informational
+	Parts   int              `json:"parts"` // parts of this cycle; informational
+	Runs    []DungeonMobsRun `json:"runs"` // empty with the newest seq: every run ended
+}
+
+// DungeonMobsRun is one instance copy of DUNGEON_MOBS: the map and instance
+// id that join it to a DungeonRun, its members' ids and targets, and the mobs
+// their bots have seen.
+type DungeonMobsRun struct {
+	Map       uint32              `json:"map"`
+	Instance  uint32              `json:"instance"`
+	Raid      bool                `json:"raid"`
+	Members   []DungeonMobsMember `json:"members"`
+	MobsMap   uint32              `json:"mobs_map"`
+	MobsTotal int                 `json:"mobs_total"` // before the module's cap: "24 of 57 shown"
+	Mobs      *[]CommanderMob     `json:"mobs"`       // nil = not reported, &[] = reported, none near
+}
+
+// DungeonMobsMember is one unit of a run as DUNGEON_MOBS reports it: the low
+// guid joins it to the roster row, id/target are raw guids as decimal strings
+// (what a mob's victim and a bot's target name).
+type DungeonMobsMember struct {
+	GUID   uint32 `json:"guid"`
+	ID     string `json:"id"`
+	Target string `json:"target,omitempty"`
+}
+
+// DungeonMember is one unit (bot or real player) inside a dungeon run: the
+// fields the Dungeons tab shows (party list, map dots, state line).
+type DungeonMember struct {
+	Name   string `json:"name"`
+	GUID   uint32 `json:"guid"`
+	Player bool   `json:"player"` // a real online player, drawn apart from the bots
+	Kind   string `json:"kind"`
+	Class  string `json:"class"`
+	Role   string `json:"role"`
+	Level  uint32 `json:"level"`
+	HP     uint32 `json:"hp"`
+	MaxHP  uint32 `json:"max_hp"`
+	// Power is the unit's resource, the same fields the Bots tab's bar
+	// draws (issue #1112): current, max and type (mana, rage, energy,
+	// focus, happiness — the tab colours mana blue, rage red, energy
+	// yellow). A pre-power module reports none, so the pointers stay nil
+	// and the JSON omits them: the tab then draws no bar, and a resource
+	// that really is 0 (an empty rage bar) is still present with max > 0.
+	Power     *uint32 `json:"power,omitempty"`
+	MaxPower  *uint32 `json:"max_power,omitempty"`
+	PowerType string  `json:"power_type,omitempty"`
+	// Dead is reported from the snapshot (state "dead" or a 0-HP corpse).
+	Dead bool `json:"dead"`
+	// SubGroup is the raid subgroup the unit sits in (0 outside a raid).
+	SubGroup uint32 `json:"subgroup,omitempty"`
+	State    string `json:"state"`
+	// Position for the live map. All members of a run share MapID.
+	MapID uint32  `json:"map"`
+	Zone  uint32  `json:"zone"`
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
+	Z     float64 `json:"z"`
+	O     float64 `json:"o"`
+	// ID and Target come from DUNGEON_MOBS (issue #1101): the member's guid
+	// as a decimal string (what a mob's victim names) and its target's guid.
+	// Both absent from an older module.
+	ID     string `json:"id,omitempty"`
+	Target string `json:"target,omitempty"`
+}
+
+// DungeonRun is one live instance copy (map + instance id) of a dungeon or
+// raid map with at least one bot in it (issue #895).
+type DungeonRun struct {
+	// Key is the stable id of the copy: "<map id>:<instance id>" (a
+	// pre-v12 module reports no instance, so the map id alone: "<map>:0").
+	Key      string `json:"key"`
+	MapID    uint32 `json:"map"`
+	Instance uint32 `json:"instance"`
+	// FirstSeen is the unix second the daemon first saw this copy with a
+	// bot in it (this game-server session).
+	FirstSeen int64 `json:"first_seen"`
+	// SeenSec is how long the run has been seen (FirstSeen until now).
+	SeenSec float64 `json:"seen_sec"`
+	Bots    int     `json:"bots"`
+	Players int     `json:"players"`
+	Dead    int     `json:"dead"`
+	// Members carries bots and players; players first, then by subgroup
+	// (raids) and name.
+	Members []DungeonMember `json:"members"`
+	// Mobs, MobsMap and MobsTotal come from DUNGEON_MOBS (issue #1101).
+	// Mobs nil = not reported (an older module or no datagram yet); a
+	// non-nil empty list = reported and nothing near, so the map layers
+	// stay selectable. MobsMap is the map the mobs are on (always the run's
+	// map: every member of a copy shares it).
+	Mobs      *[]CommanderMob `json:"mobs,omitempty"`
+	MobsMap   *uint32         `json:"mobs_map,omitempty"`
+	MobsTotal int             `json:"mobs_total,omitempty"`
+}
+
+// DungeonsView is what GET /api/v1/dungeons carries.
+type DungeonsView struct {
+	Runs []DungeonRun `json:"runs"`
+	// GeneratedAt is the unix second the view was built at.
+	GeneratedAt int64 `json:"generated_at"`
+	// StaleModule is true when the game server runs a pre-v12 module that
+	// reports no instance id: copies of one dungeon then fall back to one
+	// run per map and cannot be told apart.
+	StaleModule bool `json:"stale_module,omitempty"`
 }

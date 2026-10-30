@@ -1,6 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "OnyxiasLairDungeonStrategies.h"
+#include "playerbot/strategy/actions/OnyxiasLairDungeonActions.h"
 
 using namespace ai;
 
@@ -9,6 +10,19 @@ void OnyxiasLairDungeonStrategy::InitCombatTriggers(std::list<TriggerNode*>& tri
     triggers.push_back(new TriggerNode(
         "start onyxia fight",
         NextAction::array(0, new NextAction("enable onyxia fight strategy", 100.0f), NULL)));
+
+    // Paladin resist auto-swap, as in Molten Core and Blackwing Lair:
+    // Onyxia is on the fire list (Flame Breath, Fireball, Deep Breath).
+    triggers.push_back(new TriggerNode(
+        "boss wants fire aura",
+        NextAction::array(0, new NextAction("swap fire resistance aura", ACTION_HIGH + 1), NULL)));
+
+    // Boss protection potion (fire/shadow/nature per boss entry, see
+    // ProtectionPotionPolicy.h): only once a listed boss is an attacker, and
+    // below movement, dispels and every heal tier so survival comes first.
+    triggers.push_back(new TriggerNode(
+        "boss protection potion ready",
+        NextAction::array(0, new NextAction("boss protection potion", ACTION_HIGH), NULL)));
 }
 
 void OnyxiaFightStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -21,6 +35,24 @@ void OnyxiaFightStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "onyxia airborne",
         NextAction::array(0, new NextAction("shoot", ACTION_HIGH),
                              new NextAction("raid spread", ACTION_HIGH - 1), NULL)));
+
+    // Toggle (AiPlayerbot.OnyxiaWhelpsAndEggs, on by default; the triggers
+    // stay silent while it is off). Phase 2 whelp duty for AoE-capable
+    // ranged DPS, above the generic "shoot" row so the whelp becomes the
+    // target before the wand fires.
+    triggers.push_back(new TriggerNode(
+        "onyxia whelps",
+        NextAction::array(0, new NextAction("onyxia kill whelps", ACTION_HIGH + 1), NULL)));
+
+    // Step out of an egg cave before its trap circle hatches whelps.
+    triggers.push_back(new TriggerNode(
+        "onyxia eggs near",
+        NextAction::array(0, new NextAction("onyxia avoid eggs", ACTION_EMERGENCY), NULL)));
+}
+
+void OnyxiaFightStrategy::InitCombatMultipliers(std::list<Multiplier*>& multipliers)
+{
+    multipliers.push_back(new OnyxiaWhelpHoldMultiplier(ai));
 }
 
 void OnyxiaFightStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -39,5 +71,9 @@ void OnyxiaFightStrategy::InitDeadTriggers(std::list<TriggerNode*>& triggers)
 
 void OnyxiaFightStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
 {
-    // ...
+    // Deep Breath outranks the generic flank: cast-triggered lane dodge to
+    // the nearest safe zone beats cone geometry while a breath casts.
+    triggers.push_back(new TriggerNode(
+        "onyxia deep breath",
+        NextAction::array(0, new NextAction("onyxia breath safe zone", ACTION_EMERGENCY + 5), NULL)));
 }

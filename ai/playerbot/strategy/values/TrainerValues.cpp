@@ -3,6 +3,7 @@
 #include "TrainerValues.h"
 #include "SharedValueContext.h"
 #include "playerbot/PlayerbotHelpMgr.h"
+#include "../../../../runtime/policy/provision/TradeTrainerPolicy.h"
 #include "../../../../runtime/ProfessionGrantPolicy.h"
 
 using namespace ai;
@@ -95,8 +96,28 @@ trainableSpellMap* TrainableSpellMapValue::Calculate()
     return spellMap;
 }
 
+TrainerStateSignature TrainerStateSignature::Of(Player* bot)
+{
+    TrainerStateSignature s;
+    s.level = bot->GetLevel();
+    s.knownSpells = static_cast<uint32>(bot->GetSpellMap().size());
+    s.freeProfessionPoints = bot->GetFreePrimaryProfessionPoints();
+    // Skill value and bonus fields of every slot (Player.cpp PLAYER_SKILL_INDEX
+    // layout: id, value, bonus per slot): any skill-up changes the sum.
+    for (uint32 slot = 0; slot < PLAYER_MAX_SKILLS; ++slot)
+        s.skills += uint64(bot->GetUInt32Value(PLAYER_SKILL_INFO_1_1 + slot * 3 + 1)) +
+            bot->GetUInt32Value(PLAYER_SKILL_INFO_1_1 + slot * 3 + 2);
+    return s;
+}
+
 std::vector<TrainerSpell const*> TrainableSpellsValue::Calculate()
 {
+    TrainerStateSignature const now = TrainerStateSignature::Of(bot);
+    if (calculated && now == signature)
+        return value;
+    calculated = true;
+    signature = now;
+
     std::vector<TrainerSpell const*> trainableSpells;
 
     int8 qualifierType = getQualifier().empty() ? -1 : stoi(getQualifier());
@@ -151,6 +172,12 @@ std::string TrainableSpellsValue::Format()
 
 std::vector<int32> AvailableTrainersValue::Calculate()
 {
+    TrainerStateSignature const now = TrainerStateSignature::Of(bot);
+    if (calculated && now == signature)
+        return value;
+    calculated = true;
+    signature = now;
+
     std::vector<TrainerSpell const*> trainableSpells = AI_VALUE2(std::vector<TrainerSpell const*>, "trainable spells", getQualifier());;
     std::vector<int32> retTrainers;
 
@@ -173,6 +200,17 @@ std::vector<int32> AvailableTrainersValue::Calculate()
             for (auto& [trainerSpell, trainers] : trainerSpellList)
             {
                 if (std::find(trainableSpells.begin(), trainableSpells.end(), trainerSpell) == trainableSpells.end())
+                    continue;
+
+                // Trade trainers teach the bot's OWN craft only: for TRADESKILLS
+                // the map key is the spell's skill id, so a herbalism trainer
+                // never qualifies a miner. Without this every green rank-1 in
+                // the world qualified every trade trainer, and level-5 bots
+                // walked to whichever craft was nearest, learning nothing.
+                if (trainerType == TRAINER_TYPE_TRADESKILLS &&
+                    !TradeSpellJustifiesTrip(requirement, bot->HasSkill((uint16)requirement),
+                        sSpellMgr.IsPrimaryProfessionFirstRankSpell(trainerSpell->spell),
+                        bot->GetFreePrimaryProfessionPoints() > 0))
                     continue;
 
                 for (auto& trainer : trainers)

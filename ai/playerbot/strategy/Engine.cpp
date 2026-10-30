@@ -1,12 +1,14 @@
 
 #include "playerbot/playerbot.h"
 #include <stdarg.h>
+#include <cstring>
 #include <iomanip>
 
 #include "Engine.h"
 #include "playerbot/PlayerbotAIConfig.h"
 // #include "playerbot/PerformanceMonitor.h" // E2E green
 #include "playerbot/BotActionLog.h"
+#include "playerbot/ForceRebuffPolicy.h"
 #include "../../../runtime/ObservabilityEmitter.h"
 
 #ifdef BUILD_ELUNA
@@ -49,6 +51,14 @@ void ActionExecutionListeners::After(Action* action, bool executed, const Event&
     for (std::list<ActionExecutionListener*>::iterator i = listeners.begin(); i!=listeners.end(); i++)
     {
         (*i)->After(action, executed, event);
+    }
+}
+
+void ActionExecutionListeners::Outcome(Action* action, ActionOutcome outcome, const Event& event, float baseRelevance, float relevance)
+{
+    for (std::list<ActionExecutionListener*>::iterator i = listeners.begin(); i!=listeners.end(); i++)
+    {
+        (*i)->Outcome(action, outcome, event, baseRelevance, relevance);
     }
 }
 
@@ -169,6 +179,18 @@ void Engine::RecordFailure(Action* action, Event& event, ActionResult result)
     }
 }
 
+void Engine::NoteOutcome(Action* action, char result)
+{
+    if (!action)
+        return;
+    std::string const& name = action->getName();
+    std::strncpy(lastOutcomeName, name.c_str(), sizeof(lastOutcomeName) - 1);
+    lastOutcomeName[sizeof(lastOutcomeName) - 1] = '\0';
+    lastOutcomeResult = result;
+    // Only a verdict that says the action did not run carries a cast-check reason.
+    lastOutcomeCastFail = (result == 'F' || result == 'I') ? static_cast<uint32>(ai->GetLastCastCheckFail()) : 0;
+}
+
 void Engine::ClearActionFailures(Action* action, Event& event)
 {
     actionFailures.Clear(FailureKey(action, event, ACTION_RESULT_FAILED),
@@ -238,7 +260,12 @@ void Engine::Init()
 
 bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
 {
-    LogAction("--- AI Tick --- state=%s strats=%s", BotStateName(state), StrategySignature().c_str());
+    // Hot path: this tick line used to format + append + trim + detail-log on
+    // every DoNextAction call. LogAction early-outs for groupless bots, but
+    // only after that work; skip the call itself when it would be a no-op.
+    // lastAction keeps every other PUSH/A/T line, so .bot action output is unchanged.
+    if (!sPlayerbotAIConfig.logInGroupOnly || (ai->GetBot() && ai->GetBot()->GetGroup()))
+        LogAction("--- AI Tick --- state=%s strats=%s", BotStateName(state), StrategySignature().c_str());
     if (sPlayerbotAIConfig.logValuesPerTick)
         LogValues();
 
@@ -275,6 +302,11 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
 
     time_t currentTime = time(0);
     aiObjectContext->Update();
+    // Force-rebuff cycle roll (donor RollBuffPendingCycle): the per-tick
+    // "buff proposed / buff pending" flags clear at tick start so each tick
+    // re-derives them from its own trigger evaluations and casts.
+    aiObjectContext->GetValue<bool>("manual bool", "force rebuff buff proposed")->Set(false);
+    aiObjectContext->GetValue<bool>("manual bool", "force rebuff buff pending")->Set(false);
     ProcessTriggers(minimal);
     PushDefaultActions();
 
@@ -359,6 +391,7 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
             else
             {
                 bool isUseful = false;
+                ai->ClearLastCastCheckFail();
                 if (!isStunned || action->isUsefulWhenStunned())
                 {
                     // E2E green: PerformanceMonitor stub
@@ -373,6 +406,7 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                         relevance = 0.0f;
                         action->setRelevance(relevance);
                         LogAction("A:%s - vetoed earlier this tick", action->getName().c_str());
+                        NoteOutcome(action, 'V');
                     }
                     else if (std::find(modifiedActions.begin(), modifiedActions.end(), action) == modifiedActions.end())
                     {
@@ -407,6 +441,8 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                     if (IsFailureBackedOff(action, event))
                     {
                         LogAction("A:%s - BACKOFF src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
+                        NoteOutcome(action, 'V');
+                        actionExecutionListeners.Outcome(action, ActionOutcome::Backoff, event, oldRelevance, relevance);
                         delete actionNode;
                         continue;
                     }
@@ -424,6 +460,8 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                         LogAction("A:%s - PREREQ src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
                         if (MultiplyAndPush(actionNode->getPrerequisites(), relevance + 0.02, false, event, "prereq"))
                         {
+                            NoteOutcome(action, 'P');
+                            actionExecutionListeners.Outcome(action, ActionOutcome::Prereq, event, oldRelevance, relevance);
                             PushAgain(actionNode, relevance + 0.01, event);
                             continue;
                         }
@@ -436,6 +474,7 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                     if (isPossible && relevance)
                     {
                         // E2E green: PerformanceMonitor stub
+                        action->BeforeExecute();
                         actionExecuted = ListenAndExecute(action, event);
 // E2E green: pmo stub
 
@@ -448,6 +487,9 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                         if (actionExecuted)
                         {
                             LogAction("A:%s - OK src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
+                            NoteOutcome(action, 'O');
+                            actionExecutionListeners.Outcome(action, ActionOutcome::Ok, event, oldRelevance, relevance);
+                            botdiag::CountAction(ai->GetBot() ? ai->GetBot()->GetClass() : 0, action->getName().c_str(), true);
                             ClearActionFailures(action, event);
                             MultiplyAndPush(actionNode->getContinuers(), 0, false, event, "cont");
                             lastRelevance = relevance;
@@ -456,7 +498,11 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                         }
                         else
                         {
-                            LogAction("A:%s - FAILED src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
+                            LogAction("A:%s - FAILED src=%s base=%.3f eff=%.3f%s", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance,
+                                action->GetFailNote().c_str());
+                            NoteOutcome(action, 'F');
+                            actionExecutionListeners.Outcome(action, ActionOutcome::Failed, event, oldRelevance, relevance);
+                            botdiag::CountAction(ai->GetBot() ? ai->GetBot()->GetClass() : 0, action->getName().c_str(), false);
                             RecordFailure(action, event, ACTION_RESULT_FAILED);
                             MultiplyAndPush(actionNode->getAlternatives(), relevance + 0.03, false, event, "alt");
                         }
@@ -486,6 +532,10 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                             }
                         }
                         LogAction("A:%s - IMPOSSIBLE src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
+                        NoteOutcome(action, 'I');
+                        // A possible action that got here had its relevance zeroed by a multiplier.
+                        actionExecutionListeners.Outcome(action, isPossible ? ActionOutcome::Vetoed : ActionOutcome::Impossible, event, oldRelevance, relevance);
+                        botdiag::CountAction(ai->GetBot() ? ai->GetBot()->GetClass() : 0, action->getName().c_str(), false);
                         RecordFailure(action, event, ACTION_RESULT_IMPOSSIBLE);
                         MultiplyAndPush(actionNode->getAlternatives(), relevance + 0.03, false, event, "alt");
                     }
@@ -516,6 +566,8 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
                     }
                     lastRelevance = relevance;
                     LogAction("A:%s - USELESS src=%s base=%.3f eff=%.3f", action->getName().c_str(), event.getSource().c_str(), oldRelevance, relevance);
+                    NoteOutcome(action, 'U');
+                    actionExecutionListeners.Outcome(action, ActionOutcome::Useless, event, oldRelevance, relevance);
                 }
             }
             delete actionNode;
@@ -563,25 +615,38 @@ bool Engine::DoNextAction(Unit* unit, int depth, bool minimal, bool isStunned)
 
 ActionNode* Engine::CreateActionNode(const std::string& name)
 {
-    ActionNode* cachedNode = nullptr;
-    for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
+    // The strategy factories build a fresh node on every GetAction() call (and the walk over every strategy
+    // and factory costs a map lookup each), so the engine keeps one prototype per name and hands out copies.
+    // A null prototype remembers "no strategy defines a node for this name". The creators are pure functions
+    // of the name, so the answer only changes when the attached strategy set does (see the clear() calls).
+    auto found = actionNodePrototypes.find(name);
+    if (found == actionNodePrototypes.end())
     {
-        Strategy* strategy = i->second;
-        cachedNode = strategy->GetAction(name);
-        if (cachedNode)
+        // Action names can come from chat commands: keep the cache bounded.
+        if (actionNodePrototypes.size() >= kMaxActionNodePrototypes)
+            actionNodePrototypes.clear();
+
+        std::unique_ptr<ActionNode> prototype;
+        for (std::map<std::string, Strategy*>::iterator i = strategies.begin(); i != strategies.end(); i++)
         {
-            break;
+            Strategy* strategy = i->second;
+            prototype.reset(strategy->GetAction(name));
+            if (prototype)
+            {
+                break;
+            }
         }
+
+        found = actionNodePrototypes.emplace(name, std::move(prototype)).first;
     }
 
     // Every caller either queues the node (Engine::Reset deletes it when the
     // queue drains) or deletes it outright, so the engine must own what it gets
-    // back. A node from a strategy factory belongs to that strategy's cache -
-    // handing it out and then deleting it left the factory holding a dangling
-    // pointer, and the next lookup double-freed it (issue: .bot action
-    // commands killed the world server with heap corruption).
-    if (cachedNode)
-        return new ActionNode(*cachedNode);
+    // back: always a copy, never the prototype. (Handing out a node that a
+    // strategy factory kept and then deleting it once double-freed it - issue:
+    // .bot action commands killed the world server with heap corruption.)
+    if (found->second)
+        return new ActionNode(*found->second);
 
     return new ActionNode(name);
 }
@@ -687,10 +752,12 @@ ActionResult Engine::ExecuteAction(const std::string& name, Event& event)
 
                     MultiplyAndPush(action->getContinuers(), 0.0f, false, event, "default");
                     actionResult = executionResult ? ACTION_RESULT_OK : ACTION_RESULT_FAILED;
+                    botdiag::CountAction(ai->GetBot() ? ai->GetBot()->GetClass() : 0, action->getName().c_str(), executionResult);
                 }
                 else
                 {
                     actionResult = ACTION_RESULT_IMPOSSIBLE;
+                    botdiag::CountAction(ai->GetBot() ? ai->GetBot()->GetClass() : 0, action->getName().c_str(), false);
                 }
             }
             else
@@ -767,6 +834,7 @@ void Engine::addStrategy(const std::string& name)
 
         LogAction("S:+%s", strategy->getName().c_str());
         strategies[strategy->getName()] = strategy;
+        actionNodePrototypes.clear();
         strategy->OnStrategyAdded(state);
     }
 
@@ -807,6 +875,7 @@ bool Engine::removeStrategy(const std::string& name, bool init)
     LogAction("S:-%s", name.c_str());
     i->second->OnStrategyRemoved(state);
     strategies.erase(i);
+    actionNodePrototypes.clear();
 
     if (init)
     {
@@ -819,6 +888,7 @@ bool Engine::removeStrategy(const std::string& name, bool init)
 void Engine::removeAllStrategies()
 {
     strategies.clear();
+    actionNodePrototypes.clear();
     Init();
 }
 
@@ -877,6 +947,19 @@ void Engine::ProcessTriggers(bool minimal)
             if (!event)
                 continue;
 
+            // Force-rebuff mark on fire (donor Engine.cpp:488-489): a buff
+            // trigger that produced an event this tick counts as proposed
+            // buff work. BuffTrigger::IsActive deliberately does NOT mark —
+            // subclasses add post-gates (greater-aura vetoes) after it that
+            // can still refuse, and a mark there would veto heals / hold the
+            // ready reply with no work queued. Window read mirrors the
+            // IsActive gate (OOC + pending); the tick-start roll clears it.
+            if (trigger->IsBuffTrigger() && !trigger->IsDebuffTrigger() && ai->GetBot() && !ai->GetBot()->IsInCombat())
+            {
+                uint32 beginMs = aiObjectContext->GetValue<int32>("manual int", "force rebuff begin ms")->Get();
+                if (beginMs && ai::ForceRebuffPending(beginMs, WorldTimer::getMSTime()))
+                    aiObjectContext->GetValue<bool>("manual bool", "force rebuff buff proposed")->Set(true);
+            }
             MultiplyAndPush(node->getHandlers(), 0.0f, false, event, "trigger");
             LogAction("T:%s src=%s", trigger->getName().c_str(), event.getSource().c_str());
         }
@@ -978,6 +1061,7 @@ bool Engine::ListenAndExecute(Action* action, Event& event)
         {
             ai->SetActionDuration(action);
             lastExecutedAction = action;
+            lastExecutedTrigger = event.getSource();
         }
     }
 

@@ -28,6 +28,7 @@ type Listener struct {
 	metricsReg *metrics.Registry
 	zoneProj   *zoneproject.Engine
 	hub        Hub
+	forwards   []*forwardTarget
 	stopChan   chan struct{}
 }
 
@@ -72,6 +73,7 @@ func (l *Listener) Stop() {
 	if l.conn != nil {
 		_ = l.conn.Close()
 	}
+	l.closeForwards()
 }
 
 func (l *Listener) readLoop() {
@@ -84,7 +86,7 @@ func (l *Listener) readLoop() {
 		default:
 		}
 
-		n, _, err := l.conn.ReadFrom(buf)
+		n, src, err := l.conn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-l.stopChan:
@@ -97,6 +99,13 @@ func (l *Listener) readLoop() {
 		}
 
 		if n > 0 {
+			// A datagram from one of our own forward sockets went round a loop:
+			// drop it before it is forwarded or processed a second time.
+			if l.isOwnForward(src) {
+				continue
+			}
+			// Forward first: the copy goes out whatever the parse makes of it.
+			l.forwardDatagram(buf[:n])
 			l.processPacket(buf[:n])
 		}
 	}
@@ -172,6 +181,11 @@ func (l *Listener) processPacket(data []byte) {
 
 		for i := range batch.Bots {
 			l.project(&batch.Bots[i])
+			// Issue #872: a pre-v11 module sends no kind; read it off the
+			// flags it does send so old and new servers render the same.
+			if batch.Bots[i].Kind == "" {
+				batch.Bots[i].Kind = model.KindFromFlags(batch.Bots[i].Player, batch.Bots[i].Alt)
+			}
 		}
 
 		if l.store.ApplyBatch(&batch) {
@@ -194,6 +208,24 @@ func (l *Listener) processPacket(data []byte) {
 		// Broadcast alone (no roster republish): the panel listens for this
 		// event and the next snapshot carries the same payload inline.
 		l.hub.Broadcast("server_info", info)
+
+	case "DUNGEON_MOBS":
+		var dm model.DungeonMobsPayload
+		if err := json.Unmarshal(data, &dm); err != nil {
+			return
+		}
+		// No stream event: the browser refetches /api/v1/dungeons on the
+		// snapshot broadcast, and the module sends this before the batches.
+		l.store.ApplyDungeonMobs(&dm)
+
+	case "COMMANDERS":
+		var cmd model.CommandersPayload
+		if err := json.Unmarshal(data, &cmd); err != nil {
+			return
+		}
+		if l.store.ApplyCommanders(&cmd) {
+			l.hub.Broadcast("commanders", l.store.Commanders())
+		}
 
 	default:
 		var anomaly model.AnomalyPayload

@@ -8,10 +8,13 @@ namespace ai
     // PlayerbotAI::OnDeath cannot break a camp loop whose mobs rotate as they
     // kill the bot (measured: median 7 distinct killer kinds per loop bot, 728
     // DeathClusterEscape rows across 191 bots with dying continuing). The
-    // second escape inside the window below escalates from "leave this kind
-    // alone" to "leave this hunting ground alone": the spot around the death
-    // is avoided, so grind and quest-objective picks inside it are refused
-    // and the bot walks elsewhere.
+    // first escape already escalates from "leave this kind alone" to "leave
+    // this hunting ground alone": the spot around the death is avoided, so
+    // grind and quest-objective picks inside it are refused and the bot walks
+    // elsewhere. Waiting for a second escape cost three more deaths per loop
+    // (Oct 2026 pool: 240 bots in a graveyard camp loop, 1,090 deaths within
+    // 300 yd/15 min of a spirit-healer revive), and the kind blacklist the
+    // first escape buys cannot help when the killers rotate.
     //
     // Pure decision rule, no core includes: PlayerbotAI owns the per-bot
     // avoidance list, SetBestTarget only asks IsDeathSpotAvoided. All clocks
@@ -19,7 +22,7 @@ namespace ai
     // comparison below uses unsigned subtraction, which stays correct across
     // the wrap (a direct nowMs >= expiryMs read goes true the instant a
     // wrapped expiry is stored).
-    std::uint32_t const kDeathAvoidEscapes = 2; // escapes inside the window that trigger avoidance
+    std::uint32_t const kDeathAvoidEscapes = 1; // escapes inside the window that trigger avoidance
 
     std::uint32_t const kDeathAvoidWindowMs = 60u * 60u * 1000u; // escapes this far apart belong to one loop
 
@@ -146,9 +149,96 @@ namespace ai
     // and the quest giver/taker NPCs: a hand-in inside a camp the bot keeps
     // dying in is a death loop too (Rane Yorick at Ivar Patch: 38 level 10-12
     // bots died 837 times walking to him through the Moonrage worgens).
-    // Services (vendor, trainer, repair) stay walkable.
-    inline bool IsDeathGatedPurpose(std::uint32_t purposeId, std::uint32_t grindId, std::uint32_t questMask)
+    // gatherMask covers mining/herbalism nodes the same way: a node inside
+    // the avoided camp is re-mined otherwise (Khuceburn: 7 deaths in 12 min
+    // to Searing Hatchlings on the same Gold Vein, Oct 2026 pool).
+    // Services (vendor, trainer, repair) and fishing stay walkable.
+    inline bool IsDeathGatedPurpose(std::uint32_t purposeId, std::uint32_t grindId, std::uint32_t questMask,
+        std::uint32_t gatherMask = 0)
     {
-        return purposeId == grindId || (purposeId & questMask) != 0;
+        return purposeId == grindId || (purposeId & questMask) != 0 || (purposeId & gatherMask) != 0;
+    }
+
+    // Errand death park: the rules above key on the spot the bot died at, so
+    // a bot that dies on the ROUTE to a far hand-in, node or trainer keeps the
+    // errand - the destination point is nowhere near the death - and the next
+    // pick hands it the same nearest destination along the same path. Oct 2026
+    // pool (500 bots, 27.8 min): 80 % of all deaths were a bot dying 2+ times
+    // on one errand (Molor 19 deaths in 26 min on the way to one taker). A
+    // second death on the same destination (purpose + entry) inside the window
+    // parks that destination for the bot; the pick then lands elsewhere. This
+    // is the donor's "give the target up after N failed attempts" (TravelTarget
+    // retry cap -> cooldown) with a death counted as the failed attempt.
+    // Grind is left to the lethal-kind and death-cluster rules above.
+    std::uint32_t const kErrandDeathsToPark = 2;
+
+    std::uint32_t const kErrandDeathWindowMs = 15u * 60u * 1000u; // deaths this far apart belong to one errand
+
+    std::uint32_t const kErrandParkMs = 30u * 60u * 1000u; // how long the destination stays parked
+
+    std::uint32_t const kErrandParkSlots = 4; // parked destinations kept per bot; the oldest live one is replaced
+
+    struct ErrandPark
+    {
+        std::uint32_t purposeId = 0;
+        std::int32_t entry = 0;
+        std::uint32_t expiryMs = 0; // 0 = slot free
+    };
+
+    // Death count on the errand after one more death now: the same
+    // destination inside the window extends the streak, anything else starts
+    // a fresh one. Wrap-safe like NextDeathEscapeCount.
+    inline std::uint32_t NextErrandDeathCount(std::uint32_t prevCount, std::uint32_t prevPurposeId,
+        std::int32_t prevEntry, std::uint32_t purposeId, std::int32_t entry, std::uint32_t nowMs,
+        std::uint32_t lastDeathMs, std::uint32_t windowMs = kErrandDeathWindowMs)
+    {
+        if (prevCount > 0 && prevPurposeId == purposeId && prevEntry == entry && (nowMs - lastDeathMs) <= windowMs)
+            return prevCount + 1;
+        return 1;
+    }
+
+    // Whether destination (purposeId, entry) is parked for this bot now.
+    inline bool IsErrandParked(std::uint32_t purposeId, std::int32_t entry, std::uint32_t nowMs,
+        ErrandPark const* parks, std::uint32_t parkCount)
+    {
+        for (std::uint32_t i = 0; i < parkCount; ++i)
+        {
+            if (parks[i].purposeId == purposeId && parks[i].entry == entry && DeathSpotActive(nowMs, parks[i].expiryMs))
+                return true;
+        }
+        return false;
+    }
+
+    // Park one more destination: refresh its own slot when it is already
+    // parked, else take a free/expired slot, else replace the oldest live one.
+    inline void AddErrandPark(ErrandPark* parks, std::uint32_t parkCount, std::uint32_t purposeId, std::int32_t entry,
+        std::uint32_t nowMs, std::uint32_t durationMs = kErrandParkMs)
+    {
+        std::uint32_t slot = parkCount;
+        for (std::uint32_t i = 0; i < parkCount && slot == parkCount; ++i)
+        {
+            if (parks[i].purposeId == purposeId && parks[i].entry == entry && DeathSpotActive(nowMs, parks[i].expiryMs))
+                slot = i;
+        }
+        for (std::uint32_t i = 0; i < parkCount && slot == parkCount; ++i)
+        {
+            if (!DeathSpotActive(nowMs, parks[i].expiryMs))
+                slot = i;
+        }
+        if (slot == parkCount)
+        {
+            slot = 0;
+            for (std::uint32_t i = 1; i < parkCount; ++i)
+            {
+                if (static_cast<std::int32_t>(parks[i].expiryMs - nowMs) <
+                    static_cast<std::int32_t>(parks[slot].expiryMs - nowMs))
+                    slot = i;
+            }
+        }
+        parks[slot].purposeId = purposeId;
+        parks[slot].entry = entry;
+        parks[slot].expiryMs = nowMs + durationMs;
+        if (parks[slot].expiryMs == 0) // 0 marks a free slot; nudge the rare wrap onto it
+            parks[slot].expiryMs = 1;
     }
 }

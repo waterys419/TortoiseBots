@@ -17,13 +17,15 @@ namespace ai
         static bool IsValid(Unit* target, Player* player);
 
     private:
-        void ApplyFilter(std::list<ObjectGuid>& targets, bool getOne);
+        void ApplyFilter(std::list<ObjectGuid>& targets, bool getOne, bool proximityScan = false);
+        void ApplyWorldPvpFilter(std::list<ObjectGuid>& targets, bool getOne);
+        bool CanEngageFromHere(Unit* target) const;
     };
 
     class HasEnemyPlayersValue : public BoolCalculatedValue, public Qualified
     {
     public:
-        HasEnemyPlayersValue(PlayerbotAI* ai, std::string name = "has enemy players") : BoolCalculatedValue(ai, name, 3), Qualified() {}
+        HasEnemyPlayersValue(PlayerbotAI* ai, std::string name = "has enemy players") : BoolCalculatedValue(ai, name, 3), Qualified() { this->keepLegacyRefresh = true; }
         virtual bool Calculate() override;
     };
 

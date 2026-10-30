@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "WeightedShufflePolicy.h"
 
 namespace G3D
 {
@@ -28,27 +29,6 @@ namespace ai
         WP_MEAN_CENTROID = 2,
         WP_CLOSEST = 3
     };
-
-    template <class D, class W, class URBG>
-    inline void WeightedShuffle
-    (D first, D last
-        , W first_weight, W last_weight
-        , URBG&& g)
-    {
-        while (first != last && first_weight != last_weight)
-        {
-            std::discrete_distribution<int> dd(first_weight, last_weight);
-            auto i = dd(g);
-
-            if (i)
-            {
-                std::swap(*first, *std::next(first, i));
-                std::swap(*first_weight, *std::next(first_weight, i));
-            }
-            ++first;
-            ++first_weight;
-        }
-    }
 
     class GuidPosition;
 
@@ -147,6 +127,12 @@ namespace ai
         bool isInWater() const { return getTerrain() ? getTerrain()->IsInWater(x, y, z) : false; };
         bool isUnderWater() const { return getTerrain() ? getTerrain()->IsUnderWater(x, y, z) : false; };
         bool IsUnderWater() const { return isUnderWater(); }
+        // In magma by the core's own rule (MagmaHazardPolicy.h); the overload
+        // takes a terrain the caller already resolved (one lookup per route).
+        bool isInMagma() const { return isInMagma(getTerrain()); }
+        bool isInMagma(const TerrainInfo* terrain) const;
+        bool isInSlime() const { return isInSlime(getTerrain()); }
+        bool isInSlime(const TerrainInfo* terrain) const;
         bool setAtWaterSurface();
         bool isUnderground() const;
         float getWaterLevel() const { return getTerrain() ? getTerrain()->GetWaterLevel(x, y, z) : -200000.0f; };
@@ -330,8 +316,11 @@ namespace ai
         // (map -> 64 yd cells -> guard positions), not a spawn-table walk: the
         // world tick is already 100-218 ms and AttackersValue runs on the hot path.
         // Random bots only (callers gate on AvoidHostileTowns + masterless).
-        bool isGuardedHostileTownFor(Player const* bot, float radius = 60.0f) const;
-        bool IsGuardedHostileTownFor(Player const* bot, float radius = 60.0f) const { return isGuardedHostileTownFor(bot, radius); }
+        // neutralTowns: count neutral-town bruisers (Booty Bay, Gadgetzan,
+        // Ratchet, Everlook). They only punish fighting in town, so travel
+        // routes and destinations pass false; fight checks keep the default.
+        bool isGuardedHostileTownFor(Player const* bot, float radius = 60.0f, bool neutralTowns = true) const;
+        bool IsGuardedHostileTownFor(Player const* bot, float radius = 60.0f, bool neutralTowns = true) const { return isGuardedHostileTownFor(bot, radius, neutralTowns); }
         // Test hook + diagnostics: index state without a bot. Built flag is
         // atomic (release on build, acquire on read); cell/guard counts only
         // meaningful after Built() returns true.
@@ -353,6 +342,17 @@ namespace ai
         std::vector<G3D::Vector3> toPointsArray(const std::vector<WorldPosition>& path) const;
 
         //Pathfinding
+        // The core PathFinder's type for the last getPathStepFrom on this thread
+        // (0 = none since the caller reset it): the action log's FAILED line reads it
+        // for a failed move (MoveFailNotePolicy.h).
+        static uint32& LastPathStepType() { static thread_local uint32 type = 0; return type; }
+        // The swim-line test getPathStepFrom keeps the core's straight swim answer by
+        // (SwimPathPolicy.h): every leg in water or ocean at 2 yd samples, at most 80 yd,
+        // and in `bot`'s sight. The run leader asks it before a stall's direct move.
+        static bool IsSwimLine(const std::vector<WorldPosition>& path, const Unit* bot);
+        // Why IsSwimLine refuses `path` for `bot` ("ok", or the first failing check of the first leg that
+        // fails): the swim hand-off's log line (MovementActions.cpp).
+        static std::string SwimLineWhy(const std::vector<WorldPosition>& path, const Unit* bot);
         std::vector<WorldPosition> getPathStepFrom(const WorldPosition& startPos, std::unique_ptr<PathFinder>& pathfinder, const Unit* bot, bool forceNormalPath = false) const;
         std::vector<WorldPosition> getPathStepFrom(const WorldPosition& startPos, const Unit* bot, bool forceNormalPath = false) const;
         std::vector<WorldPosition> GetPathStepFrom(const WorldPosition& startPos, const Unit* bot, bool forceNormalPath = false) const { return getPathStepFrom(startPos, bot, forceNormalPath); }

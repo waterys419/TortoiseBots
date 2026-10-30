@@ -3,8 +3,14 @@
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/values/SharedValueContext.h"
-#include "playerbot/QuestLogPolicy.h"
-#include "../../runtime/GatherToolPolicy.h"
+#include "playerbot/strategy/values/ItemUsageValue.h"
+#include "playerbot/policy/quest/QuestLogPolicy.h"
+#include "playerbot/policy/loot/GameObjectPickupPolicy.h"
+#include "../../runtime/policy/provision/GatherToolPolicy.h"
+#include "../../runtime/CommandedGroupQuery.h"
+#include "../../runtime/HireLifecycle.h"
+#include "../../runtime/policy/hire/HireLootPolicy.h"
+#include "../../runtime/RemoteCommanderTasks.h"
 
 using namespace ai;
 
@@ -108,6 +114,65 @@ static bool MayLootCorpse(Player* bot, Creature* creature)
         return true;
 
     return loot.hasItemFor(bot);                            // another member's turn: personal loot only
+}
+// Collects every item an open chest can hold, following reference tables
+// one level deep. Returns false as soon as one item is better than common.
+static bool CollectCommonChestLoot(LootTemplateAccess const* access, std::vector<uint32>& items, int depth)
+{
+    auto visit = [&](LootStoreItem const& row) -> bool
+    {
+        if (row.mincountOrRef < 0)
+        {
+            if (depth > 0)
+                return true;
+            LootTemplate const* referenced = LootTemplates_Reference.GetLootFor(uint32(-row.mincountOrRef));
+            return !referenced || CollectCommonChestLoot(
+                reinterpret_cast<LootTemplateAccess const*>(referenced), items, depth + 1);
+        }
+        if (!row.itemid)
+            return true;
+        ItemPrototype const* proto = sObjectMgr.GetItemPrototype(row.itemid);
+        if (!proto || proto->Quality > ITEM_QUALITY_NORMAL)
+            return false;
+        items.push_back(row.itemid);
+        return true;
+    };
+    for (LootStoreItem const& row : access->Entries)
+        if (!visit(row))
+            return false;
+    for (LootLootGroupAccess const& group : access->Groups)
+    {
+        for (LootStoreItem const& row : group.ExplicitlyChanced)
+            if (!visit(row))
+                return false;
+        for (LootStoreItem const& row : group.EqualChanced)
+            if (!visit(row))
+                return false;
+    }
+    return true;
+}
+
+// An open chest holding only common/poor items and nothing a quest of this
+// bot needs: a world prop (festive mug, feast food).
+static bool IsCommonWorldProp(Player* bot, GameObject* go)
+{
+    if (go->GetGoType() != GAMEOBJECT_TYPE_CHEST || !go->GetGOInfo())
+        return false;
+    LootTemplate const* pickupLoot = LootTemplates_Gameobject.GetLootFor(go->GetGOInfo()->GetLootId());
+    if (!pickupLoot)
+        return false;
+    ai::GameObjectPickupFacts facts;
+    facts.isChest = true;
+    std::vector<uint32> items;
+    facts.onlyCommonLoot = CollectCommonChestLoot(
+        reinterpret_cast<LootTemplateAccess const*>(pickupLoot), items, 0);
+    if (facts.onlyCommonLoot)
+    {
+        facts.questObject = sObjectMgr.IsGameObjectForQuests(go->GetEntry()) || go->ActivateToQuest(bot);
+        for (uint32 itemId : items)
+            facts.questObject = facts.questObject || ItemUsageValue::IsNeededForQuest(bot, itemId);
+    }
+    return !ai::AllowGameObjectPickup(facts);
 }
 
 void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
@@ -263,6 +328,17 @@ void LootObject::Refresh(Player* bot, ObjectGuid guid, bool debug)
 
     if (debug && guid && !this->guid)
         ai->TellDebug(ai->GetMaster(), "Go has bad lock.", "debug loot");
+
+    if (this->guid.IsGameObject() && skillId == SKILL_NONE && !reqItem)
+    {
+        GameObject* go = ai->GetGameObject(this->guid);
+        if (go && IsCommonWorldProp(bot, go))
+        {
+            if (debug)
+                ai->TellDebug(ai->GetMaster(), "Go is a common world prop.", "debug loot");
+            this->guid = ObjectGuid();
+        }
+    }
 }
 
 WorldObject* LootObject::GetWorldObject(Player* bot)
@@ -375,7 +451,6 @@ bool LootObject::IsLootPossible(Player* bot)
     // got one above. Queue them only when the bot has somewhere to put the loot.
     if ((skillId != SKILL_NONE || guid.IsGameObject()) && !HasBagRoomForLoot(ai, bot))
         return false;
-
     // Bone Chew Toy piles never queue even if ActivateToQuest says yes:
     // Refresh (the open path) already refuses them, and this Add path would
     // otherwise re-queue the same junk pile every sweep.
@@ -516,8 +591,53 @@ bool LootObjectStack::IsAbandoned(ObjectGuid guid)
     return i->second.first >= MAX_APPROACH_FAILURES;
 }
 
+void LootObjectStack::ForgetFailures(ObjectGuid guid)
+{
+    approachFailures.erase(guid);
+}
+
+void LootObjectStack::Abandon(ObjectGuid guid)
+{
+    std::pair<uint32, time_t>& entry = approachFailures[guid];
+    entry.first = MAX_APPROACH_FAILURES;
+    entry.second = time(0);
+    Remove(guid);
+}
+
+void LootObjectStack::NotePlayerOrder(ObjectGuid guid)
+{
+    time_t now = time(0);
+
+    // Drop aged-out marks (a handful of entries at most, only on a player order).
+    for (std::map<ObjectGuid, time_t>::iterator i = playerOrders.begin(); i != playerOrders.end();)
+    {
+        if (now - i->second > APPROACH_FAILURE_TTL)
+            i = playerOrders.erase(i);
+        else
+            ++i;
+    }
+
+    approachFailures.erase(guid);
+    playerOrders[guid] = now;
+}
+
+bool LootObjectStack::TakePlayerOrder(ObjectGuid guid)
+{
+    std::map<ObjectGuid, time_t>::iterator i = playerOrders.find(guid);
+    if (i == playerOrders.end())
+        return false;
+
+    bool const fresh = time(0) - i->second <= APPROACH_FAILURE_TTL;
+    playerOrders.erase(i);
+    return fresh;
+}
+
 bool LootObjectStack::Add(ObjectGuid guid)
 {
+    if (!TortoiseBots::HireMayLoot(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()),
+            sPlayerbotAIConfig.hireLoot))
+        return false;
+
     // A corpse we repeatedly failed to reach stays out of the stack until the
     // failure memory ages out, even if a later "add all loot" sweep re-adds it.
     if (IsAbandoned(guid))
@@ -526,17 +646,20 @@ bool LootObjectStack::Add(ObjectGuid guid)
     // Re-adding refreshes the entry's age. Ignoring a guid that is already queued left the corpse
     // with the timestamp of the first Add, so OrderByDistance dropped it LOOT_OBJECT_TTL_SECONDS
     // later even though "add all loot" (or the bot's own next kill) had just re-offered it.
-    availableLoot.erase(LootTarget(guid));
+    // A refresh is not an addition, though (donor LootObjectStack::Add returns false too):
+    // "add gathering loot" runs every second above travel, and counting the node it had
+    // already queued as done took the decision of bots standing next to an ore vein or herb.
+    bool const known = availableLoot.erase(LootTarget(guid)) > 0;
     availableLoot.insert(LootTarget(guid));
 
     if (availableLoot.size() < MAX_LOOT_OBJECT_COUNT)
-        return true;
+        return !known;
 
     std::vector<LootObject> ordered = OrderByDistance();
     for (size_t i = MAX_LOOT_OBJECT_COUNT; i < ordered.size(); i++)
         Remove(ordered[i].guid);
 
-    return true;
+    return !known;
 }
 
 void LootObjectStack::Remove(ObjectGuid guid)
@@ -550,6 +673,7 @@ void LootObjectStack::Clear()
 {
     availableLoot.clear();
     approachFailures.clear();
+    playerOrders.clear();
 }
 
 bool LootObjectStack::CanLoot(float maxDistance)
@@ -591,11 +715,22 @@ std::vector<LootObject> LootObjectStack::OrderByDistance(float maxDistance)
 
     std::map<float, LootObject> sortedMap;
     LootTargetList safeCopy(availableLoot);
+    // A bot in a commanded group leaves game objects to the commander's orders
+    // (RemoteCommander::OwnLootTakesObject); asked once, and only when one is queued.
+    int commanded = -1;
     for (LootTargetList::iterator i = safeCopy.begin(); i != safeCopy.end(); i++)
     {
         ObjectGuid guid = i->guid;
         if (IsAbandoned(guid))
             continue;
+
+        if (guid.IsGameObject())
+        {
+            if (commanded < 0)
+                commanded = TortoiseBots::BotCommands::IsInCommandedGroup(bot) ? 1 : 0;
+            if (!TortoiseBots::RemoteCommander::OwnLootTakesObject(true, commanded == 1, false))
+                continue;
+        }
 
         LootObject lootObject(bot, guid);
         if (!lootObject.IsLootPossible(bot))

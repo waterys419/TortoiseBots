@@ -10,10 +10,11 @@ namespace ai
     class GrindTargetValue : public TargetValue
 	{
 	public:
-        GrindTargetValue(PlayerbotAI* ai, std::string name = "grind target") : TargetValue(ai, name, 2) {}
+        GrindTargetValue(PlayerbotAI* ai, std::string name = "grind target") : TargetValue(ai, name, 2) { this->keepLegacyRefresh = true; }
 
     public:
         Unit* Calculate() override;
+        static bool IsAllowedInstanceTarget(PlayerbotAI* ai, Unit* target);
 
     private:
         int GetTargetingPlayerCount(Unit* unit);

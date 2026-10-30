@@ -1,5 +1,6 @@
 #pragma once
 #include "DungeonTriggers.h"
+#include "playerbot/policy/raid/OnyxiaBreathPolicy.h"
 
 namespace ai
 {
@@ -27,6 +28,49 @@ namespace ai
         OnyxiaEndFightTrigger(PlayerbotAI* ai) : EndBossFightTrigger(ai, "end onyxia fight", "onyxia", 10184) {}
     };
 
+    // Deep Breath: Onyxia hovering stopped with no target (mod-playerbots
+    // parity, 1.18.1 detection). The 8 breath spells cast TRIGGERED, which
+    // never populates CURRENT_GENERIC_SPELL (Spell.cpp:3641), so cast-slot
+    // polling cannot work here. Instead: during the 5s breath window the
+    // core holds position (IsStopped) with a cleared target (SetTargetGuid
+    // empty — boss_onyxia.cpp DoMovement), while normal phase-2 flight
+    // keeps a victim + motion. Header-inline; the fight-strategy gate lives
+    // in the strategy wiring. Boss resolved via the attacker scan so whelp
+    // tanks, melee, and healers all react regardless of their own target.
+    class OnyxiaDeepBreathTrigger : public Trigger
+    {
+    public:
+        OnyxiaDeepBreathTrigger(PlayerbotAI* ai, std::string name = "onyxia deep breath", int checkInterval = 1)
+        : Trigger(ai, name, checkInterval) {}
+        std::string GetTargetName() override { return "self target"; }
+
+        bool IsActive() override
+        {
+            if (!bot->IsInWorld() || bot->IsBeingTeleported() || !sServerFacade.IsAlive(bot))
+                return false;
+            if (!ai->HasStrategy("onyxia", BotState::BOT_STATE_COMBAT))
+                return false;
+            AiObjectContext* context = ai->GetAiObjectContext();
+            const std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
+            for (const ObjectGuid& attackerGuid : attackers)
+            {
+                Unit* attacker = ai->GetUnit(attackerGuid);
+                if (!attacker || attacker->GetEntry() != 10184)
+                    continue;
+                if (!sServerFacade.IsAlive(attacker))
+                    continue;
+                // Airborne breath window only: grounded phases always hold
+                // a victim and keep moving.
+                if (!attacker->HasAura(17131))
+                    return false;
+                if (!attacker->IsStopped())
+                    return false;
+                return attacker->GetTargetGuid().IsEmpty();
+            }
+            return false;
+        }
+    };
+
     // Phase 2: Onyxia takes flight (Hover aura 17131, core boss_onyxia.cpp).
     // Melee cannot reach her; the fight strategy swaps them to wands/shoot
     // and spreads the raid for Fireball splash. Grounds on phase 3.
@@ -35,6 +79,29 @@ namespace ai
     public:
         OnyxiaAirborneTrigger(PlayerbotAI* ai) : Trigger(ai, "onyxia airborne", 1) {}
         std::string GetTargetName() override { return "current target"; }
+        bool IsActive() override;
+    };
+
+    // Phase 2 whelp duty (AiPlayerbot.OnyxiaWhelpsAndEggs, on by default):
+    // Onyxia airborne, this bot is AoE-capable ranged DPS, a live whelp is
+    // near and it is not on one yet.
+    class OnyxiaWhelpsTrigger : public Trigger
+    {
+    public:
+        OnyxiaWhelpsTrigger(PlayerbotAI* ai, std::string name = "onyxia whelps", int checkInterval = 2)
+        : Trigger(ai, name, checkInterval) {}
+        std::string GetTargetName() override { return "self target"; }
+        bool IsActive() override;
+    };
+
+    // The bot stands inside the trap circle (10yd + margin) of an unbroken
+    // Onyxia Egg (same opt-in toggle).
+    class OnyxiaEggsNearTrigger : public Trigger
+    {
+    public:
+        OnyxiaEggsNearTrigger(PlayerbotAI* ai, std::string name = "onyxia eggs near", int checkInterval = 2)
+        : Trigger(ai, name, checkInterval) {}
+        std::string GetTargetName() override { return "self target"; }
         bool IsActive() override;
     };
 }

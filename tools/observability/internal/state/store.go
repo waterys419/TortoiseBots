@@ -9,6 +9,7 @@
 package state
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -37,6 +38,10 @@ const (
 	// minXpRateWindowSec floors XP/hour windows so one fast kill cannot
 	// extrapolate to 100k XP/h.
 	minXpRateWindowSec = 60
+	// historyMaxSamples bounds the in-memory chart history: one sample
+	// per heartbeat (~2 s) covers 10 minutes, matching the dashboard's
+	// own 300-sample window. Older samples are dropped, never grown.
+	historyMaxSamples = 300
 )
 
 // Config tunes retention. Zero values fall back to the defaults.
@@ -120,17 +125,39 @@ type Store struct {
 	// Stored verbatim; cleared on session change only.
 	serverInfo *model.ServerInfoPayload
 
+	// commanders is the latest COMMANDERS payload (commanders.go): the
+	// standing remote-commander bindings behind the Commanders tab.
+	commanders commandersState
+
+	// dungeonSeen is when the daemon first saw each dungeon run (dungeons.go,
+	// issue #895) in this game-server session: "how long the run has been
+	// seen". Pruned to the runs of the fresh roster on each publish and
+	// cleared on a session change, like the roster it derives from.
+	dungeonSeen map[string]time.Time
+
+	// dungeonMobs is the newest DUNGEON_MOBS payload per run (dungeon_mobs.go,
+	// issue #1101): the mobs, member ids and targets the Dungeons tab maps
+	// draw. Its own lock, like commanders; cleared with the session.
+	dungeonMobs dungeonMobsState
+
 	// Activity rollup fed by the BOT_EVENTS datagrams: per-bot counters plus
 	// the pool-wide loot/quest/level feeds. Cleared with the roster.
 	activity  map[uint32]*botActivityState
 	lootFeed  []model.LootFeedItem
 	questFeed []model.QuestFeedItem
 	levelFeed []model.ActivityLevelItem
+	pvpFeed   []model.PvpFeedItem
 
 	// gear is the daemon's periodic equipped-gear sweep, keyed by GUID.
 	// Replaced wholesale by SetGear on every sweep (it is DB truth, not
 	// session state), so it stays bounded by the pool that sweep saw.
 	gear map[uint32]model.BotGear
+
+	// history is the rolling chart seed behind GET /api/v1/history: one
+	// sample per heartbeat, oldest first, capped at historyMaxSamples
+	// (~10 min). Cleared on session change so a restarted game server
+	// cannot inherit the previous pool's series.
+	history []model.HistorySample
 }
 
 // New creates an empty store. The ring buffer is owned by the caller and is
@@ -166,6 +193,7 @@ func New(cfg Config, anomalies *ringbuf.RingBuffer) *Store {
 		xpTracks:  make(map[uint32]*xpTrack),
 		activity:  make(map[uint32]*botActivityState),
 		gear:      make(map[uint32]model.BotGear),
+		dungeonMobs: dungeonMobsState{runs: make(map[string]dungeonMobsEntry)},
 	}
 }
 
@@ -193,12 +221,16 @@ func (s *Store) ApplyHeartbeat(hb *model.HeartbeatPayload) bool {
 	s.heartbeat = hb
 	s.heartbeatAt = now
 	s.prunePendingLocked(now)
+	s.appendHistoryLocked(now)
 
 	if hb.Seq == 0 || hb.Seq <= s.lastSeq {
 		return false
 	}
 
-	if hb.BotsCount == 0 {
+	// BotsCount covers bot rows only; players ride the batches. Publishing
+	// here when only players are online would wipe the roster until their
+	// batches land, so an empty publish needs both counts at zero.
+	if hb.BotsCount == 0 && hb.HumansCount == 0 {
 		s.publishLocked(hb.Seq, nil, now)
 		return true
 	}
@@ -311,7 +343,6 @@ func (s *Store) Evict() bool {
 	if s.lastSnapshotAt.IsZero() || now.Sub(s.lastSnapshotAt) > s.cfg.RosterTTL {
 		s.bots = make(map[uint32]*botEntry)
 		s.xpTracks = make(map[uint32]*xpTrack)
-		s.resetActivityLocked()
 		s.resetAnomalyTotalsLocked()
 		s.issues.Reset()
 		return true
@@ -349,6 +380,7 @@ func (s *Store) Snapshot() model.SnapshotPayload {
 		}
 		snap.Activity = s.activityForLocked(snap.GUID)
 		snap.Gear = s.gearForLocked(snap.GUID)
+		snap.WorldPvpFighting = s.worldPvpFightingLocked(snap.GUID, now)
 		bots = append(bots, snap)
 	}
 	sort.Slice(bots, func(i, j int) bool { return bots[i].Name < bots[j].Name })
@@ -540,8 +572,17 @@ func xpRateLocked(samples []xpSample, now time.Time) float64 {
 // grindingLocked builds the pool-wide "are they grinding" rollup. Kills come
 // from BOT_DEATH anomalies in the ring buffer (no new emitter counter), XP
 // from the derived per-bot rates, combat/travel from the roster itself.
+// Player and autonomous-alt rows are excluded: pool KPIs describe the pool,
+// not whoever happens to be logged in or playing on their own (Issue #872).
 func (s *Store) grindingLocked(bots []model.BotSnapshot, now time.Time) model.GrindingSummary {
 	out := model.GrindingSummary{}
+	pool := bots[:0:0]
+	for _, b := range bots {
+		if !b.Player && !b.Alt {
+			pool = append(pool, b)
+		}
+	}
+	bots = pool
 	n := len(bots)
 	if n == 0 {
 		return out
@@ -551,6 +592,9 @@ func (s *Store) grindingLocked(bots []model.BotSnapshot, now time.Time) model.Gr
 	rates := make([]float64, 0, n)
 	for _, b := range bots {
 		rates = append(rates, b.XpPerHour)
+		if b.WorldPvpSeeker {
+			out.WorldPvpSeekers++
+		}
 		if b.XpGainAgeSec >= 0 && now.Sub(s.lastSnapshotAt) <= 10*time.Minute {
 			// Counted as gaining when the last positive delta is recent.
 			// 10 min matches the "died in last 5 min" scale below.
@@ -670,7 +714,8 @@ func levelBands(bots []model.BotSnapshot, gear map[uint32]model.BotGear) []model
 // publishLocked replaces the roster with the contents of a complete cycle.
 // Trail continuity is preserved only for bots that stayed on the same
 // map/zone; any transition resets the trail so coordinates never leak across
-// zone maps.
+// zone maps. Player rows never carry trails (no breadcrumb noise for the
+// operator's own character).
 func (s *Store) publishLocked(seq uint64, bots []model.BotSnapshot, now time.Time) {
 	next := make(map[uint32]*botEntry, len(bots))
 
@@ -680,11 +725,14 @@ func (s *Store) publishLocked(seq uint64, bots []model.BotSnapshot, now time.Tim
 		}
 
 		var trail []model.Coordinate
-		if prev, ok := s.bots[snap.GUID]; ok &&
-			prev.snap.MapID == snap.MapID && prev.snap.ZoneID == snap.ZoneID {
-			trail = prev.trail
+		if !snap.Player {
+			if prev, ok := s.bots[snap.GUID]; ok &&
+				prev.snap.MapID == snap.MapID && prev.snap.ZoneID == snap.ZoneID &&
+				!trailJump(prev.snap, snap, now.Sub(s.lastSnapshotAt)) {
+				trail = prev.trail
+			}
+			trail = appendTrail(trail, snap, s.cfg.TrailPoints)
 		}
-		trail = appendTrail(trail, snap, s.cfg.TrailPoints)
 
 		next[snap.GUID] = &botEntry{
 			snap:  snap,
@@ -698,13 +746,6 @@ func (s *Store) publishLocked(seq uint64, bots []model.BotSnapshot, now time.Tim
 	s.snapshotsPublished++
 	s.observeXPLocked(bots, now)
 	s.observeLevelsLocked(bots, now)
-	// Drop activity for bots the roster no longer carries; the map stays
-	// bounded by the live population instead of growing with bot churn.
-	for guid := range s.activity {
-		if _, ok := next[guid]; !ok {
-			delete(s.activity, guid)
-		}
-	}
 	// Stamp the derived XP fields onto the stored roster so Snapshot serves
 	// them without recomputation.
 	for _, b := range bots {
@@ -714,6 +755,17 @@ func (s *Store) publishLocked(seq uint64, bots []model.BotSnapshot, now time.Tim
 		}
 	}
 	s.issues.Observe(bots, now)
+	s.noteDungeonsLocked(bots, now)
+}
+
+// trailJump reports whether a bot moved farther between two snapshots than walking or riding explains (a summon, a teleport, a spirit
+// release): its breadcrumb trail then starts over instead of drawing a straight line, through walls, to the new place. Same rule and
+// numbers as the Commanders trails (JumpLimitYd). gap is the time between the snapshots; unknown (the first cycle) counts as the cap.
+func trailJump(prev, cur model.BotSnapshot, gap time.Duration) bool {
+	if gap <= 0 || gap > time.Duration(TravelMaxGapSec)*time.Second {
+		gap = time.Duration(TravelMaxGapSec) * time.Second
+	}
+	return math.Hypot(prev.X-cur.X, prev.Y-cur.Y) > JumpLimitYd(gap.Seconds())
 }
 
 func appendTrail(trail []model.Coordinate, snap model.BotSnapshot, limit int) []model.Coordinate {
@@ -740,17 +792,77 @@ func appendTrail(trail []model.Coordinate, snap model.BotSnapshot, limit int) []
 	return trail
 }
 
-// beginSessionLocked resets sequence and roster state when a different
-// game-server process starts. The daemon outlives server restarts, and the
-// emitter's seq restarts at 1; without this, every cycle from the new process
-// would be rejected as old.
+// History returns the rolling chart seed: up to historyMaxSamples
+// heartbeat observations, oldest first. The slice is a copy; callers
+// may marshal without holding the lock.
+func (s *Store) History() model.HistoryResponse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := model.HistoryResponse{
+		Samples: make([]model.HistorySample, len(s.history)),
+	}
+	copy(out.Samples, s.history)
+	if !s.sessionSince.IsZero() {
+		out.Since = s.sessionSince.UnixMilli()
+	}
+	return out
+}
+
+// appendHistoryLocked records one chart observation from the current
+// heartbeat plus the live issue counts, dropping the oldest sample
+// past the bound. The issue counts come from the tracker (the same
+// Snapshot every client already sees), not from the heartbeat, so
+// the series matches the Issues tab exactly. Lag percentiles fall
+// back to the tick average/diff exactly like the live chart, so a
+// seed from an older module draws the same line as live samples.
+func (s *Store) appendHistoryLocked(now time.Time) {
+	if s.heartbeat == nil {
+		return
+	}
+	hb := s.heartbeat
+	p50 := hb.LagP50Ms
+	if p50 == 0 {
+		p50 = hb.TickAvgMs
+	}
+	if p50 == 0 {
+		p50 = hb.TickDiffMs
+	}
+	p95 := hb.LagP95Ms
+	if p95 == 0 {
+		p95 = hb.TickAvgMs
+	}
+	if p95 == 0 {
+		p95 = hb.TickDiffMs
+	}
+	counts := s.issues.Snapshot().CountsByType
+	sample := model.HistorySample{
+		At:       now.UnixMilli(),
+		Bots:     hb.BotsCount,
+		Humans:   hb.HumansCount,
+		LagP50Ms: p50,
+		LagP95Ms: p95,
+		Issues:   counts,
+	}
+	s.history = append(s.history, sample)
+	if len(s.history) > historyMaxSamples {
+		s.history = append([]model.HistorySample(nil), s.history[len(s.history)-historyMaxSamples:]...)
+	}
+}
+
+// beginSessionLocked resets sequence and transient roster state when a
+// different game-server process starts. Sequence numbers start from 1 on each
+// server launch. Cumulative activity counters and recent feeds persist across
+// restarts.
 func (s *Store) beginSessionLocked(session uint64) {
 	if session == 0 || session == s.session {
 		return
 	}
 
 	s.session = session
-	s.sessionSince = s.now()
+	if s.sessionSince.IsZero() {
+		s.sessionSince = s.now()
+	}
 	s.lastSeq = 0
 	s.pending = make(map[uint64]*pendingCycle)
 	s.bots = make(map[uint32]*botEntry)
@@ -758,20 +870,76 @@ func (s *Store) beginSessionLocked(session uint64) {
 	s.heartbeatAt = time.Time{}
 	s.lastSnapshotAt = time.Time{}
 	s.xpTracks = make(map[uint32]*xpTrack)
-	s.resetActivityLocked()
+	// Re-anchor money tracking for bots so offline balance changes are not treated as delta.
+	for _, a := range s.activity {
+		a.hasMoney = false
+		a.deadAt = time.Time{}
+	}
 	s.resetAnomalyTotalsLocked()
 	s.serverInfo = nil
 	s.issues.Reset()
 	s.issues.NoteSessionChange(s.now())
+	s.history = nil
+	s.dungeonSeen = make(map[string]time.Time)
 }
 
-// resetActivityLocked drops every activity counter and feed. Called with the
-// roster: a new game-server process, or a roster wipe, invalidates them.
-func (s *Store) resetActivityLocked() {
-	s.activity = make(map[uint32]*botActivityState)
-	s.lootFeed = nil
-	s.questFeed = nil
-	s.levelFeed = nil
+// BackfillActivityFromDB merges authoritative lifetime quest completions,
+// spells known, and active open quests from character-DB rollups into the activity state.
+func (s *Store) BackfillActivityFromDB(quests map[uint32]uint64, spells map[uint32]uint64, openQuests map[uint32][]uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.activity == nil {
+		s.activity = make(map[uint32]*botActivityState)
+	}
+
+	now := s.now().Unix()
+	if !s.sessionSince.IsZero() {
+		now = s.sessionSince.Unix()
+	}
+
+	for guid, qCount := range quests {
+		a := s.activity[guid]
+		if a == nil {
+			a = &botActivityState{openQuest: make(map[uint32]bool)}
+			a.counters.FirstSeen = now
+			s.activity[guid] = a
+		}
+		if a.counters.QuestsRewarded < int(qCount) {
+			a.counters.QuestsRewarded = int(qCount)
+		}
+		if a.counters.QuestsCompleted < int(qCount) {
+			a.counters.QuestsCompleted = int(qCount)
+		}
+	}
+
+	for guid, sCount := range spells {
+		a := s.activity[guid]
+		if a == nil {
+			a = &botActivityState{openQuest: make(map[uint32]bool)}
+			a.counters.FirstSeen = now
+			s.activity[guid] = a
+		}
+		if a.counters.SpellsLearned < int(sCount) {
+			a.counters.SpellsLearned = int(sCount)
+		}
+	}
+
+	for guid, qList := range openQuests {
+		a := s.activity[guid]
+		if a == nil {
+			a = &botActivityState{openQuest: make(map[uint32]bool)}
+			a.counters.FirstSeen = now
+			s.activity[guid] = a
+		}
+		if a.openQuest == nil {
+			a.openQuest = make(map[uint32]bool)
+		}
+		for _, qID := range qList {
+			a.openQuest[qID] = true
+		}
+		a.counters.OpenQuests = len(a.openQuest)
+	}
 }
 
 func (s *Store) prunePendingLocked(now time.Time) {
@@ -793,6 +961,10 @@ func (s *Store) statusLocked(now time.Time) model.ServerStatus {
 	if hb := s.heartbeat; hb != nil {
 		status.Uptime = hb.Uptime
 		status.TickDiffMs = hb.TickDiffMs
+		status.TickAvgMs = hb.TickAvgMs
+		status.TickWorstMs = hb.TickWorstMs
+		status.LagP50Ms = hb.LagP50Ms
+		status.LagP95Ms = hb.LagP95Ms
 		status.WindowSecs = hb.WindowSecs
 		status.Humans = hb.HumansCount
 		status.Bots = hb.BotsCount

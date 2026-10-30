@@ -103,9 +103,49 @@ void PriestStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "low health",
         NextAction::array(0, new NextAction("greater heal", ACTION_MEDIUM_HEAL), NULL)));
 
+    // Owner-approved (2026-10-14): Flash Heal over Greater Heal while the
+    // tank does not hold the pack (PriestPackLoose).
+    triggers.push_back(new TriggerNode(
+        "low health loose pack",
+        NextAction::array(0, new NextAction("flash heal", ACTION_MEDIUM_HEAL + 0.5f), NULL)));
+
     triggers.push_back(new TriggerNode(
         "target of attacker",
         NextAction::array(0, new NextAction("power word: shield", ACTION_HIGH), NULL)));
+
+    // Owner-approved (2026-10-14): a mob on the priest is shed with Fade
+    // before the next heal, above every heal row (critical heal + 2 is the
+    // highest). The action needs a group to shed to, so solo priests are
+    // unaffected; its 30 s cooldown keeps it to one cast per window, and the
+    // trigger only arms while that cooldown is spent.
+    triggers.push_back(new TriggerNode(
+        "fade ready and target of attacker",
+        NextAction::array(0, new NextAction("fade", ACTION_CRITICAL_HEAL + 3), NULL)));
+
+    // Drop aggro while climbing the threat table in a group (the raid-only
+    // node below keeps its EMERG-adjacent slot). Fade needs a group to shed
+    // to - the action's usefulness already requires one - so solo priests
+    // keep burning the GCD on heals instead of fading into nothing. The
+    // threat ratio reads 100 while the tank holds nothing, so the Fade waits
+    // for the tank to hold the mob; a mob on the priest sheds through the
+    // row above instead.
+
+    triggers.push_back(new TriggerNode(
+        "fade ready and priest fade threat",
+        NextAction::array(0, new NextAction("fade", ACTION_HIGH), NULL)));
+
+    // Each Turtle wand shot renews the GCD, so a running wand keeps every
+    // heal and nuke "not ready" for as long as it runs. Stop it while a heal
+    // (or a wanted nuke) is held back by that GCD alone, or while a healer
+    // may not wand at all (HealerMayWand). The row sits above every heal row
+    // (and Fade): those all fail while the wand runs, and below them the
+    // engine reached "dps assist" (60), which succeeds and ends the tick, so
+    // the old NORMAL + 5 slot was starved while the tank died (Uldaman
+    // 2026-10-14). The trigger only fires when stopping lets a spell out
+    // (or the wand is not allowed), so this never costs a cast.
+    triggers.push_back(new TriggerNode(
+        "wand blocks cast",
+        NextAction::array(0, new NextAction("stop wand", ACTION_CRITICAL_HEAL + 4), NULL)));
 }
 
 void PriestStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -180,7 +220,7 @@ void PriestRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     ClassRaidStrategy::InitCombatTriggers(triggers);
 
     triggers.push_back(new TriggerNode(
-        "medium threat",
+        "fade ready and priest fade threat",
         NextAction::array(0, new NextAction("fade", ACTION_DISPEL), NULL)));
 }
 
@@ -319,6 +359,12 @@ void PriestCcStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "shackle undead",
         NextAction::array(0, new NextAction("shackle undead", ACTION_INTERRUPT), NULL)));
 
+    // Each wand shot renews the GCD, so "shackle undead" (needs the spell
+    // ready) never fires while a wand runs: stop the wand while it waits.
+    triggers.push_back(new TriggerNode(
+        "wand blocks cc",
+        NextAction::array(0, new NextAction("stop wand", ACTION_INTERRUPT + 1), NULL)));
+
     triggers.push_back(new TriggerNode(
         "chastise",
         NextAction::array(0, new NextAction("chastise", ACTION_INTERRUPT), NULL)));
@@ -372,9 +418,17 @@ void PriestBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     BuffStrategy::InitCombatTriggers(triggers);
 
+    // The tank row outranks the generic row by relevance (the engine
+    // executes the highest-relevance action; list order sets no priority).
+    // The generic ward used to sit at ACTION_EMERGENCY, above even critical
+    // heals — it now rides below the tank ward as a manual-target fallback.
+    triggers.push_back(new TriggerNode(
+        "fear ward on tank",
+        NextAction::array(0, new NextAction("fear ward on tank", ACTION_HIGH + 3), NULL)));
+
     triggers.push_back(new TriggerNode(
         "fear ward",
-        NextAction::array(0, new NextAction("fear ward", ACTION_EMERGENCY), NULL)));
+        NextAction::array(0, new NextAction("fear ward", ACTION_HIGH + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "target of attacker",
@@ -387,6 +441,13 @@ void PriestBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "power word: fortitude on party",
         NextAction::array(0, new NextAction("power word: fortitude on party", ACTION_DEFAULT), NULL)));
+
+    // Same shape as the Fortitude fallback above: the out-of-combat Spirit
+    // kept losing to follow on a moving master and never landed on the party
+    // in long fights.
+    triggers.push_back(new TriggerNode(
+        "divine spirit on party",
+        NextAction::array(0, new NextAction("divine spirit on party", ACTION_DEFAULT), NULL)));
 }
 
 void PriestBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -493,10 +554,6 @@ void PriestBoostStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "power infusion",
         NextAction::array(0, new NextAction("power infusion", ACTION_HIGH), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "inner focus",
-        NextAction::array(0, new NextAction("inner focus", ACTION_HIGH), NULL)));
 }
 
 void PriestBoostStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)

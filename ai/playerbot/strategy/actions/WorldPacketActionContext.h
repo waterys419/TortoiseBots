@@ -21,11 +21,11 @@
 #include "TellCastFailedAction.h"
 #include "AcceptDuelAction.h"
 #include "ReadyCheckAction.h"
-#include "SecurityCheckAction.h"
 #include "GuildAcceptAction.h"
 #include "PetitionSignAction.h"
 #include "BattleGroundJoinAction.h"
 #include "UnlockTradedItemAction.h"
+#include "MimicConsumableAction.h"
 
 namespace ai
 {
@@ -50,7 +50,9 @@ namespace ai
             creators["accept all quests"] = [](PlayerbotAI* ai) { return new AcceptAllQuestsAction(ai); };
             creators["accept quest share"] = [](PlayerbotAI* ai) { return new AcceptQuestShareAction(ai); };
             creators["loot start roll"] = [](PlayerbotAI* ai) { return (QueryItemUsageAction*)new LootStartRollAction(ai); };
+            creators["loot vote"] = [](PlayerbotAI* ai) { return (QueryItemUsageAction*)new LootVoteAction(ai); };
             creators["loot roll"] = [](PlayerbotAI* ai) { return (QueryItemUsageAction*)new LootRollAction(ai); };
+            creators["log roll won"] = [](PlayerbotAI* ai) { return new RollWonLogAction(ai); };
             creators["revive from corpse"] = [](PlayerbotAI* ai) { return new ReviveFromCorpseAction(ai); };
             creators["find corpse"] = [](PlayerbotAI* ai) { return new FindCorpseAction(ai); };
             creators["auto release"] = [](PlayerbotAI* ai) { return new AutoReleaseSpiritAction(ai); };
@@ -73,12 +75,14 @@ namespace ai
             creators["accept duel"] = [](PlayerbotAI* ai) { return new AcceptDuelAction(ai); };
             creators["ready check"] = [](PlayerbotAI* ai) { return new ReadyCheckAction(ai); };
             creators["finish ready check"] = [](PlayerbotAI* ai) { return new FinishReadyCheckAction(ai); };
+            creators["ready reply"] = [](PlayerbotAI* ai) { return new ReadyReplyAction(ai); };
+            creators["force rebuff"] = [](PlayerbotAI* ai) { return new ForceRebuffAction(ai); };
             creators["uninvite"] = [](PlayerbotAI* ai) { return new UninviteAction(ai); };
-            creators["security check"] = [](PlayerbotAI* ai) { return new SecurityCheckAction(ai); };
             creators["guild accept"] = [](PlayerbotAI* ai) { return new GuildAcceptAction(ai); };
             creators["inventory change failure"] = [](PlayerbotAI* ai) { return new InventoryChangeFailureAction(ai); };
             creators["petition sign"] = [](PlayerbotAI* ai) { return new PetitionSignAction(ai); };
             creators["unlock traded item"] = [](PlayerbotAI* ai) { return new UnlockTradedItemAction(ai); };
+            creators["mimic consumable"] = [](PlayerbotAI* ai) { return new MimicConsumableAction(ai); };
         }
     };
 };

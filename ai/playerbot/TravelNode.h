@@ -1,8 +1,18 @@
 #pragma once
 
+#include <ctime>
 #include <shared_mutex>
+#include <unordered_map>
 #include "WorldPosition.h"
 #include "Maps/PathFinder.h"
+
+// The Deeprun Tram map: crossed only by riding the train, which bots cannot board.
+static constexpr uint32 MAP_DEEPRUN_TRAM = 369;
+
+class PlayerbotAI;
+// Moves a masterless pool bot stranded on the tram map out through the
+// station exit nearest to `goal` (any exit when goal is off map 0).
+bool LeaveDeeprunTram(PlayerbotAI* ai, Player* bot, ai::WorldPosition const& goal);
 
 //THEORY
 //
@@ -44,6 +54,38 @@ using namespace ai;
 namespace ai
 {
     class WorldPosition;
+
+    //What TravelNodePath::getCost needs to know about the traveller. It is
+    //built once per route search (TravelNodeMap::getRoute) so the A* does not
+    //repeat the dynamic_cast, the AI lookup and the named-value lookups on
+    //every edge. The bot cannot change while the search runs on the world
+    //thread, so the captured values equal what a per-edge lookup returned.
+    struct TravelCostContext
+    {
+        explicit TravelCostContext(Unit* unit);
+
+        Player* bot = nullptr;
+        PlayerbotAI* ai = nullptr;
+        uint32 mapId = 0;
+        uint32 instanceId = 0;
+        uint32 level = 0;
+        bool isAlliance = false;
+        bool taxiCheater = false;
+        float speed = 8.0f;     //run speed
+        float swimSpeed = 4.0f; //swim speed, with the druid aquatic form bonus
+
+        //Whether the bot may take this area trigger edge: its teleport
+        //condition, the refusal the server gave it and the tram rule.
+        //Evaluated once per trigger id and search.
+        bool canUseAreaTrigger(uint32 triggerId);
+
+    private:
+        bool hasRealPlayerMaster();
+
+        std::unordered_map<uint32, bool> areaTriggerUsable;
+        int8 realPlayerMaster = -1; //-1 = not asked yet
+        time_t now = 0;
+    };
 
     //A connection between two nodes.
     class TravelNodePath
@@ -100,6 +142,7 @@ namespace ai
         void calculateCost(bool distanceOnly = false);
 
         float getCost(Unit* unit = nullptr, uint32 cGold = 0);
+        float getCost(TravelCostContext& context, uint32 cGold = 0);
         float GetCost(Unit* unit = nullptr, uint32 cGold = 0) { return getCost(unit, cGold); }
         uint32 getPrice();
         uint32 GetPrice() { return getPrice(); }
@@ -119,7 +162,7 @@ namespace ai
         float distance = 0.1f;
 
         //Calculated mobs level along the way.
-        std::vector<uint8> maxLevelCreature = { 0,0,0 }; //mobs, horde, alliance
+        std::vector<uint8> maxLevelCreature = { 0,0,0 }; //hostile to both, alliance-friendly, horde-friendly (see TravelNodePath::calculateCost)
 
         //Calculated swiming distances along the way.
         float swimDistance = 0;
@@ -308,6 +351,20 @@ namespace ai
         bool IsWalkable() const { return isWalkable(); }
     };
 
+    // Out-parameter of TravelPath::ClipPath for the dungeon "hold before a
+    // pack" follow (AiPlayerbot.DungeonFollowHoldBeforePacks): the creature
+    // that stopped the route and where the route now ends.
+    struct PackHoldResult
+    {
+        // In: the bot stands at its hold point, so reuse the cached creature
+        // list instead of refreshing it (only walking can bring new packs in).
+        bool reuseTargets = false;
+        // Out:
+        bool hold = false;
+        ObjectGuid pack;
+        WorldPosition point;
+    };
+
     //A complete list of points the bots has to walk to or teleport to.
     class TravelPath
     {
@@ -341,10 +398,13 @@ namespace ai
         bool shouldMoveToNextPoint(WorldPosition startPos, std::vector<PathNodePoint>::iterator beg, std::vector<PathNodePoint>::iterator ed, std::vector<PathNodePoint>::iterator p, float& moveDist, float maxDist);
         bool UpcommingSpecialMovement(WorldPosition startPos, float maxDist, bool onTransport);
 
-        void ClipPath(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets);
+        // packHold non-null: also end the route just outside the aggro radius of the
+        // first unpulled hostile creature on it, and report that creature there.
+        void ClipPath(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets, PackHoldResult* packHold = nullptr);
         std::ostringstream print();
     private:
         std::vector<PathNodePoint>::iterator getNextPoint(WorldPosition startPos, float maxDist, bool onTransport);
+        void ClipBeforePack(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets, PackHoldResult& packHold);
 
         std::vector<PathNodePoint> fullPath;
     };
@@ -433,6 +493,8 @@ namespace ai
 
         //Find the full path between those locations
         static TravelPath getFullPath(WorldPosition startPos, WorldPosition endPos, Unit* unit = nullptr);
+        // Why the last getFullPath on this thread found no node route ("" when it did), for the TravelMoveFailed row.
+        static std::string& LastRouteFail() { static thread_local std::string reason; return reason; }
         static TravelPath GetFullPath(WorldPosition startPos, WorldPosition endPos, Unit* unit = nullptr) { return getFullPath(startPos, endPos, unit); }
 
         //Manage/update nodes

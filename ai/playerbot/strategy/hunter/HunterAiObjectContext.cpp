@@ -2,6 +2,7 @@
 #include "playerbot/playerbot.h"
 #include "HunterActions.h"
 #include "HunterTriggers.h"
+#include "HunterValues.h"
 #include "HunterAiObjectContext.h"
 #include "BeastMasteryHunterStrategy.h"
 #include "MarksmanshipHunterStrategy.h"
@@ -190,13 +191,17 @@ namespace ai
             {
                 creators["no stings"] = [](PlayerbotAI* ai) { return new HunterNoStingsActiveTrigger(ai); };
                 creators["hunters pet dead"] = [](PlayerbotAI* ai) { return new HuntersPetDeadTrigger(ai); };
+                creators["safe to revive pet"] = [](PlayerbotAI* ai) { return new SafeToRevivePetTrigger(ai); };
                 creators["hunters pet low health"] = [](PlayerbotAI* ai) { return new HuntersPetLowHealthTrigger(ai); };
+                creators["pet has aggro"] = [](PlayerbotAI* ai) { return new PetHasAggroTrigger(ai); };
+                creators["hunters pet medium health"] = [](PlayerbotAI* ai) { return new HuntersPetMediumHealthTrigger(ai); };
                 creators["hunter's mark"] = [](PlayerbotAI* ai) { return new HuntersMarkTrigger(ai); };
                 creators["freezing trap"] = [](PlayerbotAI* ai) { return new FreezingTrapTrigger(ai); };
                 creators["frost trap"] = [](PlayerbotAI* ai) { return new FrostTrapTrigger(ai); };
                 creators["explosive trap"] = [](PlayerbotAI* ai) { return new ExplosiveTrapTrigger(ai); };
                 creators["rapid fire"] = [](PlayerbotAI* ai) { return new RapidFireTrigger(ai); };
                 creators["aspect of the hawk"] = [](PlayerbotAI* ai) { return new AspectOfTheHawkTrigger(ai); };
+                creators["aspect of the viper low mana"] = [](PlayerbotAI* ai) { return new AspectOfTheViperLowManaTrigger(ai); };
                 creators["aspect of the wild"] = [](PlayerbotAI* ai) { return new AspectOfTheWildTrigger(ai); };
                 creators["aspect of the monkey"] = [](PlayerbotAI* ai) { return new AspectOfTheMonkeyTrigger(ai); };
                 creators["aspect of the beast"] = [](PlayerbotAI* ai) { return new AspectOfTheBeastTrigger(ai); };
@@ -209,14 +214,19 @@ namespace ai
                 creators["concussive shot on snare target"] = [](PlayerbotAI* ai) { return new ConsussiveShotSnareTrigger(ai); };
                 creators["scare beast"] = [](PlayerbotAI* ai) { return new ScareBeastTrigger(ai); };
                 creators["low ammo"] = [](PlayerbotAI* ai) { return new HunterLowAmmoTrigger(ai); };
+                creators["volley channel check"] = [](PlayerbotAI* ai) { return new VolleyChannelCheckTrigger(ai); };
                 creators["no ammo"] = [](PlayerbotAI* ai) { return new HunterNoAmmoTrigger(ai); };
                 creators["has ammo"] = [](PlayerbotAI* ai) { return new HunterHasAmmoTrigger(ai); };
                 creators["switch to melee"] = [](PlayerbotAI* ai) { return new SwitchToMeleeTrigger(ai); };
                 creators["switch to ranged"] = [](PlayerbotAI* ai) { return new SwitchToRangedTrigger(ai); };
                 creators["enemy too close for auto shot"] = [](PlayerbotAI* ai) { return new EnemyTooCloseForAutoShotTrigger(ai); };
+                creators["hunter enemy is close"] = [](PlayerbotAI* ai) { return new HunterEnemyIsCloseTrigger(ai); };
+                creators["hunter multiple attackers"] = [](PlayerbotAI* ai) { return new HunterMultipleAttackersTrigger(ai); };
+                creators["disengage on attacker"] = [](PlayerbotAI* ai) { return new HunterDisengageTrigger(ai); };
+                creators["hunter dead zone step out"] = [](PlayerbotAI* ai) { return new HunterDeadZoneStepOutTrigger(ai); };
                 creators["feign death"] = [](PlayerbotAI* ai) { return new FeignDeathTrigger(ai); };
                 creators["scatter shot on snare target"] = [](PlayerbotAI* ai) { return new ScatterShotSnareTrigger(ai); };
-                creators["multi-shot"] = [](PlayerbotAI* ai) { return new MultishotCanCastTrigger(ai); };
+                creators["multi-shot"] = [](PlayerbotAI* ai) { return new HunterMultiShotTrigger(ai); };
                 creators["intimidation"] = [](PlayerbotAI* ai) { return new IntimidationTrigger(ai); };
                 creators["intimidation on snare target"] = [](PlayerbotAI* ai) { return new IntimidationSnareTrigger(ai); };
                 creators["counterattack"] = [](PlayerbotAI* ai) { return new CounterattackCanCastTrigger(ai); };
@@ -225,6 +235,7 @@ namespace ai
                 creators["viper sting"] = [](PlayerbotAI* ai) { return new ViperStingTrigger(ai); };
                 creators["aimed shot"] = [](PlayerbotAI* ai) { return new AimedShotTrigger(ai); };
                 creators["arcane shot"] = [](PlayerbotAI* ai) { return new ArcaneShotTrigger(ai); };
+                creators["steady shot"] = [](PlayerbotAI* ai) { return new SteadyShotTrigger(ai); };
                 creators["bestial wrath"] = [](PlayerbotAI* ai) { return new BestialWrathBoostTrigger(ai); };
                 creators["kill command"] = [](PlayerbotAI* ai) { return new KillCommandTrigger(ai); };
                 creators["carve"] = [](PlayerbotAI* ai) { return new CarveTrigger(ai); };
@@ -242,6 +253,7 @@ namespace ai
                 creators["equip ammo"] = [](PlayerbotAI* ai) { return new HunterEquipAmmoAction(ai); };
                 creators["aimed shot"] = [](PlayerbotAI* ai) { return new CastAimedShotAction(ai); };
                 creators["arcane shot"] = [](PlayerbotAI* ai) { return new CastArcaneShotAction(ai); };
+                creators["steady shot"] = [](PlayerbotAI* ai) { return new CastSteadyShotAction(ai); };
                 creators["tranquilizing shot"] = [](PlayerbotAI* ai) { return new CastTranquilizingShotAction(ai); };
                 creators["concussive shot"] = [](PlayerbotAI* ai) { return new CastConcussiveShotAction(ai); };
                 creators["distracting shot"] = [](PlayerbotAI* ai) { return new CastDistractingShotAction(ai); };
@@ -257,6 +269,7 @@ namespace ai
                 creators["mend pet"] = [](PlayerbotAI* ai) { return new CastMendPetAction(ai); };
                 creators["revive pet"] = [](PlayerbotAI* ai) { return new CastRevivePetAction(ai); };
                 creators["call pet"] = [](PlayerbotAI* ai) { return new CastCallPetAction(ai); };
+                creators["cower"] = [](PlayerbotAI* ai) { return new CastPetCowerAction(ai); };
                 creators["rapid fire"] = [](PlayerbotAI* ai) { return new CastRapidFireAction(ai); };
                 creators["boost"] = [](PlayerbotAI* ai) { return new CastRapidFireAction(ai); };
                 creators["readiness"] = [](PlayerbotAI* ai) { return new CastReadinessAction(ai); };
@@ -272,7 +285,11 @@ namespace ai
                 creators["trueshot aura"] = [](PlayerbotAI* ai) { return new CastTrueshotAuraAction(ai); };
                 creators["feign death"] = [](PlayerbotAI* ai) { return new CastFeignDeathAction(ai); };
                 creators["wing clip"] = [](PlayerbotAI* ai) { return new CastWingClipAction(ai); };
+                creators["wing clip on attacker"] = [](PlayerbotAI* ai) { return new CastWingClipOnAttackerAction(ai); };
                 creators["raptor strike"] = [](PlayerbotAI* ai) { return new CastRaptorStrikeAction(ai); };
+                creators["hunter step out"] = [](PlayerbotAI* ai) { return new HunterStepOutAction(ai); };
+                creators["hunter kite step out"] = [](PlayerbotAI* ai) { return new HunterStepOutAction(ai, "hunter kite step out", "closest attacker targeting me"); };
+                creators["disengage"] = [](PlayerbotAI* ai) { return new CastDisengageAction(ai); };
                 creators["feed pet"] = [](PlayerbotAI* ai) { return new FeedPetAction(ai); };
                 creators["bestial wrath"] = [](PlayerbotAI* ai) { return new CastBestialWrathAction(ai); };
                 creators["scare beast"] = [](PlayerbotAI* ai) { return new CastScareBeastAction(ai); };
@@ -313,6 +330,22 @@ namespace ai
     };
 };
 
+namespace ai
+{
+    namespace hunter
+    {
+        class ValueFactoryInternal : public NamedObjectContext<UntypedValue>
+        {
+        public:
+            ValueFactoryInternal()
+            {
+                // Kit-switch dwell and dead-zone step-out bookkeeping (HunterSwitchPolicy.h).
+                creators["hunter kit state"] = [](PlayerbotAI* ai) { return new HunterKitStateValue(ai); };
+            }
+        };
+    };
+};
+
 HunterAiObjectContext::HunterAiObjectContext(PlayerbotAI* ai) : AiObjectContext(ai)
 {
     strategyContexts.Add(new ai::hunter::StrategyFactoryInternal());
@@ -328,4 +361,5 @@ HunterAiObjectContext::HunterAiObjectContext(PlayerbotAI* ai) : AiObjectContext(
     strategyContexts.Add(new ai::hunter::AspectSituationStrategyFactoryInternal());
     actionContexts.Add(new ai::hunter::AiObjectContextInternal());
     triggerContexts.Add(new ai::hunter::TriggerFactoryInternal());
+    valueContexts.Add(new ai::hunter::ValueFactoryInternal());
 }

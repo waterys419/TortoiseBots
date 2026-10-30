@@ -24,6 +24,30 @@ namespace ai
 #endif
     };
 
+    // SMSG_LOOT_ROLL (one per cast vote) reaches every roller, so a pool bot
+    // waiting on its vote learns each live human vote as it lands (#967).
+    // Every live vote (need/greed/pass) is remembered per voter in "seen
+    // need rolls"; any NEED among them steps the bot's own NEED down to
+    // GREED at vote time, and the per-voter record tells when every real
+    // roller voted. Post-resolution echoes carry a real roll number and are
+    // ignored.
+    class LootVoteAction : public QueryItemUsageAction
+    {
+    public:
+        LootVoteAction(PlayerbotAI* ai, std::string name = "loot vote") : QueryItemUsageAction(ai, name) {}
+        virtual bool Execute(Event& event) override;
+        virtual bool isUsefulWhenStunned() override { return true; }
+
+#ifdef GenerateBotHelp
+        virtual std::string GetHelpName() { return "loot vote"; } //Must equal internal name
+        virtual std::string GetHelpDescription()
+        {
+            return "This action records a group-loot vote another roller just cast.\n";
+        }
+        virtual std::vector<std::string> GetUsedActions() { return {}; }
+        virtual std::vector<std::string> GetUsedValues() { return { "seen need rolls" }; }
+#endif
+    };
     class RollAction : public QueryItemUsageAction
     {
     public:
@@ -49,11 +73,12 @@ namespace ai
 
     protected:
         virtual ItemQualifier GetRollItem(ObjectGuid lootGuid, uint32 slot);
-        virtual RollVote CalculateRollVote(ItemQualifier& itemQualifier);
+        virtual RollVote CalculateRollVote(ItemQualifier& itemQualifier, RollVote* finalVote = nullptr, std::string* reasonOut = nullptr, bool log = true);
         virtual bool RollOnItemInSlot(RollVote type, ObjectGuid lootGuid, uint32 slot);
-        bool RollWithEtiquette(ObjectGuid lootGuid, uint32 slot);
-        bool HumansStillDeciding(ObjectGuid lootGuid, uint32 slot, bool& humanNeeds);
-        bool RollAboutToExpire(ObjectGuid lootGuid);
+        bool RollWithEtiquette(ObjectGuid lootGuid, uint32 slot, ObjectGuid seenVoter = ObjectGuid(), uint8 seenVote = ROLL_NOT_VALID);
+        bool RealPlayerMayNeed(ObjectGuid lootGuid, ItemQualifier& itemQualifier, ObjectGuid seenVoter, uint8 seenVote);
+        bool ShouldWaitForPlayers(ObjectGuid lootGuid, uint32 slot);
+        bool AllRealRollersVoted(ObjectGuid lootGuid, uint32 slot);
     };
 
     class LootRollAction : public RollAction
@@ -72,6 +97,23 @@ namespace ai
         }
         virtual std::vector<std::string> GetUsedActions() { return { "roll" }; }
         virtual std::vector<std::string> GetUsedValues() { return { "item usage", "force item usage" }; }
+#endif
+    };
+    class RollWonLogAction : public Action
+    {
+    public:
+        RollWonLogAction(PlayerbotAI* ai, std::string name = "log roll won") : Action(ai, name) {}
+        virtual bool Execute(Event& event) override;
+        virtual bool isUsefulWhenStunned() override { return true; }
+
+#ifdef GenerateBotHelp
+        virtual std::string GetHelpName() { return "log roll won"; } //Must equal internal name
+        virtual std::string GetHelpDescription()
+        {
+            return "This action logs an item the bot won from a group-loot roll.\n";
+        }
+        virtual std::vector<std::string> GetUsedActions() { return {}; }
+        virtual std::vector<std::string> GetUsedValues() { return {}; }
 #endif
     };
 

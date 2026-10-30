@@ -5,6 +5,7 @@
 #include "playerbot/strategy//AiObject.h"
 #include "playerbot/strategy/Value.h"
 #include "playerbot/TravelMgr.h"
+#include "playerbot/policy/combat/RunnerFinishPolicy.h"
 #include <map>
 
 namespace ai
@@ -39,9 +40,76 @@ namespace ai
     public:
         FindNonCcTargetStrategy(PlayerbotAI* ai) : FindTargetStrategy(ai) {}
 
-    protected:
-        virtual bool IsCcTarget(Unit* attacker);
+        // True when every live enemy fighting the group is a CC mark (Moon
+        // or a bot's assigned "rti cc" mark), not counting `except`. Judged
+        // from the raw "attackers" list, so a stunned, rooted, feared or
+        // sheeped unmarked mob still counts as an enemy left to fight.
+        // False when no live enemy is in the list at all; a live `except`
+        // counts as one (CcOnlyMarksLeft in CcMarkHoldPolicy.h).
+        bool OnlyCcMarksLeft(Unit* except = nullptr);
 
+        // The unit is crowd-controlled right now: a damage-breakable CC
+        // (sheep, sap, gouge, shackle, hibernate, trap, seduction, ...), a
+        // fear or a banish. Frost Nova's root is not crowd control here.
+        static bool IsCrowdControlled(PlayerbotAI* ai, Unit* unit);
+        // `caster`'s cast bar is a crowd-control spell aimed at `target`.
+        static bool IsCastingCcAt(Unit* caster, Unit* target);
+        // The spell carries a crowd-control mechanic (polymorph, banish,
+        // fear, sleep, knockout/sap, shackle) on the spell or an effect.
+        static bool IsCcSpell(SpellEntry const* info);
+
+    protected:
+        // Moon or a bot's assigned "rti cc" mark, crowd-controlled or not.
+        bool IsCcMark(Unit* attacker);
+        // A CC mark the party leaves alone: a mark that is crowd-controlled,
+        // has a group member's CC cast bar on it, is not fighting yet, or is
+        // in its hold window (CcMarkHoldPolicy.h, first 10 s of combat) with
+        // its CC bot ready and in range. A free mark (CC missed, broke, no
+        // CC bot, or the window ran out) is a normal enemy.
+        virtual bool IsCcTarget(Unit* attacker);
+        bool IsCcProtected(Unit* unit);
+        // `player` (a bot with AI `memberAi`) can CC `unit` now: "cc" on,
+        // knows a fitting cast-time CC spell off cooldown, within spell
+        // range + 5 yd. Whether `unit` is its mark is the caller's test.
+        static bool IsCcBotReadyFor(PlayerbotAI* memberAi, Player* player, Unit* unit);
+
+    };
+
+    // Crowd control the party must not break, checked outside a target
+    // tournament (current target, snare/DoT picks, splash). Build one per
+    // decision: the "only CC marks left" answer is computed once, on need.
+    class CcGuard : public FindNonCcTargetStrategy
+    {
+    public:
+        CcGuard(PlayerbotAI* ai) : FindNonCcTargetStrategy(ai), onlyMarksLeft(-1) {}
+        void CheckAttacker(Unit* /*attacker*/, ThreatManager* /*threatManager*/) override {}
+
+        // A protected CC mark (see IsCcTarget) while any other enemy still
+        // fights the group: nobody targets, taunts, DoTs or splashes it (it
+        // is killed last, see TargetValue::FindLastCcTarget).
+        bool IsHeldCcMark(Unit* unit);
+        // This bot's own assigned CC mark ("rti cc target") that it can CC
+        // now (IsCcBotReadyFor), held or free.
+        bool IsOwnReadyCcMark(Unit* unit);
+        // A group member's cast bar is a CC spell aimed at `unit`.
+        bool GroupCastsCcAt(Unit* unit);
+        // An enemy fighting the group within `radius` of `center` (bounding
+        // radii included) that holds a damage-breakable CC, or with
+        // `includeMarks` is a held CC mark (being or about to be CC'd), or
+        // is this bot's own ready CC mark while other enemies are left (the
+        // CC bot never splashes the mob it will sheep next). `skip` (may be
+        // null) is not counted (CcGuardCountsUnit): Blade Flurry passes the
+        // rogue's own victim, which its proc never hits.
+        bool ProtectedEnemyNear(WorldObject* center, float radius, bool includeMarks, Unit* skip = nullptr);
+        // A CC mark fighting the group within `radius` of `center` whose CC
+        // bot (the group bot with it as "rti cc target") can CC it now
+        // (IsCcBotReadyFor), at any combat time, while other enemies are
+        // left. Only Blade Flurry's cancel uses it (CcCancelBladeFlurry).
+        bool ReadyCcMarkNear(WorldObject* center, float radius);
+
+    private:
+        bool OnlyMarksLeftCached();
+        int onlyMarksLeft;
     };
 
     class TargetValue : public UnitCalculatedValue
@@ -61,6 +129,11 @@ namespace ai
         // to preserve that commitment while the normal combat engine catches
         // up and creates threat.
         Unit* GetExplicitAttackTarget();
+        // Kill-last fallback for the tank/DPS pickers: once only CC-marked
+        // mobs (Moon or a bot's assigned "rti cc" mark) are left fighting the
+        // group, sheeped or free, the first live one in combat is the target
+        // instead of none. Any other enemy, crowd-controlled or not, blocks it.
+        Unit* FindLastCcTarget();
     };
 
     class RpgTargetValue : public ManualSetValue<GuidPosition>
@@ -115,6 +188,38 @@ namespace ai
 
     private:
         std::map<ObjectGuid, uint32> data;
+    };
+
+    // Targets a melee chase set aside because they stand in a creature aura keep-out
+    // (MovementAction::HoldChaseOutsideKeepout), mapped to the time (ms) until which they
+    // are refused. A book of its own, apart from "unreachable targets", so the pick paths
+    // that bypass the attackers list (the group tank's victim, raid marks) refuse exactly
+    // these and nothing a reach or combat-stuck give-up wrote. Read through
+    // AttackersValue::IsKeepoutSetAside; an explicit attack order erases the entry
+    // (CommitExplicitAttackTarget).
+    class KeepoutSetAsideValue : public ManualSetValue<std::map<ObjectGuid, uint32>& >
+    {
+    public:
+        KeepoutSetAsideValue(PlayerbotAI* ai) : ManualSetValue<std::map<ObjectGuid, uint32>& >(ai, data, "keepout set aside") {}
+
+    private:
+        std::map<ObjectGuid, uint32> data;
+    };
+
+    // Runners a bot of a dungeon run let go at a ledge, and its last navmesh
+    // read of the way to each (AttackersValue::RunnerLetGoAtLedge,
+    // RunnerFinishPolicy RunnerLedgeEntry): purged on every access and capped
+    // (PurgeRunnerBook). A book of its own, apart from "unreachable targets":
+    // that one is lifted when the mob hits the bot in sight, which a mob below
+    // the ledge can do. An explicit attack order erases the entry
+    // (CommitExplicitAttackTarget).
+    class RunnersLetGoValue : public ManualSetValue<std::map<ObjectGuid, RunnerLedgeEntry>& >
+    {
+    public:
+        RunnersLetGoValue(PlayerbotAI* ai) : ManualSetValue<std::map<ObjectGuid, RunnerLedgeEntry>& >(ai, data, "runners let go") {}
+
+    private:
+        std::map<ObjectGuid, RunnerLedgeEntry> data;
     };
 
     // The kinds (creature entries) a reach action gave up on, mapped to the time (ms) until

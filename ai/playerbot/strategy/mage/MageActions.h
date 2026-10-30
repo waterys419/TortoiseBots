@@ -10,6 +10,22 @@ namespace ai
     BUFF_ACTION(CastFrostWardAction, "frost ward");
     BUFF_ACTION(CastBlinkAction, "blink");
 
+    // Kite escape ("blink back" trigger, a live target inside 8 yd). Blink
+    // lands along the caster's facing: the core fills its destination from
+    // the orientation (TARGET_LOCATION_CASTER_FRONT_LEAP) when the spell
+    // fires, and PlayerbotAI::CastSpell simulates the same point. A mage that
+    // just cast at its target faces it, so a plain Blink jumps into the pack.
+    // Ported from mod-playerbots CastBlinkBackAction (MageActions.cpp, 79bd428):
+    // turn away from the current target, then cast. The plain "blink" (root
+    // and stun escape) keeps the current facing.
+    class CastBlinkBackAction : public CastBuffSpellAction
+    {
+    public:
+        CastBlinkBackAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "blink") {}
+        std::string getName() override { return "blink back"; }
+        bool Execute(Event& event) override;
+    };
+
     class CastFireballAction : public CastSpellAction
     {
     public:
@@ -34,6 +50,15 @@ namespace ai
         CastArcaneMissilesAction(PlayerbotAI* ai) : CastSpellAction(ai, "arcane missiles") {}
     };
 
+    // Turtle Arcane Rupture (51949-51954): direct damage that lands the
+    // self buff (52502/52588, +19% missiles, 8s). Builder half of the
+    // arcane rupture->missiles rhythm (MAG-5).
+    class CastArcaneRuptureAction : public CastSpellAction
+    {
+    public:
+        CastArcaneRuptureAction(PlayerbotAI* ai) : CastSpellAction(ai, "arcane rupture") {}
+    };
+
     class CastPyroblastAction : public CastSpellAction
     {
     public:
@@ -44,12 +69,35 @@ namespace ai
     {
     public:
         CastFlamestrikeAction(PlayerbotAI* ai) : CastSpellAction(ai, "flamestrike") {}
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
     };
 
     class CastFrostNovaAction : public CastMeleeAoeSpellAction
     {
     public:
         CastFrostNovaAction(PlayerbotAI* ai) : CastMeleeAoeSpellAction(ai, "frost nova", 10.0f) {}
+        // Donor CastFrostNovaAction::isUseful (MageActions.cpp): skip the
+        // cast when the target is already frozen or immune to the freeze,
+        // so the GCD goes to damage instead of a wasted nova.
+        bool isUseful() override
+        {
+            if (!CastMeleeAoeSpellAction::isUseful())
+                return false;
+            Unit* target = GetTarget();
+            if (!target || !target->IsInWorld() || sServerFacade.IsFrozen(target))
+                return false;
+            if (SpellEntry const* spellInfo = sServerFacade.LookupSpellInfo(GetSpellID()))
+            {
+                for (int32 i = EFFECT_INDEX_0; i <= EFFECT_INDEX_2; ++i)
+                {
+                    if (target->IsImmuneToSpellEffect(spellInfo, (SpellEffectIndex)i, false))
+                        return false;
+                }
+            }
+            return true;
+        }
     };
 
 	class CastFrostboltAction : public CastSpellAction
@@ -102,7 +150,7 @@ namespace ai
 		CastCombustionAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "combustion") {}
 	};
 
-    BEGIN_SPELL_ACTION(CastCounterspellAction, "counterspell")
+    BEGIN_INTERRUPT_SPELL_ACTION(CastCounterspellAction, "counterspell")
     END_SPELL_ACTION()
 
     class CastRemoveCurseOnPartyAction : public CurePartyMemberAction
@@ -151,36 +199,47 @@ namespace ai
             return false;
         }
 
+        // Conjuring with a gem already in the bags only wastes the cast:
+        // skip when any rank is held. No item-cheat gate here on purpose:
+        // cheat-holding hires (pool-classified accounts) must still restock
+        // real gems, otherwise the in-combat gem row starves (or fires
+        // virtual uses that fail). The cheat still covers the use path.
+        bool isUseful() override
+        {
+            const std::vector<uint32> manaGemIds = { 5514, 5513, 8007, 8008 };
+            for (const uint32 manaGemId : manaGemIds)
+            {
+                if (bot->HasItemCount(manaGemId, 1))
+                    return false;
+            }
+            return true;
+        }
+
         bool isPossible() override
         {
-            if (!ai->HasCheat(BotCheatMask::item))
+            const uint32 level = bot->GetLevel();
+            spellId = 0;
+            if (level >= 28 && level < 38)
             {
-                const uint32 level = bot->GetLevel();
-                spellId = 0;
-                if (level >= 28 && level < 38)
-                {
-                    spellId = 759;
-                }
-                else if (level >= 38 && level < 48)
-                {
-                    spellId = 3552;
-                }
-                else if (level >= 48 && level < 58)
-                {
-                    spellId = 10053;
-                }
-                else if (level >= 58)
-                {
-                    spellId = 10054;
-                }
-
-                if (!spellId)
-                    return false;
-
-                return ai->CanCastSpell(spellId, bot, 0);
+                spellId = 759;
+            }
+            else if (level >= 38 && level < 48)
+            {
+                spellId = 3552;
+            }
+            else if (level >= 48 && level < 58)
+            {
+                spellId = 10053;
+            }
+            else if (level >= 58)
+            {
+                spellId = 10054;
             }
 
-            return false;
+            if (!spellId)
+                return false;
+
+            return ai->CanCastSpell(spellId, bot, 0);
         }
 
     private:
@@ -227,14 +286,22 @@ namespace ai
             if (bot->HasSpell(28272))
                 polySpells.push_back("polymorph: pig");
 
-            return ai->CastSpell(polySpells[urand(0, polySpells.size() - 1)], GetTarget());
-        }
-    };
+            Unit* target = GetTarget();
+            if (!target)
+                return false;
 
-    class CastLesserInvisibilityAction : public CastBuffSpellAction
-    {
-    public:
-        CastLesserInvisibilityAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "lesser invisibility") {}
+            // Same contract as CastSpellAction::Execute: the action duration
+            // is the cast time, so the engine sleeps through the cast bar.
+            // The old wait-for-spell cast left the default 100 ms duration,
+            // the engine woke mid-cast, another action cancelled the sheep and
+            // the trigger restarted it (4-5 Polymorph starts a second).
+            uint32 spellDuration = sPlayerbotAIConfig.globalCoolDown;
+            bool executed = ai->CastSpell(polySpells[urand(0, polySpells.size() - 1)], target, nullptr, false, &spellDuration);
+            if (executed)
+                SetDuration(spellDuration);
+
+            return executed;
+        }
     };
 
 	class CastEvocationAction : public CastSpellAction
@@ -242,6 +309,11 @@ namespace ai
 	public:
 	    CastEvocationAction(PlayerbotAI* ai) : CastSpellAction(ai, "evocation") {}
 	    virtual std::string GetTargetName() override { return "self target"; }
+	    // Self-channel mana return, not a threat event: the inherited
+	    // CastSpellAction SINGLE type lets the high-threat veto zero it
+	    // (live H8: vetoed on the ticks the mage needed it most). Same
+	    // precedent as CastBuffSpellAction's threat-None self casts.
+	    virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
 	};
 
     class CastCounterspellOnEnemyHealerAction : public CastSpellOnEnemyHealerAction
@@ -310,12 +382,27 @@ namespace ai
     {
     public:
         CastArcaneExplosionAction(PlayerbotAI* ai) : CastMeleeAoeSpellAction(ai, "arcane explosion", 10.0f) {}
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
     };
 
     class CastConeOfColdAction : public CastMeleeAoeSpellAction
     {
     public:
         CastConeOfColdAction(PlayerbotAI* ai) : CastMeleeAoeSpellAction(ai, "cone of cold", 10.0f) {}
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
+        // Donor CastConeOfColdAction::isUseful: a cone only hits what the
+        // caster faces. Refuse cast while turned away so the GCD goes to a
+        // nuke instead of an empty cone (range gate stays in the base).
+        bool isUseful() override
+        {
+            if (!CastMeleeAoeSpellAction::isUseful())
+                return false;
+            return AI_VALUE2(bool, "facing", "current target");
+        }
     };
 
     class CastBlastWaveAction : public CastMeleeAoeSpellAction
@@ -329,43 +416,43 @@ namespace ai
     public:
         UseManaGemAction(PlayerbotAI* ai) : UseItemIdAction(ai, "mana gem") {}
 
+        // MAG-9: gems are for staying in the fight, not for topping up
+        // between pulls (donor gates every rank on in-combat). Has-item is
+        // already covered by UseItemIdAction::isPossible.
+        bool isUseful() override
+        {
+            if (!UseItemIdAction::isUseful())
+                return false;
+            return AI_VALUE2(bool, "combat", "self target");
+        }
+
         uint32 GetItemId() override
         {
-            uint32 itemId = 0;
+            // Real gems first: a virtual (item-cheat) use without the item
+            // in the bags fails at cast time, so cheat-holders with a
+            // conjured gem must spend the real one. The virtual id stays as
+            // the fallback for pool bots that carry nothing.
+            const std::vector<uint32> manaGemIds = { 8008, 8007, 5513, 5514 };
+            for (const uint32 manaGemId : manaGemIds)
+            {
+                if (bot->HasItemCount(manaGemId, 1))
+                    return manaGemId;
+            }
+
             if (ai->HasCheat(BotCheatMask::item))
             {
                 const uint32 level = bot->GetLevel();
                 if (level >= 28 && level < 38)
-                {
-                    itemId = 5514;
-                }
+                    return 5514;
                 else if (level >= 38 && level < 48)
-                {
-                    itemId = 5513;
-                }
+                    return 5513;
                 else if (level >= 48 && level < 58)
-                {
-                    itemId = 8007;
-                }
+                    return 8007;
                 else if (level >= 58)
-                {
-                    itemId = 8008;
-                }
-            }
-            else
-            {
-                const std::vector<uint32> manaGemIds = { 8008, 8007, 5513, 5514 };
-                for (const uint32 manaGemId : manaGemIds)
-                {
-                    if (bot->HasItemCount(manaGemId, 1))
-                    {
-                        itemId = manaGemId;
-                        break;
-                    }
-                }
+                    return 8008;
             }
 
-            return itemId;
+            return 0;
         }
     };
 

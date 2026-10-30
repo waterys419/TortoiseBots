@@ -12,17 +12,17 @@ public:
     {
         creators["omen of clarity"] = &omen_of_clarity;
         creators["shred"] = &shred;
-        creators["mangle (cat)"] = &mangle_cat;
         creators["powershift"] = &powershift;
+        creators["innervate"] = &innervate;
     }
 
 private:
 
     ACTION_NODE_P(omen_of_clarity, "omen of clarity", "caster form");
 
-    ACTION_NODE_A(shred, "shred", "mangle (cat)");
+    ACTION_NODE_P(innervate, "innervate", "caster form");
 
-    ACTION_NODE_A(mangle_cat, "mangle (cat)", "claw");
+    ACTION_NODE_A(shred, "shred", "claw");
 
     ACTION_NODE_A(pounce, "pounce", "ravage");
 
@@ -44,13 +44,10 @@ public:
         creators["pounce"] = &pounce;
         creators["ravage"] = &ravage;
         creators["shred"] = &shred;
-        creators["mangle (cat)"] = &mangle_cat;
     }
 
 private:
-    ACTION_NODE_A(shred, "shred", "mangle (cat)");
-
-    ACTION_NODE_A(mangle_cat, "mangle (cat)", "claw");
+    ACTION_NODE_A(shred, "shred", "claw");
 
     ACTION_NODE_A(pounce, "pounce", "ravage");
 
@@ -77,6 +74,10 @@ void DpsFeralDruidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
         NextAction::array(0, new NextAction("rebirth", ACTION_EMERGENCY), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "medium threat",
+        NextAction::array(0, new NextAction("cower", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("regrowth", ACTION_CRITICAL_HEAL + 1),
                              new NextAction("healing touch", ACTION_CRITICAL_HEAL), NULL)));
@@ -85,21 +86,54 @@ void DpsFeralDruidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
         "low health",
         NextAction::array(0, new NextAction("regrowth", ACTION_MEDIUM_HEAL), NULL)));
 
+    // mod-playerbots parity (DRU-3): the cat feeds Innervate to a thirsty
+    // group healer. The innervate action already targets the lowest-mana
+    // party healer (manual .bot boost wins); this row just fires it.
+    // Below cower, above the rotation — a living healer outranks combo
+    // points. The innervate node shifts to caster form first.
+    triggers.push_back(new TriggerNode(
+        "healer low mana",
+        NextAction::array(0, new NextAction("innervate", ACTION_HIGH - 1), NULL)));
+
+    // Manual .bot boost assignments work for cats too: the innervate
+    // trigger watches "boost targets", so an explicit order fires even
+    // when no healer is low (player control beats automation).
+    triggers.push_back(new TriggerNode(
+        "innervate",
+        NextAction::array(0, new NextAction("innervate", ACTION_HIGH - 1), NULL)));
+
     triggers.push_back(new TriggerNode(
         "faerie fire (feral)",
         NextAction::array(0, new NextAction("faerie fire (feral)", ACTION_NORMAL + 5), NULL)));
 
+    // mod-playerbots parity (DRU-5): execute-bite outranks everything
+    // below (a dying target dies now); strictly above the faerie-fire row
+    // at +5 since ties keep the first-pushed basket. Timed bite replaces
+    // the old flat-CP5 row below rip, so: execute > rip > timed bite.
     triggers.push_back(new TriggerNode(
-        "ferocious bite",
+        "ferocious bite execute",
+        NextAction::array(0, new NextAction("ferocious bite", ACTION_NORMAL + 6), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "ferocious bite time",
         NextAction::array(0, new NextAction("ferocious bite", ACTION_NORMAL + 3), NULL)));
+
+    // mod-playerbots parity (DRU-4): spend Omen of Clarity procs on a free
+    // Shred — free combo points above the whole finisher/builder ladder
+    // (and above the faerie-fire row at +5: ties keep the first-pushed
+    // basket, so the proc must strictly outrank the debuff refresh).
+    triggers.push_back(new TriggerNode(
+        "clearcasting",
+        NextAction::array(0, new NextAction("shred", ACTION_NORMAL + 6), NULL)));
 
     triggers.push_back(new TriggerNode(
         "behind target",
         NextAction::array(0, new NextAction("shred", ACTION_NORMAL + 1), NULL)));
 
+    // Claw is the 1.12 builder here: Turtle has no Mangle (Cat) spell.
     triggers.push_back(new TriggerNode(
         "not behind target",
-        NextAction::array(0, new NextAction("mangle (cat)", ACTION_NORMAL), NULL)));
+        NextAction::array(0, new NextAction("claw", ACTION_NORMAL), NULL)));
 }
 
 void DpsFeralDruidStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -210,9 +244,15 @@ void DpsFeralDruidRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
     DpsFeralDruidStrategy::InitCombatTriggers(triggers);
     DruidRaidStrategy::InitCombatTriggers(triggers);
 
+    // Same finisher rows as the pve/pvp variants: dungeons count as raid
+    // (IsInRaid), so without these a cat in any instance never rips.
     triggers.push_back(new TriggerNode(
-        "medium threat",
-        NextAction::array(0, new NextAction("cower", ACTION_HIGH), NULL)));
+        "rip",
+        NextAction::array(0, new NextAction("rip", ACTION_NORMAL + 4), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "rake",
+        NextAction::array(0, new NextAction("rake", ACTION_NORMAL + 2), NULL)));
 }
 
 void DpsFeralDruidRaidStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -235,11 +275,8 @@ void DpsFeralDruidRaidStrategy::InitDeadTriggers(std::list<TriggerNode*>& trigge
 
 void DpsFeralDruidAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // Cat form has no area attack on 1.12: Swipe is a bear-form spell.
     DruidAoeStrategy::InitCombatTriggers(triggers);
-
-    triggers.push_back(new TriggerNode(
-        "melee medium aoe",
-        NextAction::array(0, new NextAction("swipe (cat)", ACTION_HIGH), NULL)));
 }
 
 void DpsFeralDruidAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -581,15 +618,16 @@ public:
         if ((actionName == "unstealth") ||
             (actionName == "check stealth") ||
             (actionName == "claw") ||
-            (actionName == "mangle (cat)") ||
             (actionName == "pounce") ||
             (actionName == "ravage") ||
             (actionName == "shred") ||
             (actionName == "food") ||
             (actionName == "drink") ||
+            (actionName == "bg leave") || // leaving a finished battleground, as for rogues
             (actionName == "dps assist") ||
             (actionName == "select new target") ||
             (actionName == "follow") ||
+            (actionName == "release pull hold") ||
             (actionName == "reach melee") ||
             (actionName == "set behind") ||
             (actionName == "set combat state") ||
@@ -597,6 +635,15 @@ public:
             (actionName == "set dead state") ||
             (actionName == "update pvp strats") ||
             (actionName == "update pve strats") ||
+            // Battleground play, as the rogue list allows it: without these a prowling
+            // druid could neither take an objective nor chase a carrier or a player.
+            (actionName == "bg status") ||
+            (actionName == "bg move to start") ||
+            (actionName == "bg move to objective") ||
+            (actionName == "bg check objective") ||
+            (actionName == "bg check flag") ||
+            (actionName == "attack enemy flag carrier") ||
+            (actionName == "attack enemy player") ||
             (actionName == "update raid strats"))
         {
             return 1.0f;
@@ -613,7 +660,11 @@ void DpsFeralDruidStealthedStrategy::InitCombatMultipliers(std::list<Multiplier*
 
 void DpsFeralDruidStealthedStrategy::InitNonCombatMultipliers(std::list<Multiplier*>& multipliers)
 {
-    DpsFeralDruidStealthedStrategy::InitCombatMultipliers(multipliers);
+    // No whitelist out of combat. The druid non-combat engine has no "stealth"
+    // strategy, so nothing there ever runs "check stealth" or "unstealth": a druid
+    // that left combat while prowling kept this whitelist, which blocks travel,
+    // grind and rpg, and stood still until the stall relog (~45 min). Prowl only
+    // gates combat openers, as in mod-playerbots, where prowl is a plain buff.
 }
 
 void DpsFeralDruidPowershiftStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

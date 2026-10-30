@@ -18,8 +18,12 @@ namespace ai
         static bool CanPetAttack(PlayerbotAI* ai, Pet* pet, Unit* target);
 
     protected:
-        bool Attack(Player* requester, Unit* target);
-        bool IsTargetValid(Player* requester, Unit* target);
+        // acceptCurrentVictim: an explicit order (attack my target, RTI) on the
+        // victim the bot already attacks counts as done instead of failed.
+        bool Attack(Player* requester, Unit* target, float maxDistance = 0.0f, bool acceptCurrentVictim = false);
+        // Whether an attack order arms the melee auto-attack for this bot.
+        bool ArmsMeleeSwing();
+        bool IsTargetValid(Player* requester, Unit* target, float maxDistance = 0.0f);
 
 #ifdef GenerateBotHelp
         virtual std::string GetHelpName() { return "attack"; }

@@ -13,6 +13,7 @@ public:
         creators["frostbolt"] = &frostbolt;
         creators["frost nova"] = &frost_nova;
         creators["evocation"] = &evocation;
+        creators["mana gem"] = &mana_gem;
         creators["remove curse"] = &remove_curse;
         creators["remove curse on party"] = &remove_curse_on_party;
         creators["blast wave"] = &blast_wave;
@@ -21,11 +22,27 @@ public:
     }
 
 private:
-    ACTION_NODE_A(frostbolt, "frostbolt", "shoot");
+    // No "shoot" alternative: Frostbolt is refused "not ready" by every
+    // GCD, and on Turtle each wand shot renews the GCD, so one fallback
+    // kept the wand going (Zul'Farrak: frost mages wanded 30-33% of the
+    // fight at 76-83% mana). Out of mana the "no mana" row wands.
+    static ActionNode* frostbolt(PlayerbotAI* ai)
+    {
+        return new ActionNode("frostbolt",
+            /*P*/ NULL,
+            /*A*/ NULL,
+            /*C*/ NULL);
+    }
 
     ACTION_NODE_A(frost_nova, "frost nova", "cone of cold");
 
     ACTION_NODE_A(evocation, "evocation", "mana potion");
+
+    // Gem spent or on cooldown must not end mana recovery: fall through
+    // to the potion (then its drink alt) instead of leaving the bot with
+    // nothing until Evocation cools down. Live H8: the gem row without a
+    // fallback left mages wanding below 5% once gem + evo were spent.
+    ACTION_NODE_A(mana_gem, "mana gem", "mana potion");
 
     ACTION_NODE_A(remove_curse, "remove curse", "remove lesser curse");
 
@@ -62,12 +79,29 @@ void MageStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "blink",
         NextAction::array(0, new NextAction("blink", ACTION_EMERGENCY), NULL)));
 
+    // Kite escape below the root/stun blink and the frost-nova pack root:
+    // a live melee mob inside 8 yd eats a blink, then the nuke loop resumes.
+    // "blink back" turns away from the target first (plain Blink goes the
+    // way the mage faces, which is at its target).
     triggers.push_back(new TriggerNode(
-        "low mana",
+        "blink back",
+        NextAction::array(0, new NextAction("blink back", ACTION_HIGH + 5), NULL)));
+
+    // MAG-9: burn the gem EARLY (medium mana, <40%) so it returns mana
+    // while the fight still needs it; evocation stays the <15% rescue.
+    // (Donor burns its gem below 65%; medium avoids waste in short fights.)
+    triggers.push_back(new TriggerNode(
+        "medium mana",
         NextAction::array(0, new NextAction("mana gem", ACTION_HIGH + 4), NULL)));
 
+    // Evocation arms with the gem (medium, <40%) instead of waiting for
+    // <15%: on a 7-min fight the channel must land while nukes still need
+    // the mana, not as a last rite at wand time. Live H8: the single
+    // evocation fired at ~70 s, then the row sat on cooldown-gated
+    // IMPOSSIBLE for the rest of the fight. The los/moving/cooldown gates
+    // in isPossible still refuse when it cannot run.
     triggers.push_back(new TriggerNode(
-        "low mana",
+        "medium mana",
         NextAction::array(0, new NextAction("evocation", ACTION_HIGH + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
@@ -88,6 +122,14 @@ void MageStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "no mana",
         NextAction::array(0, new NextAction("shoot", ACTION_NORMAL), NULL)));
+
+    // Each Turtle wand shot renews the GCD, so a running wand keeps every
+    // nuke "not ready" for as long as it runs. Stop it while the nuke is
+    // held back by that GCD alone (mana is there): above the nukes' rows
+    // (frostbolt/fireball NORMAL+1, scorch NORMAL+2), below the HIGH tier.
+    triggers.push_back(new TriggerNode(
+        "wand blocks nuke",
+        NextAction::array(0, new NextAction("stop wand", ACTION_NORMAL + 5), NULL)));
 }
 
 void MageStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -165,8 +207,10 @@ void MageRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassRaidStrategy::InitCombatTriggers(triggers);
 
+    // Only in a real raid group: this strategy is on in every dungeon
+    // (PlayerbotAI::IsInRaid), and a 5-man mage with aggro wanded here.
     triggers.push_back(new TriggerNode(
-        "has aggro",
+        "has aggro in raid group",
         NextAction::array(0, new NextAction("shoot", ACTION_HIGH + 9), NULL)));
 }
 
@@ -188,6 +232,12 @@ void MageRaidStrategy::InitDeadTriggers(std::list<TriggerNode*>& triggers)
 void MageAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     AoeStrategy::InitCombatTriggers(triggers);
+
+    // Pack thinned mid-channel: stop blizzard and go back to single
+    // target. Mirrors the donor row and our icicles/evocation cancels.
+    triggers.push_back(new TriggerNode(
+        "blizzard channel check",
+        NextAction::array(0, new NextAction("cancel channel", ACTION_HIGH + 3), NULL)));
 }
 
 void MageAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -240,6 +290,14 @@ void MageBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "low health",
         NextAction::array(0, new NextAction("mana shield", ACTION_HIGH), NULL)));
+
+    // Same shape as the priest Fortitude fallback: the out-of-combat
+    // Intellect kept losing to follow on a moving master and never landed on
+    // the party in long fights. Also allow it in combat, below every heal
+    // and attack, for the quiet moments of a fight.
+    triggers.push_back(new TriggerNode(
+        "arcane intellect on party",
+        NextAction::array(0, new NextAction("arcane intellect on party", ACTION_DEFAULT), NULL)));
 }
 
 void MageBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -271,6 +329,14 @@ void MageBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "often",
         NextAction::array(0, new NextAction("apply oil", ACTION_NORMAL), NULL)));
+
+    // Mana-gem supply: the "no mana gem" trigger never pushes live (zero
+    // pushes in full bot logs), so re-stock on the always-evaluating
+    // "often" pulse instead. The action's own possession gate keeps it
+    // quiet while any rank is held, and all specs inherit this base.
+    triggers.push_back(new TriggerNode(
+        "often",
+        NextAction::array(0, new NextAction("conjure mana gem", ACTION_NORMAL), NULL)));
 }
 
 void MageBuffPvpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -363,8 +429,10 @@ void MageCcStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     CcStrategy::InitCombatTriggers(triggers);
 
+    // The tank's held pack must not burn the emergency cooldown: fire only
+    // when a mob within nova range is not on a tank.
     triggers.push_back(new TriggerNode(
-        "enemy ten yards",
+        "frost nova window",
         NextAction::array(0, new NextAction("frost nova", ACTION_EMERGENCY), NULL)));
 
     triggers.push_back(new TriggerNode(
@@ -378,6 +446,12 @@ void MageCcStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "polymorph",
         NextAction::array(0, new NextAction("polymorph", ACTION_INTERRUPT), NULL)));
+
+    // Each wand shot renews the GCD, so "polymorph" (needs the spell ready)
+    // never fires while a wand runs: stop the wand while a sheep waits.
+    triggers.push_back(new TriggerNode(
+        "wand blocks cc",
+        NextAction::array(0, new NextAction("stop wand", ACTION_INTERRUPT + 1), NULL)));
 }
 
 void MageCcStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)

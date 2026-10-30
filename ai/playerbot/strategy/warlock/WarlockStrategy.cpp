@@ -52,11 +52,25 @@ void WarlockStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 
     triggers.push_back(new TriggerNode(
         "life tap",
-        NextAction::array(0, new NextAction("life tap", ACTION_NORMAL), NULL)));
+        NextAction::array(0, new NextAction("life tap", ACTION_NORMAL + 2), NULL)));
+
+    // No combat filler for the 85% top-up band (review pr-593): engine
+    // defaults are pushed at relevance-200 ("shadow bolt" IDLE=1 lands at
+    // -199), so any trigger row would preempt the nuke and tap instead of
+    // casting on every tick mana sits at 41-84. The urgent band above is the
+    // only combat tap; the top-up band pre-taps out of combat only.
 
     triggers.push_back(new TriggerNode(
         "no mana",
         NextAction::array(0, new NextAction("shoot", ACTION_NORMAL), NULL)));
+
+    // Each Turtle wand shot renews the GCD, so a running wand keeps Shadow
+    // Bolt (and Life Tap) "not ready" for as long as it runs. Stop it once
+    // Shadow Bolt is held back by that GCD alone (mana is back): above the
+    // corruption/life tap rows, below the HIGH tier, like the mage row.
+    triggers.push_back(new TriggerNode(
+        "wand blocks nuke",
+        NextAction::array(0, new NextAction("stop wand", ACTION_NORMAL + 5), NULL)));
 }
 
 void WarlockStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -84,7 +98,22 @@ void WarlockStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 
     triggers.push_back(new TriggerNode(
         "no soulstone",
-        NextAction::array(0, new NextAction("create soulstone", ACTION_NORMAL), NULL)));
+        // One above the healthstone / weapon stones: a warlock with a single
+        // shard spends it on the stone the group's healer needs first.
+        NextAction::array(0, new NextAction("create soulstone", ACTION_NORMAL + 1), NULL)));
+
+    // Donor-parity pre-tap (WAR-5): top up to near-full mana between pulls
+    // while health allows. Both bands at 9: above drink (6)/loot (6) so the
+    // bot taps instead of drinking away its health advantage, below stones
+    // (10). The urgent band (mana<=medium) needs its own row: the top-up
+    // trigger only covers 41-84.
+    triggers.push_back(new TriggerNode(
+        "life tap",
+        NextAction::array(0, new NextAction("life tap", ACTION_NORMAL - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "life tap top-up",
+        NextAction::array(0, new NextAction("life tap", ACTION_NORMAL - 1), NULL)));
 
     /*
     triggers.push_back(new TriggerNode(
@@ -163,8 +192,9 @@ void WarlockRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassRaidStrategy::InitCombatTriggers(triggers);
 
+    // Only in a real raid group, as for the mage (MageStrategy.cpp).
     triggers.push_back(new TriggerNode(
-        "has aggro",
+        "has aggro in raid group",
         NextAction::array(0, new NextAction("shoot", ACTION_HIGH + 9), NULL)));
 }
 
@@ -198,6 +228,10 @@ void WarlockAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "corruption on attacker",
         NextAction::array(0, new NextAction("corruption on attacker", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "immolate on attacker",
+        NextAction::array(0, new NextAction("immolate on attacker", ACTION_HIGH - 1), NULL)));
 }
 
 void WarlockAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -255,6 +289,16 @@ void WarlockBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& trigger
     triggers.push_back(new TriggerNode(
         "soulstone",
         NextAction::array(0, new NextAction("soulstone", ACTION_NORMAL + 1), NULL)));
+
+    // Swim-gated water breathing (WAR-6, donor parity): only fires while
+    // the bot swims, self first, then the party.
+    triggers.push_back(new TriggerNode(
+        "unending breath",
+        NextAction::array(0, new NextAction("unending breath", ACTION_NORMAL + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "unending breath on party",
+        NextAction::array(0, new NextAction("unending breath on party", ACTION_NORMAL), NULL)));
 
     triggers.push_back(new TriggerNode(
         "often",
@@ -362,14 +406,27 @@ void WarlockCcStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "death coil on snare target",
         NextAction::array(0, new NextAction("death coil on snare target", ACTION_INTERRUPT + 3), NULL)));
-
     triggers.push_back(new TriggerNode(
         "banish",
         NextAction::array(0, new NextAction("banish on cc", ACTION_INTERRUPT + 2), NULL)));
 
+    // PET-2: below fear so the owner's fear wins ties; the succubus gate in
+    // isUseful keeps this silent without a succubus out.
+    triggers.push_back(new TriggerNode(
+        "seduction",
+        NextAction::array(0, new NextAction("seduction on cc", ACTION_INTERRUPT), NULL)));
+
     triggers.push_back(new TriggerNode(
         "fear",
         NextAction::array(0, new NextAction("fear on cc", ACTION_INTERRUPT + 1), NULL)));
+
+    // Each wand shot renews the GCD, so "banish" and "fear" (they need the
+    // spell ready) never fire while a wand runs: stop the wand while one
+    // waits. Above both rows; the higher interrupt rows are not ready under
+    // the wand GCD either, or are the felhunter's.
+    triggers.push_back(new TriggerNode(
+        "wand blocks cc",
+        NextAction::array(0, new NextAction("stop wand", ACTION_INTERRUPT + 3), NULL)));
 }
 
 void WarlockCcStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -425,6 +482,29 @@ void WarlockPetStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "spell lock enemy healer",
         NextAction::array(0, new NextAction("spell lock", ACTION_INTERRUPT + 2), NULL)));
+
+    // Felhunter utility: strip a magic buff off the enemy, or lift magic off
+    // a party member. Both actions refuse to fire without a Felhunter out
+    // (entry gate in isUseful), so other demons idle here safely.
+    triggers.push_back(new TriggerNode(
+        "devour magic purge",
+        NextAction::array(0, new NextAction("devour magic purge", ACTION_DISPEL + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "devour magic cleanse",
+        NextAction::array(0, new NextAction("devour magic cleanse", ACTION_DISPEL), NULL)));
+    // PET-6: sustain the demon mid-fight. Below the interrupt kit and the
+    // pet attack — keeping the pet alive never outranks using it.
+    triggers.push_back(new TriggerNode(
+        "health funnel",
+        NextAction::array(0, new NextAction("health funnel", ACTION_NORMAL + 1), NULL)));
+    // Raid stamina: re-cast Blood Pact mid-fight when the aura drops
+    // (resummon, out of range, dispel). The action refuses without a live
+    // imp in range and while anyone already holds the aura; below the
+    // funnel row so a dying pet is healed before it is buffed.
+    triggers.push_back(new TriggerNode(
+        "often",
+        NextAction::array(0, new NextAction("blood pact", ACTION_NORMAL), NULL)));
 }
 
 void WarlockPetStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -442,6 +522,12 @@ void WarlockPetStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers
     triggers.push_back(new TriggerNode(
         "new pet",
         NextAction::array(0, new NextAction("set pet stance", ACTION_NORMAL), NULL)));
+
+    // PET-8c: hurt Voidwalker heals itself between pulls (NC-only; the
+    // channel breaks on damage so combat would waste it).
+    triggers.push_back(new TriggerNode(
+        "consume shadows",
+        NextAction::array(0, new NextAction("consume shadows", ACTION_NORMAL), NULL)));
 }
 
 void WarlockPetPvpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -464,10 +550,39 @@ void WarlockPetPveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
     triggers.push_back(new TriggerNode(
         "has aggro",
         NextAction::array(0, new NextAction("torment", ACTION_HIGH), NULL)));
+
+    // PET-8a: AoE taunt when the Voidwalker tanks a pack solo. Same prio as
+    // the single-target peel; the triggers are mutually exclusive in
+    // practice (pack vs single) and both refuse without a live Voidwalker.
+    triggers.push_back(new TriggerNode(
+        "suffering",
+        NextAction::array(0, new NextAction("suffering", ACTION_HIGH), NULL)));
 }
 
 void WarlockPetPveStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // Spec-fitting pet (opt-in, AiPlayerbot.WarlockPetBySpec): one row per
+    // demon above the Voidwalker default, so a petless or mismatched warlock
+    // gets the demon runtime/WarlockPetPolicy.h picks for its spec. Each
+    // trigger stands down on its own when the toggle is off, the spec is
+    // unknown, a "pet <demon>" order is set, or a shard is missing, and the
+    // rows below then behave exactly as before.
+    if (sPlayerbotAIConfig.warlockPetBySpec)
+    {
+        triggers.push_back(new TriggerNode(
+            "spec pet felhunter",
+            NextAction::array(0, new NextAction("summon felhunter", ACTION_NORMAL + 2), NULL)));
+        triggers.push_back(new TriggerNode(
+            "spec pet succubus",
+            NextAction::array(0, new NextAction("summon succubus", ACTION_NORMAL + 2), NULL)));
+        triggers.push_back(new TriggerNode(
+            "spec pet voidwalker",
+            NextAction::array(0, new NextAction("summon voidwalker", ACTION_NORMAL + 2), NULL)));
+        triggers.push_back(new TriggerNode(
+            "spec pet imp",
+            NextAction::array(0, new NextAction("summon imp", ACTION_NORMAL + 2), NULL)));
+    }
+
     triggers.push_back(new TriggerNode(
         "no pet",
         NextAction::array(0, new NextAction("summon voidwalker", ACTION_NORMAL + 1), NULL)));
@@ -538,6 +653,13 @@ void WarlockManualPetStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& tr
     triggers.push_back(new TriggerNode(
         "often",
         NextAction::array(0, new NextAction("initialize pet", ACTION_NORMAL + 1), NULL)));
+}
+
+void WarlockCurseOfExhaustionStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
+{
+    triggers.push_back(new TriggerNode(
+        "curse of exhaustion on snare target",
+        NextAction::array(0, new NextAction("curse of exhaustion on snare target", ACTION_HIGH), NULL)));
 }
 
 void WarlockManualCurseStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

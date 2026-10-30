@@ -103,9 +103,61 @@ namespace ai
         bool IsActive() override;
     };
 
-    // Universal raid survival: 4H-style mark rotation. The Four Horsemen
-    // marks (28832 Thane, 28833 Blaumeux, 28834 Mograine, 28835 Zeliek)
-    // stack to lethal; at 3+ stacks the carrier must rotate out.
+    // Per-boss resist auras (mod-playerbots parity, fight-agnostic):
+    // while ANY attacker matches the fire/shadow boss list, paladins swap
+    // to the matching resistance aura. Paladin-gated first (cheap class
+    // check filters out most of the raid, mirroring the donor), then a
+    // bounded attacker-list scan for boss entries — no world scan.
+    class BossWantsFireAuraTrigger : public Trigger
+    {
+    public:
+        BossWantsFireAuraTrigger(PlayerbotAI* ai, std::string name = "boss wants fire aura", int checkInterval = 5)
+        : Trigger(ai, name, checkInterval) {}
+        bool IsActive() override;
+    };
+
+    class BossWantsShadowAuraTrigger : public Trigger
+    {
+    public:
+        BossWantsShadowAuraTrigger(PlayerbotAI* ai, std::string name = "boss wants shadow aura", int checkInterval = 5)
+        : Trigger(ai, name, checkInterval) {}
+        bool IsActive() override;
+    };
+
+    // True while the bot carries an explicit "aura ..." order in either
+    // engine. The swap stays out of the way, and so does the restore.
+    bool HasManualPaladinAuraOverride(PlayerbotAI* ai);
+
+    // Fight over for a paladin that made the resist swap: alive and out of
+    // combat (boss dead, wipe, or the raid walked out). Non-combat only.
+    class ResistAuraSwapOverTrigger : public Trigger
+    {
+    public:
+        ResistAuraSwapOverTrigger(PlayerbotAI* ai, std::string name = "resist aura swap over", int checkInterval = 2)
+        : Trigger(ai, name, checkInterval) {}
+        bool IsActive() override;
+    };
+
+    // Generic too-close-to-debuffed-player gate (donor
+    // TooCloseToPlayerWithDebuffTrigger shape): fires when a groupmate
+    // carrying spellId is inside range. The bot itself never counts (its
+    // own bomb is the carrier-side "raid bomb debuff" path).
+    class TooCloseToPlayerWithDebuffTrigger : public Trigger
+    {
+    public:
+        TooCloseToPlayerWithDebuffTrigger(PlayerbotAI* ai, std::string name, uint32 spellId, float range)
+        : Trigger(ai, name, 1)
+        , spellId(spellId)
+        , range(range) {}
+        bool IsActive() override;
+
+    private:
+        uint32 spellId;
+        float range;
+    };
+
+    // 4H mark threshold (3+ stacks of one of 28832-28835). ReactionStrategy
+    // routes it to "four horsemen rotate" (next corner clockwise).
     class FourHorsemenMarkTrigger : public Trigger
     {
     public:
@@ -135,6 +187,19 @@ namespace ai
     {
     public:
         RaidSpreadNeededTrigger(PlayerbotAI* ai, std::string name = "raid spread needed", int checkInterval = 2)
+        : Trigger(ai, name, checkInterval) {}
+        std::string GetTargetName() override { return "self target"; }
+        bool IsActive() override;
+    };
+
+    // Opt-in combat spread gate ("spread" strategy): fires when another
+    // live groupmate is inside the spread radius. Unlike the pool-only
+    // raid-spread gate above, ownership and ranged-only never gate — the
+    // player asked for spacing. Combat-only, hold orders veto.
+    class SpreadNeededTrigger : public Trigger
+    {
+    public:
+        SpreadNeededTrigger(PlayerbotAI* ai, std::string name = "spread needed", int checkInterval = 2)
         : Trigger(ai, name, checkInterval) {}
         std::string GetTargetName() override { return "self target"; }
         bool IsActive() override;
@@ -246,5 +311,16 @@ namespace ai
 
     private:
         uint32 buffID;
+    };
+
+    // In combat with a listed raid boss (ProtectionPotionPolicy.h), the
+    // matching protection potion is in the bags (or the item cheat is on),
+    // off cooldown, and its buff is not up.
+    class BossProtectionPotionReadyTrigger : public ItemReadyTrigger
+    {
+    public:
+        BossProtectionPotionReadyTrigger(PlayerbotAI* ai) : ItemReadyTrigger(ai, "boss protection potion ready", 0) {}
+
+        bool IsActive() override;
     };
 }

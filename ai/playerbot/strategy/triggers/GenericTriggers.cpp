@@ -1,38 +1,151 @@
 #include "playerbot/playerbot.h"
+#include "playerbot/BoostReadinessPolicy.h"
+#include "playerbot/GroupMembers.h"
 #include "playerbot/GroupBuffPolicy.h"
+#include "playerbot/HealerManaPolicy.h"
+#include "playerbot/MainTankPolicy.h"
+#include "playerbot/TankAddPickupPolicy.h"
+#include "playerbot/policy/combat/AoeTauntPolicy.h"
+#include "playerbot/ServerFacade.h"
+#include "playerbot/ReadyRebuffPolicy.h"
 #include "playerbot/SurvivePolicy.h"
+#include "playerbot/ForceRebuffPolicy.h"
 #include "GenericTriggers.h"
 #include "playerbot/LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/strategy/generic/PullStrategy.h"
 #include "playerbot/strategy/values/PositionValue.h"
 #include "playerbot/strategy/values/AoeValues.h"
+#include "playerbot/FourHorsemenRotationPolicy.h"
 #include "playerbot/strategy/actions/AttackAction.h"
 #include "playerbot/strategy/actions/GenericSpellActions.h"
 #include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
+#include "playerbot/strategy/values/PossibleTargetsValue.h"
+#include "playerbot/strategy/values/HazardsValue.h"
+#include "playerbot/strategy/actions/PositionAction.h"
 
 #include <regex>
 
 using namespace ai;
 
+namespace
+{
+// Recovery rows (mana gem, mana potion, evocation, innervate) must fire at
+// exactly 0 power too: that is when the bot needs them most. The shared
+// "has mana" value reads CURRENT power, so it is false at 0 and would gate
+// them off. A mana pool (max power) means the bot is a mana user regardless
+// of the current level; rage/energy classes have no mana pool and stay out.
+bool HasManaPool(Player* bot)
+{
+    return bot && bot->GetMaxPower(POWER_MANA) > 0;
+}
+}  // namespace
+
 bool NoManaTrigger::IsActive()
 {
-    return AI_VALUE2(bool, "has mana", "self target") && AI_VALUE2(uint8, "mana", "self target") < 5;
+    return HasManaPool(bot) && AI_VALUE2(uint8, "mana", "self target") < 5;
 }
 
 bool LowManaTrigger::IsActive()
 {
-    return AI_VALUE2(bool, "has mana", "self target") && AI_VALUE2(uint8, "mana", "self target") < sPlayerbotAIConfig.lowMana;
+    return HasManaPool(bot) && AI_VALUE2(uint8, "mana", "self target") < sPlayerbotAIConfig.lowMana;
 }
 
 bool MediumManaTrigger::IsActive()
 {
-    return AI_VALUE2(bool, "has mana", "self target") && AI_VALUE2(uint8, "mana", "self target") < sPlayerbotAIConfig.mediumMana;
+    return HasManaPool(bot) && AI_VALUE2(uint8, "mana", "self target") < sPlayerbotAIConfig.mediumMana;
+}
+
+bool HealerLowManaTrigger::IsActive()
+{
+    // Pure donor check (HealthTriggers.cpp:25-32): the "healer low mana"
+    // value picks the lowest-mana alive group healer; fire while that
+    // healer sits below the low-mana line. No Innervate guards here: those
+    // live in the druid action (spell known/ready, range, aura), so shaman
+    // Mana Tide rows and future batteries can share this trigger.
+    Unit* target = GetTarget();
+    if (!target || !target->GetMaxPower(POWER_MANA))
+        return false;
+
+    return ai->GetManaPercent(*target) < sPlayerbotAIConfig.lowMana;
 }
 
 bool HighManaTrigger::IsActive()
 {
-    return AI_VALUE2(bool, "has mana", "self target") && AI_VALUE2(uint8, "mana", "self target") < 65;
+    // Refill-wanted line (mana below the high-water mark): same 0-power
+    // trap as LowManaTrigger above, fixed the same way.
+    return HasManaPool(bot) && AI_VALUE2(uint8, "mana", "self target") < 65;
+}
+
+bool EnoughManaTrigger::IsActive()
+{
+    return AI_VALUE2(bool, "has mana", "self target") && AI_VALUE2(uint8, "mana", "self target") > 65;
+}
+
+bool ai::TargetFightsGroup(Player* bot, Unit* target)
+{
+    if (!bot || !target || !target->IsAlive())
+        return false;
+    Unit* const victim = target->GetVictim();
+    if (!victim)
+        return false;
+    if (victim == bot)
+        return true;
+    Player* const victimPlayer = victim->GetCharmerOrOwnerPlayerOrPlayerItself();
+    return victimPlayer && bot->IsInSameRaidWith(victimPlayer);
+}
+
+bool ai::NoGroupMemberNear(Player* bot)
+{
+    Group* const group = bot ? bot->GetGroup() : nullptr;
+    if (!group)
+        return true;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (member && member != bot && member->IsInWorld() && member->IsAlive() &&
+            member->GetMapId() == bot->GetMapId() &&
+            sServerFacade.getDistance2d(bot, member) <= sPlayerbotAIConfig.sightDistance)
+            return false;
+    }
+    return true;
+}
+
+bool ai::HealerWandAllowed(PlayerbotAI* ai, Unit* target)
+{
+    Player* const bot = ai->GetBot();
+    Group* const group = bot->GetGroup();
+    HealerWandGate gate;
+    gate.groupedHealer = group && ai->ContainsStrategy(STRATEGY_TYPE_HEAL);
+    if (!gate.groupedHealer)
+        return true;
+
+    AiObjectContext* const context = ai->GetAiObjectContext();
+    gate.targetEngaged = TargetFightsGroup(bot, target);
+    gate.aloneNear = NoGroupMemberNear(bot);
+    ObjectGuid const ordered = context->GetValue<ObjectGuid>("explicit attack target")->Get();
+    gate.explicitOrder = target && ordered && ordered == target->GetObjectGuid();
+    gate.healOnly = ai->RunHealOnly();
+    gate.noMana = context->GetValue<bool>("has mana", "self target")->Get() &&
+        context->GetValue<uint8>("mana", "self target")->Get() < 5;
+    gate.pullHold = ai->HasPullWindow() && !gate.explicitOrder;
+
+    // The heal rows' own lines: the party below almost full (the "healer
+    // should wand" line), the healer itself below low health (its self-heal
+    // rows). Members in the "party member to heal" candidate reach only
+    // (twice the heal range, PartyMemberToHeal::Check).
+    gate.memberNeedsHeal = bot->GetHealthPercent() < sPlayerbotAIConfig.lowHealth;
+    float const reach = 2.0f * (bot->InBattleGround() ? sPlayerbotAIConfig.healDistanceBg : ai->GetRange("heal"));
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (gate.memberNeedsHeal)
+            break;
+        if (!member || member == bot || !member->IsInWorld() || !member->IsAlive() ||
+            member->GetMapId() != bot->GetMapId() || sServerFacade.getDistance2d(bot, member) > reach)
+            continue;
+        gate.memberNeedsHeal = member->GetHealthPercent() < sPlayerbotAIConfig.almostFullHealth;
+    }
+
+    return HealerMayWand(gate);
 }
 
 bool HealerShouldAttackTrigger::IsActive()
@@ -40,17 +153,127 @@ bool HealerShouldAttackTrigger::IsActive()
     if (!bot->GetGroup())
         return true;
 
+    // Ordered pull hold: while the pull's own join window runs, the healer
+    // heals but never opens fire (a pullback parks the party at the anchor
+    // while the tank walks the mob in). A player-placed "wait for attack"
+    // without a pull window still allows damage, as before.
+    if (ai->HasPullWindow())
+        return false;
+
+    // Donor escape (mod-playerbots GenericTriggers.cpp:348): nobody of the
+    // group near, the healer fights like a solo bot.
+    if (NoGroupMemberNear(bot))
+        return true;
+
+    // The run leader's healer heals and casts no damage spell (Holy Fire,
+    // Smite, Mind Blast, the wand; PlayerbotAI::RunHealOnly).
+    if (ai->RunHealOnly())
+        return false;
+
     if (AI_VALUE2(uint8, "health", "party member to heal") < sPlayerbotAIConfig.almostFullHealth)
+        return false;
+
+    // Never open on a fresh mob (HealerManaPolicy.h): the healer pulls it.
+    // An explicit attack order on that mob (`cmd attack <guid> <Healer>`)
+    // counts as engaged: player control first.
+    Unit* const target = AI_VALUE(Unit*, "current target");
+    ObjectGuid const ordered = AI_VALUE(ObjectGuid, "explicit attack target");
+    bool const engaged = TargetFightsGroup(bot, target) ||
+        (target && ordered && ordered == target->GetObjectGuid());
+    if (!HealerDamageTargetAllowed(true, target != nullptr, engaged))
         return false;
 
     if (!checkMana)
         return true;
 
-    // Easy fights (low balance) keep a large reserve; hard ones allow more.
-    // 65 is the "high mana" line used by HighManaTrigger.
-    uint8 balance = AI_VALUE(uint8, "balance");
-    uint32 manaThreshold = balance <= 50 ? 85 : (balance <= 100 ? 65 : sPlayerbotAIConfig.mediumMana);
-    return !AI_VALUE2(bool, "has mana", "self target") || AI_VALUE2(uint8, "mana", "self target") >= manaThreshold;
+    // Balance-scaled reserve (HealerManaPolicy.h): hard fights (low balance)
+    // keep 85 %, even and easy ones 70 % - deliberately above the donor's
+    // 65 % / 40 % (owner decision 2026-10-12). Raids keep 95 %: a
+    // minutes-long mana burn with no drink break must not spend healer
+    // mana on shocks and bolts (live Patchwerk 2026-10-14: resto at
+    // 4-9 % while the gate kept firing).
+    if (bot->GetGroup()->isRaidGroup())
+        return !AI_VALUE2(bool, "has mana", "self target") ||
+            AI_VALUE2(uint8, "mana", "self target") >= HealerDpsManaFloorRaid();
+    return HealerDpsManaAllows(AI_VALUE2(bool, "has mana", "self target"),
+        AI_VALUE2(uint8, "mana", "self target"), AI_VALUE(uint8, "balance"));
+}
+
+bool WandBlocksCastTrigger::IsWanding()
+{
+    Spell* autoRepeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL);
+    return autoRepeat && autoRepeat->m_spellInfo && autoRepeat->m_spellInfo->Category == WAND_SHOOT_CATEGORY;
+}
+
+WandSpellProbe WandBlocksCastTrigger::ProbeSpell(std::string const& spell, Unit* target, bool checkForm)
+{
+    SpellCastResult result = SPELL_FAILED_DONT_REPORT;
+    bool const castable = ai->CanCastSpell(spell, target, 0, nullptr, true, false, false, &result);
+    bool const notReady = !castable && result == SPELL_FAILED_NOT_READY;
+    if (!castable && !notReady)
+        return WandSpellProbe::Blocked;
+    return ClassifyWandSpellProbe(castable, notReady, CastBlockers(spell, target, checkForm));
+}
+
+WandCastBlockers WandBlocksCastTrigger::CastBlockers(std::string const& spell, Unit* target, bool checkForm)
+{
+    WandCastBlockers blockers;
+    uint32 const spellId = AI_VALUE2(uint32, "spell id", spell);
+    SpellEntry const* spellInfo = spellId ? sServerFacade.LookupSpellInfo(spellId) : nullptr;
+    if (!spellInfo)
+        return blockers;
+
+    // Spell::CheckCasterAuras: silence and the school lockout of a
+    // Counterspell-like interrupt (Unit::IsSpellProhibited), pacify.
+    uint32 const unitFlags = bot->GetUInt32Value(UNIT_FIELD_FLAGS);
+    if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_SILENCE)
+    {
+        blockers.silenced = (unitFlags & UNIT_FLAG_SILENCED) != 0;
+        blockers.lockedOut = bot->IsSpellProhibited(spellInfo);
+    }
+    else if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_PACIFY)
+        blockers.silenced = (unitFlags & UNIT_FLAG_PACIFIED) != 0;
+
+    // Player::ProhibitSpellSchool puts every spell of the school on its own
+    // cooldown, and the bot-side check reports that as NOT_READY too. The
+    // GCD is kept apart (GlobalCooldownMgr), so this is never the wand.
+    if (bot->HasSpellCooldown(spellId))
+        blockers.lockedOut = true;
+
+    // Spell::CheckCast form check (e.g. Smite and heals in Shadowform).
+    if (checkForm)
+        blockers.wrongForm = spellInfo->GetErrorAtShapeshiftedCast(bot->GetShapeshiftForm()) != SPELL_CAST_OK;
+
+    // Spell::CheckCast line-of-sight check, for a target other than the caster.
+    if (target && target != bot && !(spellInfo->AttributesEx2 & SPELL_ATTR_EX2_IGNORE_LOS))
+        blockers.noLineOfSight = !sServerFacade.IsWithinLOSInMap(bot, target);
+
+    return blockers;
+}
+
+bool WandBlocksCastTrigger::NoManaRowActive()
+{
+    // Same 0-power trap as NoManaTrigger above: at exactly 0 the shared
+    // "has mana" value is false, so mirror the pool check or "stop wand"
+    // would ping-pong against the "no mana" -> shoot row it guards.
+    return HasManaPool(bot) && AI_VALUE2(uint8, "mana", "self target") < 5;
+}
+
+bool WandBlocksCastTrigger::RaidAggroWand()
+{
+    Group* group = bot->GetGroup();
+    return RaidAggroWandRow(group && group->isRaidGroup(), AI_VALUE2(bool, "has aggro", "current target"));
+}
+
+bool WandBlocksCastTrigger::ThreatVetoesNuke()
+{
+    // Mirrors ThreatMultiplier::GetValue (ThreatStrategy.cpp) for a
+    // single-target damage spell.
+    if (!ai->HasStrategy("threat", BotState::BOT_STATE_COMBAT))
+        return false;
+    if (AI_VALUE(bool, "neglect threat") || !AI_VALUE(bool, "group"))
+        return false;
+    return AI_VALUE2(bool, "trigger active", "high threat");
 }
 
 bool AlmostFullManaTrigger::IsActive()
@@ -75,6 +298,14 @@ bool ComboPointsAvailableTrigger::IsActive()
 
 bool LoseAggroTrigger::IsActive()
 {
+    // Players have no threat list: against an enemy player `has aggro` is
+    // always false, so without this guard the trigger is spuriously active
+    // in PvP and taunt-grade rows would outbid real interrupts for zero
+    // effect (donor GenericTriggers.cpp guards the same way).
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (target && target->IsPlayer())
+        return false;
+
     if(!AI_VALUE2(bool, "has aggro", "current target"))
     {
         // Check if the aggro has been taken by another tank
@@ -98,17 +329,79 @@ bool LoseAggroTrigger::IsActive()
     return false;
 }
 
+bool LooseAddsNearTrigger::IsActive()
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+
+    // The "attackers" value collapses to the focus RTI mark while a "focus
+    // rti targets" strategy runs, so a marked pack hides its own loose adds.
+    // Count group victims straight from the core instead: every group member
+    // (and the bot) reports the units attacking it, before any strategy
+    // filter runs. Players are not mobs (PvP: skip them).
+    std::vector<LooseAddCandidate> candidates;
+    std::set<ObjectGuid> seen;
+    std::list<Unit*> members;
+    members.push_back(bot);
+    for (Group::member_citerator itr = group->GetMemberSlots().begin(); itr != group->GetMemberSlots().end(); ++itr)
+    {
+        if (Player* member = sObjectMgr.GetPlayer(itr->guid))
+            members.push_back(member);
+    }
+    for (Unit* member : members)
+    {
+        if (!member || !member->IsInWorld())
+            continue;
+        for (Unit* attacker : member->GetAttackers())
+        {
+            if (!attacker || !attacker->IsAlive())
+                continue;
+            if (attacker->IsPlayer())
+                continue;
+            if (!seen.insert(attacker->getObjectGuid()).second)
+                continue;
+            if (!attacker->GetVictim())
+                continue;
+            Player* victimPlayer = attacker->GetVictim()->ToPlayer();
+            if (!victimPlayer || !group->IsMember(victimPlayer->GetObjectGuid()))
+                continue;
+            LooseAddCandidate candidate;
+            candidate.victimIsGroupPlayer = true;
+            candidate.victimIsTank = ai->IsTank(victimPlayer);
+            candidate.distanceToBot = bot->GetDistance(attacker);
+            candidates.push_back(candidate);
+        }
+    }
+
+    return ShouldAoeTaunt(CountLooseAddsInReach(candidates));
+}
+
 bool HasAggroTrigger::IsActive()
 {
     return AI_VALUE2(bool, "has aggro", "current target");
 }
 
+bool HasAggroInRaidGroupTrigger::IsActive()
+{
+    // Same test as WandBlocksCastTrigger::RaidAggroWand, so the stop never
+    // fights this row.
+    Group* group = bot->GetGroup();
+    return RaidAggroWandRow(group && group->isRaidGroup(), HasAggroTrigger::IsActive());
+}
+
 bool PanicTrigger::IsActive()
 {
-    return !ai->IsInPvp() &&
-           AI_VALUE2(uint8, "health", "self target") < sPlayerbotAIConfig.criticalHealth &&
-		   (!AI_VALUE2(bool, "has mana", "self target") ||
-            AI_VALUE2(uint8, "mana", "self target") < sPlayerbotAIConfig.lowMana);
+    // Cheap gates first (perf): health/mana are scalar value reads, while
+    // IsInPvp walks the enemy-player grid scan. Same && verdict, only
+    // reordered: a bot above critical health, or with mana to fight on,
+    // refuses whatever the PvP scan finds.
+    if (AI_VALUE2(uint8, "health", "self target") >= sPlayerbotAIConfig.criticalHealth)
+        return false;
+    if (AI_VALUE2(bool, "has mana", "self target") &&
+        AI_VALUE2(uint8, "mana", "self target") >= sPlayerbotAIConfig.lowMana)
+        return false;
+    return !ai->IsInPvp();
 }
 
 bool CriticalHealthNoMasterTrigger::IsActive()
@@ -153,6 +446,19 @@ bool OutNumberedTrigger::IsActive()
     if (bot->GetClass() == CLASS_PRIEST && (bot->GetLevel() < 10 || !bot->GetGroup()))
         return false;
 
+    // Shaman, paladin and druid self-heal from level 1 too (Healing Wave, Holy
+    // Light, Healing Touch / Regrowth rows in their combat strategies), so the solo
+    // priest reasoning above holds for them - as long as they have the mana to
+    // heal. Without this a solo shaman at full mana ran from two mobs at 70%
+    // health and died (58% of shaman deaths, Oct 2026 pool poll; solo priests
+    // 0%). Out of mana they keep the flee; panic and critical health stay.
+    uint8 const botClass = bot->GetClass();
+    if ((botClass == CLASS_SHAMAN || botClass == CLASS_PALADIN || botClass == CLASS_DRUID) &&
+        ShouldSelfHealerHoldGround(true, bot->GetGroup() != nullptr,
+            AI_VALUE2(bool, "has mana", "self target"),
+            AI_VALUE2(uint8, "mana", "self target"), sPlayerbotAIConfig.lowMana))
+        return false;
+
     // Don't trigger if the bot is a dungeon or raid
     if (!bot->IsInWorld() || bot->IsBeingTeleported() || bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid())
         return false;
@@ -181,9 +487,17 @@ bool OutNumberedTrigger::IsActive()
     int32 botLevel = bot->GetLevel();
     float healthMod = bot->GetHealthPercent() / 100.0f;
     uint32 friendPower = 100 + 100 * healthMod, foePower = 0;
-    for (auto &attacker : ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("possible attack targets")->Get())
+    // Only mobs actually fighting this bot count, like the donor (mod-playerbots
+    // weighs "attackers"). The old loop weighed every hostile in "possible attack
+    // targets", so idle mobs standing near a fair one-on-one fight made a pool
+    // bot under 70% health "outnumbered": it stopped swinging to flee, covered
+    // no ground (median 0 yd) and died - 76% of deaths had a flee in their last
+    // 30 s (Oct 2026 roster poll, 571 deaths). bot->GetAttackers() rather than
+    // the "attackers" value, which also shares nearby players' targets.
+    uint32 attackerCount = 0;
+    for (Unit* attacker : bot->GetAttackers())
     {
-        Creature* creature = ai->GetCreature(attacker);
+        Creature* creature = attacker ? attacker->ToCreature() : nullptr;
         if (!creature)
             continue;
 
@@ -195,10 +509,19 @@ bool OutNumberedTrigger::IsActive()
         healthMod = creature->GetHealthPercent() / 100.0f;
 
         if(dLevel > -10)
+        {
             foePower += std::max(100 + 10 * dLevel, dLevel * 200) * healthMod;
+            ++attackerCount;
+        }
     }
 
-    if (!foePower)
+    // Outnumbered means more than one: a pool bot does not run from a single
+    // mob. Its flee cannot outpace the mob (median 0 yd covered, Oct 2026
+    // poll), so breaking off a one-on-one only stops the swings - the weights
+    // above made any mob two levels up "outnumber" a bot under 70% health.
+    // The genuine near-death escape stays with the panic / critical health
+    // triggers.
+    if (!foePower || attackerCount < 2)
         return false;
 
     for (auto & helper : ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid> >("nearest friendly players")->Get())
@@ -221,7 +544,13 @@ bool OutNumberedTrigger::IsActive()
 
 bool BuffTrigger::IsActive()
 {
-    Unit* target = GetTarget();
+    // Cheap gates first (perf): the old order ran GetTarget (a "self target"
+    // unit value read) before the two O(1) refuses. HasSpell is a spellbook
+    // hit, the claim is two map lookups under one short lock; both are
+    // cheaper than resolving and liveness-checking the target, and the aura
+    // scan below is the most expensive step. Same verdict, only reordered:
+    // a missing spell or a live claim refuses whatever the target is, and
+    // IsTargetClaimedByOther already returns false for a null target.
     // A buff that was never trained can never appear as an aura, so without
     // this the trigger stays active forever and the cast fails every tick
     // (observed ACTION_LOOPs: inner fire / lightning shield / aspect of the
@@ -233,11 +562,40 @@ bool BuffTrigger::IsActive()
     // Issue #T7: another bot is already casting this spell on the target (or, for
     // the area buffs, on the whole group). Stay inactive this tick rather than
     // pick the next member - that would re-create the same race for the others.
-    if (BuffClaimRegistry::IsTargetClaimedByOther(bot, target, spell))
+    if (BuffClaimRegistry::IsTargetClaimedByOther(bot, GetTarget(), spell))
         return false;
 
+    Unit* target = GetTarget();
     if (!target || !target->IsAlive())
         return false;
+
+    // Force-rebuff top-off pass (mod-playerbots parity, BUFF-1): while a
+    // rebuff window is pending out of combat, a LONG buff counts as missing
+    // when remaining + margin < max (donor ForceRebuff margin rule), so the
+    // pass tops it up instead of letting it drop mid-fight. Outside the
+    // window the normal refresh rule applies. Buff triggers also bypass the
+    // check interval while pending (Trigger::needCheck) so the pass
+    // evaluates every tick until the window closes.
+    if (!bot->IsInCombat())
+    {
+        AiObjectContext* rebuffContext = ai->GetAiObjectContext();
+        uint32 beginMs = rebuffContext->GetValue<int32>("manual int", "force rebuff begin ms")->Get();
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (beginMs && ai::ForceRebuffPending(beginMs, nowMs))
+        {
+            Aura* aura = ai->GetAura(spell, target, checkIsOwner);
+            if (ai::ForceRebuffBelowTarget(aura != nullptr, aura ? aura->GetAuraDuration() : 0,
+                aura ? aura->GetAuraMaxDuration() : 0, beginMs, nowMs))
+            {
+                // No "proposed" mark here (donor Engine.cpp:488-489 marks only
+                // when a trigger fires): subclasses add post-gates below
+                // (greater-aura vetoes) that can still refuse, and a mark here
+                // would veto heals / hold the ready reply with no buff work.
+                // Engine::ProcessTriggers marks on fire instead.
+                return true;
+            }
+        }
+    }
 
     // Issue #468 (donor BuffBelowRefreshTarget): a LONG aura expiring inside
     // the refresh window counts as missing, so the buff is topped up on the
@@ -288,7 +646,7 @@ ai::Value<Unit*>* BuffOnTankTrigger::GetTargetValue()
 
 Value<Unit*>* DebuffOnAttackerTrigger::GetTargetValue()
 {
-	return context->GetValue<Unit*>("attacker without aura", spell);
+	return context->GetValue<Unit*>(checkIsOwner ? "attacker without my aura" : "attacker without aura", spell);
 }
 
 bool NoAttackersTrigger::IsActive()
@@ -376,6 +734,21 @@ bool MediumThreatTrigger::IsActive()
     return false;
 }
 
+bool LowTankThreatTrigger::IsActive()
+{
+    Unit* currentTarget = AI_VALUE(Unit*, "current target");
+    if (!currentTarget || currentTarget->IsPlayer())
+        return false;
+
+    Unit* mainTank = AI_VALUE(Unit*, "main tank");
+    if (!mainTank || mainTank == bot)
+        return false;
+
+    float threat = sServerFacade.GetThreatManager(currentTarget).getThreat(bot);
+    float tankThreat = sServerFacade.GetThreatManager(currentTarget).getThreat(mainTank);
+    return LowTankThreatFires(false, threat, tankThreat);
+}
+
 bool SomeThreatTrigger::IsActive()
 {
     if (AI_VALUE2(uint8, "threat", "current target") >= 25)
@@ -392,23 +765,6 @@ bool NoThreatTrigger::IsActive()
     return true;
 }
 
-// Deliberate damage-breakable CC that an AoE would waste. The frozen state is
-// left out on purpose: Frost Nova sets it too, and nova + AoE is normal play.
-static bool HoldsBreakableCc(PlayerbotAI* ai, Unit* unit, Player* bot)
-{
-    if (!unit || PossibleAttackTargetsValue::HasIgnoreCCRti(unit, bot))
-        return false;
-
-    static char const* const breakableCc[] = { "sap", "gouge", "shackle undead", "hibernate",
-        "freezing trap effect", "seduction", "repentance", "wyvern sting" };
-    if (unit->IsPolymorphed())
-        return true;
-    for (char const* spell : breakableCc)
-        if (ai->HasAura(spell, unit))
-            return true;
-    return false;
-}
-
 bool AoeTrigger::IsActive()
 {
     std::list<ObjectGuid> aoeEnemies = AoeCountValue::FindMaxDensity(bot, range);
@@ -421,14 +777,14 @@ bool AoeTrigger::IsActive()
     // Splash counts too: a CCed mob beside the cluster still eats the blast.
     for (std::list<ObjectGuid>::iterator i = aoeEnemies.begin(); i != aoeEnemies.end(); ++i)
     {
-        if (HoldsBreakableCc(ai, ai->GetUnit(*i), bot))
+        if (PossibleAttackTargetsValue::HoldsBreakableCc(ai, ai->GetUnit(*i), bot))
             return false;
     }
     std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
     for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); ++i)
     {
         Unit* unit = ai->GetUnit(*i);
-        if (!HoldsBreakableCc(ai, unit, bot))
+        if (!PossibleAttackTargetsValue::HoldsBreakableCc(ai, unit, bot))
             continue;
         for (std::list<ObjectGuid>::iterator j = aoeEnemies.begin(); j != aoeEnemies.end(); ++j)
         {
@@ -456,6 +812,19 @@ bool DebuffTrigger::IsActive()
     }
 
     return false;
+}
+
+bool DebuffOnBossTrigger::IsActive()
+{
+    // No IsDungeonBoss on this core: world boss only, matching the donor
+    // world-boss arm exactly. Elites-in-dungeon would open the gate to all
+    // trash and defeat the conservation intent; dungeon-boss coverage waits
+    // on a real boss flag.
+    if (!DebuffTrigger::IsActive())
+        return false;
+    Unit* target = GetTarget();
+    Creature* creature = target ? dynamic_cast<Creature*>(target) : nullptr;
+    return creature && creature->IsWorldBoss();
 }
 
 bool DebuffTrigger::HasMaxDebuffs()
@@ -589,6 +958,13 @@ bool BoostTrigger::IsActive()
 {
     if (ai->IsStateActive(BotState::BOT_STATE_COMBAT) && BuffTrigger::IsActive())
     {
+        // BuffTrigger proves the spell is trained, not that it is ready:
+        // while the cooldown runs the aura is always missing, so the row
+        // would be armed (and the cast refused) every tick without this.
+        uint32 spellId = AI_VALUE2(uint32, "spell id", spell);
+        if (!ai::BoostReady(spellId != 0, spellId && sServerFacade.IsSpellReady(bot, spellId)))
+            return false;
+
         if (!ai->HasRealPlayerMaster())
         {
             return AI_VALUE(uint8, "balance") <= balance;
@@ -600,6 +976,30 @@ bool BoostTrigger::IsActive()
     }
 
     return false;
+}
+
+bool GenericBoostTrigger::IsActive()
+{
+    if (!ai->IsStateActive(BotState::BOT_STATE_COMBAT))
+        return false;
+
+    // The row is armed for every class, but a bot trained in neither spell -
+    // or with its racial on cooldown - would queue an impossible cast per
+    // tick; arm only when one of the pair is castable now.
+    auto castable = [this](std::string const& candidate)
+    {
+        uint32 spellId = AI_VALUE2(uint32, "spell id", candidate);
+        return ai::BoostReady(spellId != 0, spellId && sServerFacade.IsSpellReady(bot, spellId));
+    };
+    if (!ai::RacialBoostReady(castable(firstSpell), castable(secondSpell)))
+        return false;
+
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (target && target->IsPlayer())
+        return true;
+    if (ai->HasRealPlayerMaster())
+        return true;
+    return AI_VALUE(uint8, "balance") <= 50;
 }
 
 bool ItemCountTrigger::IsActive()
@@ -736,6 +1136,35 @@ bool TankAssistTrigger::IsActive()
     if (!AI_VALUE(bool, "has attackers"))
         return false;
 
+    // A Four Horsemen mark carrier holds its rotated horseman: assisting
+    // the group tank's target would drag it back into the mark it just
+    // left. TankTargetValue already returns that horseman; veto the assist
+    // while the stored choice holds so the two agree.
+    if (bot->GetMapId() == 533)
+    {
+        AiObjectContext* context = ai->GetAiObjectContext();
+        const int fromIdx = context->GetValue<int32>("manual int", kFourHorsemenFromKey)->Get() - 1;
+        const int toIdx = context->GetValue<int32>("manual int", kFourHorsemenToKey)->Get() - 1;
+        auto getStacks = [&](uint32 markSpell) -> uint32
+        {
+            Aura* aura = ai->GetAura(markSpell, bot);
+            return aura ? aura->GetStackAmount() : 0;
+        };
+        auto findHorseman = [&](int idx) -> Unit*
+        {
+            for (ObjectGuid const& guid : context->GetValue<std::list<ObjectGuid>>("attackers")->Get())
+            {
+                Unit* unit = ai->GetUnit(guid);
+                if (unit && unit->IsAlive() && unit->GetEntry() == kFourHorsemenEntries[idx])
+                    return unit;
+            }
+            return nullptr;
+        };
+        if (FourHorsemenRotationTargetRaw<Unit>(fromIdx, toIdx, getStacks, findHorseman,
+            ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT)))
+            return false;
+    }
+
     Unit* currentTarget = AI_VALUE(Unit*, "current target");
     if (!currentTarget)
         return true;
@@ -755,13 +1184,20 @@ bool TankAssistTrigger::IsActive()
     // still holds its current target. A loose add is picked up while the
     // current mob is held, and the tank can switch back to finish it later.
     // The old victim check forbade returning to a mob on the tank (one-way
-    // door). "has aggro" is HasAggroValue (values/AttackerCountValues.cpp).
-    bool holdsCurrent = AI_VALUE2(bool, "has aggro", "current target");
+    // door). Holding follows the donor multi-tank rule (HasAggro: victim is
+    // the bot, or — anyone but the explicit main tank — another tank), so
+    // an off-tank parked on the main tank's skull still counts as holding
+    // it and peels to loose adds; the pure rule is TankAddPickupPolicy.h.
+    Unit* victim = currentTarget->GetVictim();
+    Player* victimPlayer = victim ? dynamic_cast<Player*>(victim) : nullptr;
+    Group* group = bot->GetGroup();
+    ObjectGuid const mainTank = group ? group->GetMainTankGuid() : ObjectGuid();
+    bool const isExplicitMainTank = group && !mainTank.IsEmpty() && mainTank == bot->getObjectGuid();
+    bool holdsCurrent = TankHoldsCurrentTarget(victim == bot,
+        victimPlayer && ai->IsTank(victimPlayer), isExplicitMainTank);
     // Finish a held mob that is already low before peeling a loose add; the
     // add waits a few seconds, a half-dead mob left behind waits forever.
-    if (holdsCurrent && currentTarget->GetHealthPercent() <= sPlayerbotAIConfig.lowHealth)
-        return false;
-    return holdsCurrent;
+    return TankPeelsToLooseAdd(holdsCurrent, currentTarget->GetHealthPercent(), sPlayerbotAIConfig.lowHealth);
 }
 
 bool IsBehindTargetTrigger::IsActive()
@@ -776,36 +1212,178 @@ bool IsNotBehindTargetTrigger::IsActive()
     return target && !AI_VALUE2(bool, "behind", "current target");
 }
 
+bool RearFlankNeededTrigger::IsActive()
+{
+    // Front-arc-only (no tail clause): set-behind's destination is the
+    // exact rear, and firing there would ping-pong flank→rear→flank
+    // against the higher-priority flank row every tick. Tanks holding the
+    // mob keep the tank-face path, never flank off it. Explicit holds
+    // (stay/wait-for-attack) veto; settled-behind bots hold position.
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsCreature() || !sServerFacade.IsAlive(target))
+        return false;
+    if (target->GetVictim() && target->GetVictim()->getObjectGuid() == bot->getObjectGuid())
+        return false;
+    if (ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT) ||
+        ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT))
+        return false;
+    if (bot->GetDistance(target) > 15.0f)
+        return false;
+    if (AI_VALUE2(bool, "behind", "current target"))
+        return false;
+    return target->HasInArc(bot, 2.0f * (float)M_PI / 2.0f);
+}
+
 bool IsNotFacingTargetTrigger::IsActive()
 {
     return !AI_VALUE2(bool, "facing", "current target");
 }
 
+bool TankFaceNeededTrigger::IsActive()
+{
+    // Scope is strategy membership ("tank face" on tank kits), not the
+    // master: any tank with the strategy faces held mobs away, pool/raid
+    // tanks included. Non-tanks never carry the strategy.
+    if (!ai->HasStrategy("tank face", BotState::BOT_STATE_COMBAT))
+        return false;
+    if (!ai->IsTank(bot))
+        return false;
+    // Explicit holds win: a tank parked by stay/wait-for-attack does not
+    // sidestep (mirrors the spread exemption in RaidSpreadNeededTrigger).
+    if (ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT) ||
+        ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT))
+        return false;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsCreature() || !sServerFacade.IsAlive(target))
+        return false;
+    // Only while the tank holds the mob: it turns to face the tank, so
+    // stepping to the far side of the mob points its front at the tank.
+    if (!target->GetVictim() || target->GetVictim()->getObjectGuid() != bot->getObjectGuid())
+        return false;
+    if (!bot->CanReachWithMeleeAutoAttack(target) || target->IsMoving())
+        return false;
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    // Average angle from the mob to the live party (donor AverageGroupAngle).
+    // Needs at least one other member: alone, there is nobody to protect.
+    float sumX = 0.0f, sumY = 0.0f;
+    int count = 0;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (!member || member == bot || !sServerFacade.IsAlive(member))
+            continue;
+        if (member->GetMapId() != bot->GetMapId())
+            continue;
+        sumX += member->GetPositionX() - target->GetPositionX();
+        sumY += member->GetPositionY() - target->GetPositionY();
+        ++count;
+    }
+    if (!count)
+        return false;
+    float averageAngle = atan2(sumY, sumX);
+    // Hysteresis (donor TankFaceAction, tolerable = PI/2): fire only while
+    // the mob's front points at the party side. After the sidestep the tank
+    // sits ~108 degrees off, outside this window, so it does not jitter.
+    float delta = averageAngle - target->GetAngle(bot);
+    while (delta > M_PI)
+        delta -= 2.0f * M_PI;
+    while (delta < -M_PI)
+        delta += 2.0f * M_PI;
+    return fabs(delta) <= M_PI / 2.0f;
+}
+
 bool HasCcTargetTrigger::IsActive()
 {
     uint32 spellid = AI_VALUE2(uint32, "spell id", getName());
-    if (spellid && sServerFacade.IsSpellReady(bot, spellid))
+    return spellid && sServerFacade.IsSpellReady(bot, spellid) && CcTargetPending();
+}
+
+bool HasCcTargetTrigger::CcTargetPending()
+{
+    // mod-playerbots d9ee5198/#2648: inside a non-raid dungeon the generic
+    // CC never fires on a free pick — only on this bot's assigned raid
+    // mark ("rti cc target"). Open world keeps today's free CC; raids
+    // keep it too (marks are advisory there, packs are scripted).
+    // Opt-in bypass: the "auto cc" strategy (OFF by default, toggled via
+    // `.bot action auto cc [on|off]`) lets the bot CC its own smart pick
+    // (loose add on a healer/caster, unattacked, undotted) in dungeons.
+    // Explicit marks still win: CcTargetValue returns the assigned target
+    // first, so an assigned bot never falls through to its auto pick.
+    if (!ai->HasStrategy("auto cc", BotState::BOT_STATE_COMBAT) &&
+        bot->IsInWorld() && bot->GetMap() && bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid())
     {
-        // mod-playerbots d9ee5198/#2648: inside a non-raid dungeon the generic
-        // CC never fires on a free pick — only on this bot's assigned raid
-        // mark ("rti cc target"). Open world keeps today's free CC; raids
-        // keep it too (marks are advisory there, packs are scripted).
-        // Opt-in bypass: the "auto cc" strategy (OFF by default, toggled via
-        // `.bot action auto cc [on|off]`) lets the bot CC its own smart pick
-        // (loose add on a healer/caster, unattacked, undotted) in dungeons.
-        // Explicit marks still win: CcTargetValue returns the assigned target
-        // first, so an assigned bot never falls through to its auto pick.
-        if (!ai->HasStrategy("auto cc", BotState::BOT_STATE_COMBAT) &&
-            bot->IsInWorld() && bot->GetMap() && bot->GetMap()->IsDungeon() && !bot->GetMap()->IsRaid())
-        {
-            Unit* rtiCcTarget = AI_VALUE(Unit*, "rti cc target");
-            if (!rtiCcTarget)
-                return false;
-            Unit* ccTarget = AI_VALUE2(Unit*, "cc target", getName());
-            if (!ccTarget || ccTarget != rtiCcTarget)
-                return false;
-        }
-        return AI_VALUE2(Unit*, "cc target", getName()) && !AI_VALUE2(Unit*, "current cc target", getName());
+        Unit* rtiCcTarget = AI_VALUE(Unit*, "rti cc target");
+        if (!rtiCcTarget)
+            return false;
+        Unit* ccTarget = AI_VALUE2(Unit*, "cc target", getName());
+        if (!ccTarget || ccTarget != rtiCcTarget)
+            return false;
+    }
+    return AI_VALUE2(Unit*, "cc target", getName()) && !AI_VALUE2(Unit*, "current cc target", getName());
+}
+
+bool WandBlocksCcTrigger::IsActive()
+{
+    return IsWanding() && CcCastWaiting();
+}
+
+bool WandBlocksCcTrigger::CcCastWaiting()
+{
+    uint32 const nowMs = WorldTimer::getMSTime();
+    if (waitingCheckMs && WorldTimer::getMSTimeDiff(waitingCheckMs, nowMs) < 1000)
+        return waitingCached;
+
+    waitingCheckMs = nowMs ? nowMs : 1;
+    waitingCached = ComputeCcCastWaiting();
+    return waitingCached;
+}
+
+bool WandBlocksCcTrigger::ComputeCcCastWaiting()
+{
+    // The CC rows live in the "cc" strategy; without it nothing waits.
+    if (!ai->HasStrategy("cc", BotState::BOT_STATE_COMBAT))
+        return false;
+
+    // Same wand-on-purpose rows as the nuke triggers: the raid "has aggro"
+    // wand and the "no mana" (< 5%) wand stay up.
+    bool const keepWandForThreat = RaidAggroWand();
+    if (keepWandForThreat)
+        return false;
+    bool const noManaRowActive = NoManaRowActive();
+    if (noManaRowActive)
+        return false;
+
+    for (std::string const& spell : ccSpells)
+    {
+        // The class's own CC trigger decides whether a target waits (mark
+        // gating, Fear's mark-only rule); only the "spell ready" part is
+        // left out. "cc target" is a cached value, and the cast probe below
+        // only runs when a target is pending.
+        HasCcTargetTrigger* ccTrigger = dynamic_cast<HasCcTargetTrigger*>(context->GetTrigger(spell));
+        if (!ccTrigger || !ccTrigger->CcTargetPending())
+            continue;
+
+        Unit* target = AI_VALUE2(Unit*, "cc target", spell);
+        if (!target || !target->IsAlive())
+            continue;
+
+        // The probe ignores range. Only a target already in cast range
+        // counts: one the bot cannot reach (a stay order, a root, no path)
+        // would otherwise keep the wand off while the CC never goes out.
+        uint32 const spellId = AI_VALUE2(uint32, "spell id", spell);
+        SpellEntry const* spellInfo = spellId ? sServerFacade.LookupSpellInfo(spellId) : nullptr;
+        SpellRangeEntry const* rangeEntry = spellInfo ? sSpellRangeStore.LookupEntry(spellInfo->rangeIndex) : nullptr;
+        if (!rangeEntry)
+            continue;
+        float maxRange = rangeEntry->maxRange;
+        bot->ApplySpellMod(spellId, SPELLMOD_RANGE, maxRange);
+        if (bot->GetCombatDistance(target) > maxRange)
+            continue;
+
+        WandState const state{true, ProbeSpell(spell, target), keepWandForThreat, noManaRowActive};
+        if (ShouldStopWandToCast(state))
+            return true;
     }
 
     return false;
@@ -955,13 +1533,64 @@ bool HasAreaDebuffTrigger::IsActive()
     return AI_VALUE2(bool, "has area debuff", "self target");
 }
 
+bool AoeThreatNearbyTrigger::IsActive()
+{
+    if (!bot->IsInWorld() || bot->IsBeingTeleported() || !sServerFacade.IsAlive(bot))
+        return false;
+    // Creature aura keep-out (AiPlayerbot.AvoidCreatureAuras): register each
+    // listed creature in the cached 15yd trigger list as a short-lived
+    // movement hazard, so chase, follow and position moves keep their end
+    // points and paths outside it (MovementAction hazard checks). Re-added
+    // every tick while near (the expiry is refreshed, so it never flickers
+    // while the creature is near and alive); it lapses a few seconds after
+    // the creature dies or the bot moves on. The creature the
+    // player ordered this bot to attack is not registered.
+    // A tank in combat is exempt from the rows that give tanks a pass (it may
+    // stand in the sludge's ring to hold mobs; not in Living Poison's). The
+    // current target is registered too when it is itself a listed creature,
+    // so a chase from beyond the 15 yd list is bent before it gets close.
+    if (sPlayerbotAIConfig.avoidCreatureAuras)
+    {
+        ObjectGuid const explicitTarget = AI_VALUE(ObjectGuid, "explicit attack target");
+        std::list<ObjectGuid> keepouts = AI_VALUE(std::list<ObjectGuid>, "possible triggers");
+        if (Unit* current = AI_VALUE(Unit*, "current target"))
+        {
+            if (PossibleTriggersValue::KeepoutFor(current))
+            {
+                keepouts.remove(current->GetObjectGuid());
+                keepouts.push_back(current->GetObjectGuid());
+            }
+        }
+        for (ObjectGuid const& guid : keepouts)
+        {
+            CreatureAuraKeepout const* row = PossibleTriggersValue::KeepoutFor(ai->GetUnit(guid));
+            if (!CreatureAuraKeepoutApplies(true, row, true, true, guid == explicitTarget))
+                continue;
+            // A tank in combat is exempt from the rows that give tanks a pass.
+            if (CreatureAuraCombatExempt(*row, PlayerbotAI::IsTank(bot), bot->IsInCombat()))
+                continue;
+            Hazard hazard(guid, kCreatureAuraHazardSeconds, CreatureAuraHazardRadius(*row));
+            hazard.SetRefreshOnReAdd();
+            SET_AI_VALUE(Hazard, "add hazard", std::move(hazard));
+        }
+    }
+    // Any one sensor firing is enough; each read is value-cached (dynobj
+    // aura check, 15yd trap scan, 15yd trigger scan).
+    if (AI_VALUE2(bool, "has area debuff", "self target"))
+        return true;
+    if (!AI_VALUE(std::list<ObjectGuid>, "nearest damaging traps").empty())
+        return true;
+    return !AI_VALUE(std::list<ObjectGuid>, "possible triggers").empty();
+}
+
 bool ReturnToStayPositionTrigger::IsActive()
 {
     PositionEntry stayPosition = AI_VALUE(PositionMap&, "position")["stay"];
-    if (stayPosition.isSet())
+    if (stayPosition.isSet() && stayPosition.mapId == bot->GetMapId())
     {
-        const float distance = bot->GetDistance(stayPosition.x, stayPosition.y, stayPosition.z);
-        return distance > ai->GetRange("follow");
+        // The walk's own question (StayWalkDueNow, PositionAction.cpp: the shared 3D rule and
+        // back-off): the trigger and the action cannot disagree.
+        return StayWalkDueNow(ai, bot, stayPosition);
     }
 
     return false;
@@ -1025,9 +1654,27 @@ bool GreaterBuffOnPartyTrigger::IsActive()
     // Issue #468: the group buff only pays off while the member lacks the
     // lower single-target buff too - unless that LONG one is expiring inside
     // the refresh window, in which case the group cast tops up both at once.
+    // Force-rebuff pass: while a rebuff window is pending OOC, the LOWER
+    // aura uses the window margin rule, not the 15 s refresh rule. The
+    // predicate ("party member without aura" margin site) already selects a
+    // member whose single is below margin; without this the trigger rejects
+    // that member (single still above 15 s) while the single trigger is
+    // blocked by group presence, so Prayer/GOTW/AB never top off in-window.
+    // Donor has no greater trigger (upgrades at cast time via
+    // UpgradeToGroupIfAppropriate); locally both levels exist, so the lower
+    // check must match the margin rule that selected the member.
     if (lowerSpell.empty())
         return true;
     Aura* lower = ai->GetAura(lowerSpell, target, checkIsOwner);
+    if (!bot->IsInCombat())
+    {
+        AiObjectContext* rebuffContext = ai->GetAiObjectContext();
+        uint32 beginMs = rebuffContext->GetValue<int32>("manual int", "force rebuff begin ms")->Get();
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (beginMs && ai::ForceRebuffPending(beginMs, nowMs))
+            return ai::ForceRebuffBelowTarget(lower != nullptr, lower ? lower->GetAuraDuration() : 0,
+                lower ? lower->GetAuraMaxDuration() : 0, beginMs, nowMs);
+    }
     return ai::BuffNeedsRefresh(lower != nullptr, lower ? lower->GetAuraDuration() : 0,
         lower ? lower->GetAuraMaxDuration() : 0);
 }
@@ -1279,6 +1926,29 @@ bool AtWarTrigger::IsActive()
     return false;
 }
 
+// Deferred ready-check confirm is waiting (SOC-S5). Cheap first: config
+// gate and anchor read only; no aura scans. The due verdict itself
+// (grace/cap/casting) lives in the action's isUseful, so this trigger only
+// says "a confirm is held". An anchor held past cap + slack (e.g. through
+// combat, when this trigger stays quiet) is a dead check: clear it here so
+// no stale confirm goes out when combat ends minutes later.
+bool ForceRebuffPendingTrigger::IsActive()
+{
+    if (!sPlayerbotAIConfig.forceRebuffOnReadyCheck || bot->IsInCombat())
+        return false;
+
+    time_t anchor = context->GetValue<time_t>("manual time", ai::ReadyRebuffAnchorKey())->Get();
+    if (anchor == time_t(0))
+        return false;
+
+    if (time(0) - anchor > ai::ReadyRebuffCapSec() + ai::ReadyRebuffExpirySlackSec())
+    {
+        context->GetValue<time_t>("manual time", ai::ReadyRebuffAnchorKey())->Set(time_t(0));
+        return false;
+    }
+    return true;
+}
+
 // One-shot per pet identity (E01): ported from mod-playerbots NewPetTrigger,
 // adapted to this core (only GetPet() exists — no GetGuardianPet, grep
 // verified). Fires once per main-pet GUID change; an empty slot resets the
@@ -1309,6 +1979,11 @@ bool PetAttackTrigger::IsActive()
     Pet* pet = bot->GetPet();
     Unit* target = AI_VALUE(Unit*, "current target");
     if (!AttackAction::CanPetAttack(ai, pet, target))
+        return false;
+
+    // A channeling pet holds its spell (e.g. the succubus's Seduction):
+    // re-ordering it to the DPS target moves it and breaks the channel.
+    if (pet->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
         return false;
 
     if (pet->GetVictim() == target && pet->GetCharmInfo() && pet->GetCharmInfo()->IsCommandAttack())

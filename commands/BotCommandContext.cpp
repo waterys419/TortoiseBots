@@ -2,9 +2,15 @@
 
 #include "../host/BotSessionAdapter.h"
 #include "../runtime/PlayerbotAIStorage.h"
+#include "../runtime/ClaimLifecycle.h"
+#include "../runtime/AltBotService.h"
 #include "../ai/playerbot/PlayerbotAI.h"
+#include "../ai/playerbot/ServerFacade.h"
 #include "../ai/playerbot/strategy/Engine.h"
+#include "../ai/playerbot/strategy/values/LastMovementValue.h"
 #include "../ai/playerbot/strategy/Action.h"
+#include "../ai/playerbot/strategy/AiObjectContext.h"
+#include "../ai/playerbot/PullExecutorPolicy.h"
 #include "../ai/playerbot/strategy/generic/PullStrategy.h"
 #include "../ai/playerbot/strategy/values/PositionValue.h"
 #include "../ai/playerbot/WorldPosition.h"
@@ -17,6 +23,7 @@
 // pi-lens-ignore: clang:pp_file_not_found
 #include "Group/Group.h"
 #include <algorithm>
+#include <map>
 #include <set>
 
 namespace TortoiseBots {
@@ -36,11 +43,21 @@ bool CanControlBot(Player* requester, BotRecord const* record)
     if (IsBotAdministrator(requester))
         return true;
 
-    if (record->masterGuid && record->masterGuid == requester->GetObjectGuid())
+    // Issue #872: an alt-bot in another player's group has that player as its
+    // master, but only the owner's account controls it.
+    if (record->masterGuid && record->masterGuid == requester->GetObjectGuid() &&
+        !AltBotService::Instance().IsAutonomous(record->characterGuid))
         return true;
 
     uint32_t ownerAccount = record->ownerAccountId ? record->ownerAccountId : record->accountId;
-    return ownerAccount != 0 && ownerAccount == requester->GetSession()->GetAccountId();
+    if (ownerAccount != 0 && ownerAccount == requester->GetSession()->GetAccountId())
+        return true;
+
+    // Issue #489: Claimed guild bot owned by this player
+    if (ClaimLifecycle::Instance().IsClaimedByPlayer(record->characterGuid.GetCounter(), requester->GetGUIDLow()))
+        return true;
+
+    return false;
 }
 
 bool IsLiveHeadlessBot(Player* bot, BotRecord const* suppliedRecord)
@@ -88,6 +105,18 @@ bool ExecuteQuietAction(PlayerbotAI* ai, std::string const& action, ai::Event co
     if (!silent.IsActive())
         return ai && ai->DoSpecificAction(action, ai::Event(event), true);
     return ai->DoSpecificAction(action, ai::Event(event), true);
+}
+
+bool ExecuteOrderedAction(PlayerbotAI* ai, std::string const& action, ai::Event const& event)
+{
+    if (!ai || !ai->GetAiObjectContext())
+        return false;
+    ai::Action* ordered = ai->GetAiObjectContext()->GetAction(action);
+    if (!ordered)
+        return false;
+    ScopedSilentStrategy silent(ai);
+    ai::Event copy(event);
+    return ordered->Execute(copy);
 }
 
 void ExecuteQuietNextAction(PlayerbotAI* ai, bool minimal)
@@ -200,31 +229,110 @@ namespace {
 // ContainsStrategy probe: a leveling Arms warrior designated as tank has the
 // STRATEGY_TYPE_TANK bit only after the role kit is applied, and a native
 // Protection bot without the mature pull policy still needs it attached.
+// Readiness follows ai::PullExecutorPolicy: a tank counts as busy only while
+// its combat flag is backed by a live opponent (a victim or attackers). A
+// bare flag with neither is stale and stays a candidate (issue #908).
+static ai::PullCandidateFacts PullCandidateFactsFor(Player* requester, Player* bot)
+{
+    ai::PullCandidateFacts facts;
+    if (!requester || !bot)
+        return facts;
+    facts.inWorld = bot->IsInWorld();
+    facts.alive = bot->IsAlive();
+    facts.sameMap = bot->GetMap() == requester->GetMap();
+    facts.combatFlag = bot->IsInCombat();
+    facts.hasVictim = bot->GetVictim() != nullptr;
+    facts.hasAttackers = !bot->GetAttackers().empty();
+    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
+    if (!ai)
+        return facts;
+    facts.hasAi = true;
+    facts.tankCapable = ai->GetForcedRole() == static_cast<uint8>(BOT_ROLE_TANK) ||
+        PlayerbotAI::IsTank(bot, true);
+    facts.pullReady = PullStrategy::Get(ai) != nullptr;
+    return facts;
+}
+
 bool IsPullCandidate(Player* requester, Player* bot)
 {
-    if (!requester || !bot || !bot->IsInWorld() || !bot->IsAlive() ||
-        bot->IsInCombat() || bot->GetMap() != requester->GetMap())
+    ai::PullCandidateFacts facts = PullCandidateFactsFor(requester, bot);
+    if (ai::PullCandidateBlocked(facts))
         return false;
 
     PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
     if (!ai)
         return false;
 
-    if (ai->GetForcedRole() == static_cast<uint8>(BOT_ROLE_TANK) ||
-        PlayerbotAI::IsTank(bot, true))
+    if (!facts.pullReady)
     {
-        if (!PullStrategy::Get(ai))
-        {
-            ai->ChangeStrategy("+pull", BotState::BOT_STATE_NON_COMBAT);
-            ai->ChangeStrategy("+pull", BotState::BOT_STATE_COMBAT);
-        }
-        return PullStrategy::Get(ai) != nullptr;
+        ai->ChangeStrategy("+pull", BotState::BOT_STATE_NON_COMBAT);
+        ai->ChangeStrategy("+pull", BotState::BOT_STATE_COMBAT);
+        facts.pullReady = PullStrategy::Get(ai) != nullptr;
     }
+    return facts.tankCapable && facts.pullReady;
+}
 
-    return false;
+// The refusal detail names the most common blocker across the command scope,
+// so a refused pull says why instead of only that no tank was free.
+static void NotePullBlocker(BotCommandContext const& context, Player* bot, std::map<ai::PullExcludeReason, uint32>& counts)
+{
+    if (!context.requester || !bot)
+        return;
+    ai::PullCandidateFacts facts = PullCandidateFactsFor(context.requester, bot);
+    // A missing "pull" strategy attaches on demand, so it never blocks: the
+    // refusal counts the next reason instead.
+    if (!facts.tankCapable)
+    {
+        ++counts[ai::PullExcludeReason::NotTank];
+        return;
+    }
+    if (ai::PullCandidateInRealFight(facts))
+    {
+        ++counts[ai::PullExcludeReason::Busy];
+        return;
+    }
+    ++counts[ai::ClassifyPullCandidate(facts)];
 }
 
 } // namespace
+
+void CountPullBlockers(BotCommandContext const& context, std::map<ai::PullExcludeReason, uint32>& counts)
+{
+    counts.clear();
+    if (!context.requester)
+        return;
+    if (context.selectedBot)
+        NotePullBlocker(context, context.selectedBot, counts);
+    for (Player* bot : context.partyBots)
+    {
+        if (bot == context.selectedBot)
+            continue;
+        NotePullBlocker(context, bot, counts);
+    }
+    counts.erase(ai::PullExcludeReason::None);
+    counts.erase(ai::PullExcludeReason::NoPullStrategy);
+}
+
+std::string PullBlockerDetail(BotCommandContext const& context)
+{
+    std::map<ai::PullExcludeReason, uint32> counts;
+    CountPullBlockers(context, counts);
+    if (counts.empty())
+        return {};
+    ai::PullExcludeReason top = counts.begin()->first;
+    for (auto const& entry : counts)
+        if (entry.second > counts[top])
+            top = entry.first;
+    std::string detail = ai::PullExcludeWord(top);
+    if (counts[top] > 1)
+    {
+        detail += " (x";
+        detail += std::to_string(counts[top]);
+        detail += ")";
+    }
+    return detail;
+}
+
 
 Player* ResolvePullExecutor(BotCommandContext const& context, bool allowSelected)
 {
@@ -253,12 +361,42 @@ Player* ResolvePullExecutor(BotCommandContext const& context, bool allowSelected
     return nullptr;
 }
 
+bool PullTankIsBusy(BotCommandContext const& context)
+{
+    if (!context.requester)
+        return false;
+
+    auto busyTank = [&](Player* bot)
+    {
+        if (!bot)
+            return false;
+        ai::PullCandidateFacts facts = PullCandidateFactsFor(context.requester, bot);
+        if (!facts.inWorld || !facts.alive || !facts.sameMap || !facts.hasAi || !facts.tankCapable)
+            return false;
+        return ai::PullCandidateInRealFight(facts);
+    };
+
+    if (busyTank(context.selectedBot))
+        return true;
+    for (Player* bot : context.partyBots)
+        if (busyTank(bot))
+            return true;
+    return false;
+}
+
 // Threat window: while the tank pulls and establishes threat, party DPS bots
-// hold at the command anchor. Healers stay active. Uses the mature
+// hold at the command anchor. Healers stay active, except in the run
+// leader's pulls (held on their stand, heals only; see below); in the
+// party-chat pull hold (ai::PausePartyPullHold) healers heal but deal no
+// damage while the hold runs (their off-spec rows are vetoed for the join
+// window). Uses the mature
 // "wait for attack" gate the rotation already honors (AttackAction skips
 // bot->Attack and the multiplier zeroes combat actions), plus an explicit
 // stay hold so the allowed "keep safe distance" action cannot drift the bots
-// toward the mob. The stay is released together with the wait window.
+// toward the mob. The stay is released together with the wait window, or
+// earlier by combat end, death or a movement order; the window itself only
+// ends on its own clock or with its strategy (attack, flee, co -wait for
+// attack; see PullJoinWindowPolicy.h).
 // joinDelaySeconds is clamped to the uint8 value range (0-60 at the parser).
 // For a pullback the DPS must additionally wait out the tank's return leg:
 // the window is widened to cover the capped return plus the join delay, and
@@ -278,24 +416,45 @@ void PausePartyDpsForPull(BotCommandContext const& context, Player* executor, ui
         if (!bot || bot == executor)
             continue;
         PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai || PlayerbotAI::IsHeal(bot, true))
+        // A healer is held only in the run leader's pulls: it stands on its
+        // stand and keeps healing (Uldaman run 4: the one bot not put on stay
+        // followed the tank to the camp, wanded and died).
+        bool const healer = ai && PlayerbotAI::IsHeal(bot, true);
+        if (!ai || (healer && !context.runLeader))
             continue;
         if (ai->GetForcedRole() == static_cast<uint8>(BOT_ROLE_TANK) ||
             PlayerbotAI::IsTank(bot, true))
             continue;
+        WorldPosition stand = anchor;
+        if (healer)
+        {
+            // Heals only, from behind the tank (PlayerbotAI::RunHealOnly; the
+            // run leader's sync keeps it set for the run).
+            ai->SetRunHealOnly(true);
+            if (context.noteHealOnly)
+                context.noteHealOnly(bot);
+            float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+            if (context.healerStand && context.healerStand(bot, hx, hy, hz))
+                stand = WorldPosition(anchor.GetMapId(), hx, hy, hz);
+        }
         // Hold this bot at the anchor: stay owns the movement mode, and the
         // anchor copy lets the release step distinguish our hold from a
         // player-placed stay (only ours is cleared).
         ai->SetMovementStrategy("stay");
         ai::PositionMap& posMap = ai->GetAiObjectContext()->GetValue<ai::PositionMap&>("position")->Get();
         ai::PositionEntry stayPos = posMap["stay"];
-        stayPos.Set(anchor.getX(), anchor.getY(), anchor.getZ(), anchor.GetMapId());
+        stayPos.Set(stand.getX(), stand.getY(), stand.getZ(), stand.GetMapId());
         posMap["stay"] = stayPos;
+        // An explicit order is a fresh stay walk, even to the same spot (StayWalkOrdered).
+        TortoiseBots::StayWalkOrdered(ai->GetAiObjectContext()->GetValue<ai::LastMovement&>("last movement")->Get().stayWalk);
         ai::PositionEntry holdPos = posMap["pull hold"];
-        holdPos.Set(anchor.getX(), anchor.getY(), anchor.getZ(), anchor.GetMapId());
+        holdPos.Set(stand.getX(), stand.getY(), stand.getZ(), stand.GetMapId());
         posMap["pull hold"] = holdPos;
-        ai->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(static_cast<uint8>(windowSeconds));
-        ai->ChangeStrategy("+wait for attack", BotState::BOT_STATE_ALL);
+        // "wait for attack" with this pull's delay, on its own clock from here
+        // (PullJoinWindowPolicy.h). A "wait for attack" or a delay the player
+        // set is theirs and comes back unchanged when the window ends; one an
+        // earlier pull left (a chain pull) stays the pull's.
+        ai->StartPullWindow(static_cast<uint8>(windowSeconds), context.runLeader, static_cast<uint8>(std::min<uint32>(joinDelaySeconds, 255)));
         // Fresh combat window: a stale combat-start timestamp would expire the
         // hold immediately, so reset it for the incoming pull engagement.
         // Re-stamped when the pull lands (plain pull) or when the tank
@@ -305,27 +464,11 @@ void PausePartyDpsForPull(BotCommandContext const& context, Player* executor, ui
     }
 }
 
-// Release the anchor hold placed by PausePartyDpsForPull. Dropping the wait
-// window also drops the hold (PlayerbotAI::ChangeStrategy owns that rule, and
-// the hold marker is what keeps a player-placed stay out of it).
-void ReleasePartyDpsFromPull(BotCommandContext const& context, Player* executor)
-{
-    for (Player* bot : context.partyBots)
-    {
-        if (!bot || bot == executor)
-            continue;
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai || !ai->GetAiObjectContext())
-            continue;
-        ai->ChangeStrategy("-wait for attack", BotState::BOT_STATE_ALL);
-    }
-}
-
 // Per-command return mode: the `pull back` strategy stays the mature switch,
 // but the command snapshots the tank's default and records the per-request
 // mode on the PullStrategy. PullEndAction restores the default, so a pull
 // never leaks into the next command and a pullback never sticks.
-bool ConfigurePullMode(PlayerbotAI* ai, bool pullback, uint32 joinDelaySeconds)
+bool ConfigurePullMode(PlayerbotAI* ai, bool pullback, uint32 joinDelaySeconds, bool rangedOrder)
 {
     if (!ai)
         return false;
@@ -342,7 +485,7 @@ bool ConfigurePullMode(PlayerbotAI* ai, bool pullback, uint32 joinDelaySeconds)
     if (applied)
     {
         if (PullStrategy* strategy = PullStrategy::Get(ai))
-            strategy->BeginCommand(pullback, hadPullBack, joinDelaySeconds);
+            strategy->BeginCommand(pullback, hadPullBack, joinDelaySeconds, rangedOrder);
     }
     return applied;
 }
@@ -450,7 +593,7 @@ static uint32 CcSpellPreference(std::string const& spell)
 }
 
 static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const& mark,
-    uint32* outPreference = nullptr)
+    uint32* outPreference, CcDenyReason* outDeny, std::string* outDenySpell)
 {
     if (!ai || !target || !target->IsInWorld() || !target->IsAlive())
         return {};
@@ -494,6 +637,10 @@ static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const
     std::set<std::string> probedSpells;
     std::string selectedAction;
     uint32 selectedPreference = 0;
+    bool anyCcSpellKnown = false;
+    bool anyOutdoorsOnly = false;
+    std::string outdoorsSpell;
+    bool anyCreatureMismatch = false;
     for (std::string const& actionName : actionNames)
     {
         ai::Action* action = context->GetAction(actionName);
@@ -503,6 +650,28 @@ static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const
         std::string spell = action->GetCrowdControlSpellName();
         if (spell.empty() || !ai->HasSpell(spell))
             continue;
+        anyCcSpellKnown = true;
+
+        // Durable misses first: isPossible() only knows the spell is ready,
+        // and CanCastSpell reports whatever check fails first, so an
+        // outdoors-only Roots indoors or Hibernate on a humanoid slipped
+        // through as castable.
+        if (SpellEntry const* info = sServerFacade.LookupSpellInfo(context->GetValue<uint32>("spell id", spell)->Get()))
+        {
+            Player* bot = ai->GetBot();
+            if ((info->Attributes & SPELL_ATTR_OUTDOORS_ONLY) &&
+                !bot->GetMap()->GetTerrain()->IsOutdoors(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()))
+            {
+                anyOutdoorsOnly = true;
+                outdoorsSpell = spell;
+                continue;
+            }
+            if (info->TargetCreatureType && !(info->TargetCreatureType & target->GetCreatureTypeMask()))
+            {
+                anyCreatureMismatch = true;
+                continue;
+            }
+        }
 
         uint32 preference = CcSpellPreference(spell);
         if (!selectedAction.empty() && preference >= selectedPreference)
@@ -519,9 +688,23 @@ static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const
             continue;
 
         bool possible = action->isPossible();
-        bool spellLegal = ai->CanCastSpell(spell, target, 0, nullptr, true, true, true);
+        SpellCastResult castResult = SPELL_FAILED_DONT_REPORT;
+        bool spellLegal = ai->CanCastSpell(spell, target, 0, nullptr, true, true, true, &castResult);
         if (!possible && !spellLegal)
+        {
+            // Durable reasons only: a cooldown, a missing reagent, a move
+            // in progress all clear on their own. Outdoors-only and a
+            // creature-type mismatch never clear for this target here.
+            if (castResult == SPELL_FAILED_ONLY_OUTDOORS)
+            {
+                anyOutdoorsOnly = true;
+                outdoorsSpell = spell;
+            }
+            else if (castResult == SPELL_FAILED_BAD_TARGETS || castResult == SPELL_FAILED_TARGET_IS_PLAYER ||
+                castResult == SPELL_FAILED_IMMUNE)
+                anyCreatureMismatch = true;
             continue;
+        }
 
         selectedAction = actionName;
         selectedPreference = preference;
@@ -534,6 +717,20 @@ static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const
 
     if (outPreference)
         *outPreference = selectedPreference;
+    if (!selectedAction.empty())
+    {
+        if (outDeny)
+            *outDeny = CcDenyReason::None;
+        return selectedAction;
+    }
+    // Rank the durable failure for the caller's message: a spell the bot
+    // knows but can never cast here beats a spell it never learned.
+    if (outDeny)
+        *outDeny = !anyCcSpellKnown ? CcDenyReason::NoSpellKnown
+            : anyOutdoorsOnly ? CcDenyReason::OutdoorsOnly
+            : anyCreatureMismatch ? CcDenyReason::WrongCreatureType : CcDenyReason::Transient;
+    if (outDenySpell)
+        *outDenySpell = outdoorsSpell;
     return selectedAction;
 }
 
@@ -542,6 +739,16 @@ static std::string FindCcAction(PlayerbotAI* ai, Unit* target, std::string const
 Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::string const& mark,
     std::string* outAction)
 {
+    return ResolveCcExecutor(context, target, mark, outAction, nullptr, nullptr);
+}
+
+Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::string const& mark,
+    std::string* outAction, CcDenyReason* outDeny, std::string* outDenySpell)
+{
+    if (outDeny)
+        *outDeny = CcDenyReason::None;
+    if (outDenySpell)
+        outDenySpell->clear();
     if (!target)
         return nullptr;
 
@@ -550,7 +757,7 @@ Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::s
         PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(context.selectedBot);
         if (ai)
         {
-            std::string action = FindCcAction(ai, target, mark);
+            std::string action = FindCcAction(ai, target, mark, nullptr, outDeny, outDenySpell);
             if (!action.empty())
             {
                 if (outAction) *outAction = action;
@@ -559,12 +766,15 @@ Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::s
         }
         return nullptr;
     }
-
     // Best spell fit wins; ties go to the lowest GUID so the same target and
-    // state pick the same executor regardless of party invite order.
+    // state pick the same executor regardless of party invite order. Bots
+    // with a durable failure still report it, so the caller can refuse with
+    // a reason instead of a bare no-cc.
     Player* best = nullptr;
     std::string bestAction;
     uint32 bestPreference = 0;
+    CcDenyReason bestDeny = CcDenyReason::Transient;
+    std::string bestDenySpell;
     for (Player* bot : context.partyBots)
     {
         if (!IsLiveHeadlessBot(bot))
@@ -573,9 +783,21 @@ Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::s
         if (!ai)
             continue;
         uint32 preference = 0;
-        std::string action = FindCcAction(ai, target, mark, &preference);
+        CcDenyReason deny = CcDenyReason::None;
+        std::string denySpell;
+        std::string action = FindCcAction(ai, target, mark, &preference, &deny, &denySpell);
         if (action.empty())
+        {
+            // First durable failure wins the message; transient ones stay
+            // silent unless nothing durable was found.
+            if (bestDeny == CcDenyReason::Transient && deny != CcDenyReason::None &&
+                deny != CcDenyReason::Transient)
+            {
+                bestDeny = deny;
+                bestDenySpell = denySpell;
+            }
             continue;
+        }
         if (!best || preference < bestPreference ||
             (preference == bestPreference && bot->GetObjectGuid() < best->GetObjectGuid()))
         {
@@ -587,7 +809,35 @@ Player* ResolveCcExecutor(BotCommandContext const& context, Unit* target, std::s
 
     if (best && outAction)
         *outAction = bestAction;
+    if (!best)
+    {
+        if (outDeny)
+            *outDeny = bestDeny == CcDenyReason::Transient && bestDenySpell.empty()
+                ? CcDenyReason::Transient : bestDeny;
+        if (outDenySpell)
+            *outDenySpell = bestDenySpell;
+    }
+    else if (outDeny)
+        *outDeny = CcDenyReason::None;
     return best;
+}
+
+std::string CcDenyText(CcDenyReason reason, std::string const& spell, std::string const& targetName)
+{
+    std::string const target = targetName.empty() ? "this target" : targetName;
+    switch (reason)
+    {
+        case CcDenyReason::OutdoorsOnly:
+            return "cannot CC " + target + ": " + spell + " only works outdoors.";
+        case CcDenyReason::WrongCreatureType:
+            return "cannot CC " + target + ": no known CC spell fits its creature type here.";
+        case CcDenyReason::NoSpellKnown:
+            return "cannot CC " + target + ": no CC spell known.";
+        case CcDenyReason::Transient:
+        case CcDenyReason::None:
+            break;
+    }
+    return {};
 }
 
 std::string RosterState(Player* bot, BotRecord const* suppliedRecord)

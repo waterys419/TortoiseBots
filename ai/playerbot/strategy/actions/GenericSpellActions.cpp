@@ -1,10 +1,19 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/GroupBuffPolicy.h"
+#include "playerbot/ForceRebuffPolicy.h"
 #include "playerbot/GroupMembers.h"
+#include "playerbot/WandPolicy.h"
+#include "../../../../runtime/TotemSpellPolicy.h"
 #include "GenericActions.h"
 #include "UseItemAction.h"
+#include "playerbot/strategy/values/TargetValue.h"
+#include "playerbot/strategy/values/PartyMemberToHeal.h"
+#include "playerbot/strategy/triggers/GenericTriggers.h"
+#include "Database/DBCStores.h"
+#include "BotActionLog.h"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -13,6 +22,74 @@ using namespace ai;
 
 namespace
 {
+// True when `info` hits enemies in an area that would reach crowd control:
+// a mob in damage-breakable CC within the blast, the caster's own CC mark
+// while it will still CC it, or a held CC mark (under a CC cast bar or in
+// its hold window) - for instant, chained and lingering areas alike. The
+// shape comes from the spell data (both implicit targets: Frost
+// Nova and Thunder Clap name the enemy area in target B): caster-centred
+// areas and cones use the caster (a cone is checked as a full circle),
+// ground/dest areas and chains the spell target. Single-target spells never
+// enter the loop over attackers, so the cost stays on area casts.
+bool BreaksCcInArea(PlayerbotAI* ai, Player* bot, SpellEntry const* info, Unit* spellTarget)
+{
+    if (!info || !spellTarget)
+        return false;
+
+    bool area = false;
+    bool atTarget = false;
+    float radius = 0.0f;
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        uint32 const targetA = info->EffectImplicitTargetA[i];
+        uint32 const targetB = info->EffectImplicitTargetB[i];
+        uint32 const enemyArea =
+            (targetA == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC || targetA == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC ||
+             targetA == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 || targetA == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC ||
+             targetA == TARGET_ENUM_UNITS_ENEMY_WITHIN_CASTER_RANGE) ? targetA :
+            (targetB == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC || targetB == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC ||
+             targetB == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 || targetB == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC ||
+             targetB == TARGET_ENUM_UNITS_ENEMY_WITHIN_CASTER_RANGE) ? targetB : 0;
+
+        float effectRadius = 0.0f;
+        if (SpellRadiusEntry const* radiusEntry = sSpellRadiusStore.LookupEntry(info->EffectRadiusIndex[i]))
+            effectRadius = radiusEntry->Radius;
+
+        if (enemyArea)
+        {
+            area = true;
+            // Dest/ground areas land on the spell target unless the dest is
+            // the caster itself (Consecration: A = caster dest, B = area).
+            if ((enemyArea == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC || enemyArea == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC) &&
+                targetA != TARGET_LOCATION_CASTER_SRC && targetA != TARGET_LOCATION_CASTER_DEST)
+                atTarget = true;
+            if (effectRadius <= 0.0f)
+                if (SpellRangeEntry const* rangeEntry = sSpellRangeStore.LookupEntry(info->rangeIndex))
+                    effectRadius = rangeEntry->maxRange;
+        }
+        else if (targetA == TARGET_UNIT_ENEMY && info->EffectChainTarget[i] > 1)
+        {
+            // Chains (Cleave, Chain Lightning, Multi-Shot) jump from the target.
+            area = true;
+            atTarget = true;
+            effectRadius = std::max(effectRadius, info->DmgClass == SPELL_DAMAGE_CLASS_MELEE ?
+                float(ATTACK_DISTANCE) : float(CHAIN_SPELL_JUMP_RADIUS));
+        }
+        else
+            continue;
+
+        radius = std::max(radius, effectRadius);
+    }
+
+    if (!area)
+        return false;
+
+    // Instant areas and chains spare a held mark too (CcAreaSpellBlocked):
+    // build 13 had the tank on the Moon mob inside its hold.
+    CcGuard ccGuard(ai);
+    return ccGuard.ProtectedEnemyNear(atTarget ? static_cast<WorldObject*>(spellTarget) : bot, radius, true);
+}
+
 bool CanInterruptCurrentSpell(Spell const* spell)
 {
     // The core has no CanBeInterrupted() helper, but its spell state is the
@@ -32,11 +109,8 @@ uint32 const BUFF_RETRY_COOLDOWN = 3;
 uint32 const GREATER_BUFF_RETRY_COOLDOWN = 60;
 // Seconds between two "SelfBuff" telemetry rows for the same bot and spell.
 uint32 const SELF_BUFF_EVENT_INTERVAL = 10;
-// Mana percent an upkeep buff waits for before it is (re)cast (issue #378).
-// A charge buff (Shadowguard, Touch of Weakness, Inner Fire, shields) is spent
-// by being hit and then re-cast at full price, so it uses the higher floor.
-uint8 const BUFF_MIN_MANA_PERCENT = 40;
-uint8 const CHARGE_BUFF_MIN_MANA_PERCENT = 70;
+// Mana floors live in ai::BuffManaFloor (GroupBuffPolicy.h): 40/70 pool,
+// 20/40 with a real player master.
 
 // Issue #T7: how long a buff claim keeps the other buffers of the same spell
 // away. Must cover the cast plus the delay before the aura lands (the longest
@@ -205,7 +279,16 @@ bool CastSpellAction::Execute(Event& event)
                 ai->CastSpell("auto shot", target);
         }
 
-        executed = ai->CastSpell(spellName, target, nullptr, false, &spellDuration);
+        // An explicit rank override (SetSpellId) casts that id: re-resolving
+        // the spell name would always land the top rank and drop the pick.
+        if (spellIdOverride)
+        {
+            executed = ai->CastSpell(spellIdOverride, target, nullptr, false, &spellDuration);
+            if (executed)
+                ai->GetAiObjectContext()->GetValue<time_t>("last spell cast time", spellName)->Set(time(0));
+        }
+        else
+            executed = ai->CastSpell(spellName, target, nullptr, false, &spellDuration);
     }
 
     if (executed)
@@ -273,11 +356,22 @@ bool CastSpellAction::isPossible()
 
     if(!canReach)
     {
+        botdiag::BotActionLog::Write(ai, "CAST_REFUSED", "spell=%s reason=out-of-reach", spellName.c_str());
         return false;
     }
 
-    // Check if the spell can be casted
-	return ai->CanCastSpell(spellName, spellTarget, 0, nullptr, true);
+    // Check if the spell can be casted; log the core verdict so a bare
+    // IMPOSSIBLE in the action log names its cause.
+    SpellCastResult result = SPELL_CAST_OK;
+    if (!ai->CanCastSpell(spellName, spellTarget, 0, nullptr, true, false, false, &result))
+    {
+        // NOT_READY (GCD / cast in flight) is every tick's normal answer
+        // between casts; logging it would bury the real refusals.
+        if (result != SPELL_FAILED_NOT_READY)
+            botdiag::BotActionLog::Write(ai, "CAST_REFUSED", "spell=%s result=%u", spellName.c_str(), (uint32)result);
+        return false;
+    }
+    return true;
 }
 
 bool CastSpellAction::isUseful()
@@ -292,9 +386,29 @@ bool CastSpellAction::isUseful()
     if (!spellTarget->IsInWorld() || spellTarget->GetMapId() != bot->GetMapId())
         return false;
 
+    // A hostile totem (a healing ward too) is immune to every aura of a
+    // non-positive spell, to heals, energize and taunts (the core's
+    // Totem::IsImmuneToSpellEffect, Totem.cpp): a DoT, curse, sting, mark,
+    // slow or CC cast at it does nothing. Only spells with an effect it takes
+    // are cast at it; the bot falls through to its strikes, shots and wand
+    // (runtime/TotemSpellPolicy.h).
+    if (spellTarget != bot && spellTarget->IsCreature() && static_cast<Creature*>(spellTarget)->IsTotem() &&
+        !sServerFacade.IsFriendlyTo(spellTarget, bot))
+    {
+        if (SpellEntry const* info = sServerFacade.LookupSpellInfo(spellId))
+            if (!TortoiseBots::SpellWorksOnTotem(info->Effect, info->EffectApplyAuraName,
+                    info->EffectImplicitTargetA, MAX_EFFECT_INDEX, info->IsPositiveSpell()))
+                return false;
+    }
+
+    // Never splash crowd control: an enemy-area spell whose blast would reach
+    // a sheeped/sapped mob, the caster's own CC mark (it sheeps that mob
+    // next) or a held CC mark (being or about to be sheeped) is not cast.
+    if (BreaksCcInArea(ai, bot, sServerFacade.LookupSpellInfo(spellId), spellTarget))
+        return false;
+
     return true;
 }
-
 NextAction** CastSpellAction::getPrerequisites()
 {
     // Set the reach action as the cast spell prerequisite when needed
@@ -330,6 +444,8 @@ void CastSpellAction::SetSpellName(const std::string& name, std::string spellIDC
     {
         spellName = name;
         spellId = ai->GetAiObjectContext()->GetValue<uint32>(spellIDContextName, name)->Get();
+        resolvedSpellId = spellId;
+        spellIdOverride = 0;
 
         float spellRange;
         if (ai->GetSpellRange(spellName, &spellRange))
@@ -337,6 +453,26 @@ void CastSpellAction::SetSpellName(const std::string& name, std::string spellIDC
             range = spellRange;
         }
     }
+}
+
+void CastSpellAction::SetSpellId(uint32 id)
+{
+    if (id && id != spellId)
+    {
+        spellId = id;
+        spellIdOverride = id;
+        float spellRange;
+        if (ai->GetSpellRange(spellName, &spellRange))
+            range = spellRange;
+    }
+}
+
+void CastSpellAction::ClearSpellIdOverride()
+{
+    if (!spellIdOverride)
+        return;
+    spellIdOverride = 0;
+    spellId = resolvedSpellId;
 }
 
 Value<Unit*>* CastSpellAction::GetTargetValue()
@@ -406,6 +542,20 @@ bool CastAuraSpellAction::isUseful()
     // still up but expiring, so the recast lands before the buff drops.
     // Short combat buffs (max < 5 min) only re-arm on fall-off, as before.
     Aura* aura = ai->GetAura(GetSpellName(), target, isOwner);
+    // Force-rebuff pass (donor BuffBelowRefreshTarget action site): while a
+    // rebuff window is pending OOC, a LONG buff below the margin rule counts
+    // as useful so the expiring cast actually starts. Outside the window
+    // the normal refresh rule applies.
+    if (aura && !bot->IsInCombat())
+    {
+        AiObjectContext* rebuffContext = ai->GetAiObjectContext();
+        uint32 beginMs = rebuffContext ? rebuffContext->GetValue<int32>("manual int", "force rebuff begin ms")->Get() : 0;
+        uint32 nowMs = WorldTimer::getMSTime();
+        if (beginMs && ai::ForceRebuffPending(beginMs, nowMs) &&
+            ai::ForceRebuffBelowTarget(true, aura->GetAuraDuration(),
+                aura->GetAuraMaxDuration(), beginMs, nowMs))
+            return CastSpellAction::isUseful();
+    }
     return CastSpellAction::isUseful() && ai::BuffNeedsRefresh(aura != nullptr,
         aura ? aura->GetAuraDuration() : 0, aura ? aura->GetAuraMaxDuration() : 0);
 }
@@ -422,8 +572,10 @@ bool CastBuffSpellAction::isUseful()
 
     // Issue #378: the mana floor and the retry window are upkeep rules. Combat
     // casts of the same spells (seals, totems, Mana Shield, Earth Shield, an
-    // Inner Fire re-apply) must never be held back by them.
-    if (!bot->IsInCombat())
+    // Inner Fire re-apply) must never be held back by them. "Combat" means the
+    // combat engine with the combat flag set: the non-combat engine runs the
+    // upkeep rows while the flag can still be on, and must keep the floor.
+    if (ai::UpkeepBuffRulesApply(bot->IsInCombat(), ai->IsStateActive(BotState::BOT_STATE_COMBAT)))
     {
         if (target && lastAttemptTime && target->getObjectGuid() == lastAttemptTarget &&
             time(0) - lastAttemptTime < (time_t)GetBuffRetryCooldown())
@@ -478,8 +630,13 @@ bool CastBuffSpellAction::HasManaForBuff()
     if (!manaCost)
         return true;
 
-    uint8 const minMana = spellInfo->procCharges ? CHARGE_BUFF_MIN_MANA_PERCENT : BUFF_MIN_MANA_PERCENT;
-    return ai->GetManaPercent() >= minMana;
+    uint8 const minMana = ai::BuffManaFloor(spellInfo->procCharges != 0, ai->HasRealPlayerMaster());
+    // A real player's party bot keeps the floor after the cast (it must drink
+    // before the next pull); pool bots keep the plain floor check, so low-level
+    // casters are not held back on their own armor and self buffs.
+    if (!ai->HasRealPlayerMaster())
+        return ai->GetManaPercent() >= minMana;
+    return ai::ManaStaysAboveFloor(bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA), manaCost, minMana);
 }
 
 uint32 CastBuffSpellAction::GetBuffRetryCooldown() const
@@ -513,6 +670,10 @@ uint32 BuffOnPartyAction::CountGroupMembersMissingBoth(std::string const& groupN
     {
         if (!member || !member->IsInWorld() || member->GetMapId() != bot->GetMapId() || !sServerFacade.IsAlive(member))
             continue;
+        // A hidden GM never gets the buff (see PartyMemberValue::Check), so
+        // counting them would keep the group version wanted forever.
+        if (member->GetVisibility() == VISIBILITY_OFF)
+            continue;
         Aura* single = ai->GetAura(GetSpellName(), member);
         if (!ai::BuffNeedsRefresh(single != nullptr, single ? single->GetAuraDuration() : 0,
             single ? single->GetAuraMaxDuration() : 0))
@@ -545,21 +706,30 @@ bool BuffOnPartyAction::isUseful()
 
 bool CastBuffSpellAction::Execute(Event& event)
 {
-    // Recorded before the cast so a failed attempt starts the cooldown too -
-    // otherwise the action is retried on every tick (issue #359). The claim
-    // (issue #T7) is written at the same point, so the other buffers of the same
-    // spell see the cast while its aura is still in flight.
-    if (Unit* target = GetTarget())
+    Unit* const target = GetTarget();
+
+    if (!CastSpellAction::Execute(event))
+        return false;
+
+    // Force-rebuff pass (donor NoteBuffWork, window-gated like the donor):
+    // a buff cast that actually starts marks work this cycle so the
+    // ready-check gate holds the confirm while casts are still landing.
+    // Failed casts mark nothing, and casts with no window open mark nothing
+    // (chained instant OOC buffs must not delay a held confirm tick by tick
+    // outside any pass).
+    if (!bot->IsInCombat())
+    {
+        uint32 beginMs = context->GetValue<int32>("manual int", "force rebuff begin ms")->Get();
+        if (beginMs && ai::ForceRebuffPending(beginMs, WorldTimer::getMSTime()))
+            context->GetValue<bool>("manual bool", "force rebuff buff pending")->Set(true);
+    }
+    if (target)
     {
         lastAttemptTarget = target->getObjectGuid();
         ClaimBuffCast(target);
     }
     lastAttemptTime = time(0);
 
-    if (!CastSpellAction::Execute(event))
-        return false;
-
-    Unit* target = GetTarget();
     if (target && target == bot)
     {
         time_t const now = time(0);
@@ -591,6 +761,181 @@ bool CastAoeHealSpellAction::isUseful()
     return CastSpellAction::isUseful();
 }
 
+// Night2 gaps 1+2 (donor HealerAutoSaveManaMultiplier): refuse to START a
+// single-target direct heal whose expected amount dwarfs the target's
+// missing health, and refuse mana-hungry heals while the healer runs low.
+// Never vetoes a target in danger (at/below lowHealth): a vetoed big heal
+// falls through to the cheaper alternative in the same trigger row
+// (flash -> greater -> heal -> lesser via the action-node fallback chain).
+bool HealPartyMemberAction::isUseful()
+{
+    Unit* target = GetTarget();
+    if (!target)
+        return false;
+    // Skip the start gate while this cast is already downranked: Execute
+    // runs after isUseful each tick and would re-swap the same id (the
+    // cached actions live as long as the bot). Clear-then-gate keeps the
+    // decision stateless across ticks: the gate always sees the top rank.
+    ClearSpellIdOverride();
+    HealerManaState heal{};
+    heal.targetHealth = target->GetHealthPercent() > 100.0f ? 100 : (std::uint8_t)target->GetHealthPercent();
+    // Count heals other healers are already casting at this target — but only
+    // above lowHealth. A member in danger must read as wounded so every
+    // healer keeps casting: one slow cast in flight (or one spike hit) must
+    // never stand the whole roster down on a 25 % tank.
+    if (heal.targetHealth > sPlayerbotAIConfig.lowHealth && target->GetMaxHealth())
+    {
+        uint32 const withIncoming = HealthWithIncoming(target->GetHealth(), target->GetMaxHealth(),
+            GetIncomingHeal(ai, target), sPlayerbotAIConfig.lowHealth);
+        heal.targetHealth = withIncoming >= target->GetMaxHealth() ? 100 : std::uint8_t(withIncoming * 100 / target->GetMaxHealth());
+    }
+    heal.healerMana = AI_VALUE2(uint8, "mana", "self target");
+    heal.estAmount = estAmount;
+    heal.efficiency = manaEfficiency;
+    heal.targetIsTank = target->IsPlayer() && ai->IsTank((Player*)target, false);
+    heal.lowHealth = sPlayerbotAIConfig.lowHealth;
+    heal.mediumHealth = sPlayerbotAIConfig.mediumHealth;
+    heal.mediumMana = sPlayerbotAIConfig.mediumMana;
+    if (!ShouldStartHeal(heal))
+    {
+        // A downrankable line still gets its cast when a cheaper rank fits
+        // the wound: the gate above vetoes on the TOP rank's estimate, so a
+        // small wound would never reach Execute to pick the small rank. A
+        // cheaper fitting rank means this is a waste-of-mana veto, not a
+        // no-wound one — a full-health target must stay vetoed.
+        if (target->GetMaxHealth() && target->GetHealth() < target->GetMaxHealth() && DownrankSpellId(target))
+            return CastHealingSpellAction::isUseful();
+        return false;
+    }
+    return CastHealingSpellAction::isUseful();
+}
+
+uint32 HealPartyMemberAction::DownrankSpellId(Unit* target)
+{
+    // The action was built with the TOP rank's spell id (SpellIdValue always
+    // picks max rank at save level 1), so a small wound still pays the
+    // big-heal price. Return the cheapest known rank covering the wound
+    // (missing minus heals already incoming); the top rank on emergency
+    // (the policy says so). An explicit player save-mana level keeps the old
+    // pick (the player asked for cheap ranks by hand). Only plain
+    // single-target direct heals qualify: no HoT/shield/hybrid (their value
+    // is not the direct amount), no AoE jumps, no cooldown spells. HoTs ride
+    // HealHotPartyMemberAction::Execute below (no downrank: their ticks, not
+    // the direct portion, are the point). 0 = do not downrank.
+    if (!target || AI_VALUE(double, "mana save level") > 1.0)
+        return 0;
+    SpellEntry const* topInfo = sServerFacade.LookupSpellInfo(GetSpellID());
+    if (!topInfo || !PlayerbotAI::IsHealSpell(topInfo))
+        return 0;
+    // Turtle's Healing Wave rows target TARGET_UNIT_FRIEND_CHAIN_HEAL (45)
+    // with zero jumps — same id as Chain Heal, which really jumps
+    // (EffectChainTarget 3). Accept the id, reject actual jumps below.
+    bool directHeal = false;
+    bool hybrid = false;
+    for (uint32 effect = 0; effect < MAX_EFFECT_INDEX; ++effect)
+    {
+        if (!topInfo->Effect[effect])
+            continue;
+        if (topInfo->Effect[effect] == SPELL_EFFECT_HEAL ||
+            topInfo->Effect[effect] == SPELL_EFFECT_HEAL_MAX_HEALTH ||
+            topInfo->Effect[effect] == SPELL_EFFECT_HEAL_MECHANICAL)
+            directHeal = true;
+        else
+            hybrid = true;
+    }
+    // Jump-less single-target lines only (HealTargetAllowsDownrank): Turtle's
+    // Healing Wave rows carry the chain-heal target id with zero jumps, so
+    // they qualify; Chain Heal really jumps and stays top rank.
+    if (!directHeal || hybrid || topInfo->IsChanneledSpell() ||
+        topInfo->RecoveryTime != 0 || topInfo->CategoryRecoveryTime != 0 ||
+        !HealTargetAllowsDownrank(topInfo->EffectImplicitTargetA[0], topInfo->EffectChainTarget[0]))
+        return 0;
+    std::string name = GetSpellName();
+    strToLower(name);
+    std::vector<HealRankOption> ranks;
+    for (PlayerSpellMap::const_iterator itr = bot->GetSpellMap().begin();
+         itr != bot->GetSpellMap().end(); ++itr)
+    {
+        if (itr->second.state == PLAYERSPELL_REMOVED || itr->second.disabled ||
+            IsPassiveSpell(itr->first))
+            continue;
+        SpellEntry const* info = sServerFacade.LookupSpellInfo(itr->first);
+        // Same spell line: name match first (cheap), family/icon
+        // confirm (ranks share both; different spells do not).
+        if (!info)
+            continue;
+        std::string rankName = info->SpellName[0];
+        strToLower(rankName);
+        if (rankName != name || info->SpellFamilyName != topInfo->SpellFamilyName ||
+            info->SpellIconID != topInfo->SpellIconID)
+            continue;
+        uint32 heal = 0;
+        for (uint32 effect = 0; effect < MAX_EFFECT_INDEX; ++effect)
+        {
+            if (info->Effect[effect] != SPELL_EFFECT_HEAL &&
+                info->Effect[effect] != SPELL_EFFECT_HEAL_MAX_HEALTH &&
+                info->Effect[effect] != SPELL_EFFECT_HEAL_MECHANICAL)
+                continue;
+            // Same estimate shape as the server's EffectHeal:
+            // base incl. level scaling, then the +healing bonus.
+            int32 base = bot->CalculateSpellDamage(target, info, SpellEffectIndex(effect), nullptr);
+            if (base <= 0)
+                continue;
+            heal += bot->SpellHealingBonusDone(target, info, SpellEffectIndex(effect), base, HEAL);
+        }
+        if (!heal)
+            continue;
+        uint32 mana = info->manaCost
+            ? info->manaCost
+            : uint32(info->ManaCostPercentage) * bot->GetCreateMana() / 100;
+        ranks.push_back({itr->first, heal, mana});
+    }
+    if (ranks.size() < 2)
+        return 0;
+    std::sort(ranks.begin(), ranks.end(),
+        [](HealRankOption const& a, HealRankOption const& b) { return a.mana < b.mana; });
+    uint32 const maxHealth = target->GetMaxHealth();
+    uint32 missing = 0;
+    if (maxHealth && target->GetHealth() < maxHealth)
+        missing = maxHealth - target->GetHealth();
+    uint32 const incoming = GetIncomingHeal(ai, target);
+    missing = incoming >= missing ? 0 : missing - incoming;
+    if (!missing)
+        return 0;
+    float const healthPct = maxHealth ? target->GetHealth() * 100.0f / maxHealth : 100.0f;
+    // One melee swing of each attacker in reach, as % of the target's max
+    // health (the same pace signal the party heal rows use): a target the
+    // next swing pushes into the critical band keeps the top rank.
+    float const incomingPct = maxHealth
+        ? float(AI_VALUE2(uint32, "incoming damage", GetTargetName())) * 100.0f / float(maxHealth)
+        : 0.0f;
+    HealDownrankState const state{missing,
+        healthPct > 100.0f ? 100 : (std::uint8_t)healthPct,
+        (std::uint8_t)sPlayerbotAIConfig.lowHealth,
+        (std::uint8_t)sPlayerbotAIConfig.criticalHealth,
+        incomingPct > 100.0f ? 100 : (std::uint8_t)incomingPct};
+    return PickHealRank(ranks, state);
+}
+
+bool HealPartyMemberAction::Execute(Event& event)
+{
+    // Downrank at cast start when the wound does not need the top rank.
+    // The base Execute casts whatever SetSpellId pointed at; without a swap
+    // the override stays 0 and the spell name resolves as before.
+    if (Unit* target = GetTarget())
+        if (uint32 const rankId = DownrankSpellId(target))
+            SetSpellId(rankId);
+    return CastSpellAction::Execute(event);
+}
+
+bool HealHotPartyMemberAction::Execute(Event& event)
+{
+    // HoTs are never downranked here: their ticks are the point, not the
+    // direct portion. Skip the rank swap, cast at the resolved rank.
+    return CastSpellAction::Execute(event);
+}
+
+
 bool HealHotPartyMemberAction::isUseful()
 {
     return HealPartyMemberAction::isUseful() && !ai->HasAura(GetSpellName(), GetTarget());
@@ -611,6 +956,27 @@ bool CastShootAction::isPossible()
     }
 
     return false;
+}
+
+bool CastShootAction::isUseful()
+{
+    if (!CastSpellAction::isUseful())
+        return false;
+
+    // A wand started now renews the GCD on every shot and starves a CC
+    // that waits for its spell (WandBlocksCcTrigger): leave the wand off
+    // while the bot's CC is in range and held back by the GCD alone (the
+    // answer is cached for ~1 s, CcCastWaiting). Only the wand
+    // classes register "wand blocks cc"; for the others this is a miss.
+    WandBlocksCcTrigger* wandBlocksCc = dynamic_cast<WandBlocksCcTrigger*>(context->GetTrigger("wand blocks cc"));
+    if (wandBlocksCc && wandBlocksCc->CcCastWaiting())
+        return false;
+
+    // A grouped healer never starts a wand while somebody needs a heal, nor
+    // on a mob the party is not fighting yet (HealerMayWand, WandPolicy.h).
+    // Asked here and not only by the "healer should wand" row: a queued
+    // "shoot" outlives that row by up to ExpireActionTime.
+    return HealerWandAllowed(ai, GetTarget());
 }
 
 bool CastShootAction::Execute(Event& event)
@@ -712,6 +1078,22 @@ void CastShootAction::UpdateWeaponInfo()
     {
         rangedWeapon = nullptr;
     }
+}
+
+bool StopWandAction::isUseful()
+{
+    Spell* autoRepeat = bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL);
+    return autoRepeat && autoRepeat->m_spellInfo && autoRepeat->m_spellInfo->Category == WAND_SHOOT_CATEGORY;
+}
+
+bool StopWandAction::Execute(Event& event)
+{
+    // Sleep until both the last shot's GCD (it ends with the ranged timer)
+    // and the GCD of the bot's own last cast have run out (WandPolicy.h).
+    uint32 const wait = WandStopWaitMs(bot->GetAttackTimer(RANGED_ATTACK), ai->SpellGlobalCooldownRemainingMs(), sPlayerbotAIConfig.reactDelay);
+    bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+    SetDuration(wait);
+    return true;
 }
 
 bool RemoveBuffAction::isUseful()
@@ -962,14 +1344,11 @@ bool CastItemTargetAction::Execute(Event& event)
         if (!result)
             return false;
 
-        if (ai->HasCheat(BotCheatMask::item))
-        {
-            if (!HasSpellCooldown(itemId))
-            {
-                bot->RemoveSpellCooldown(spellInfo->Id, false);
-                bot->AddSpellAndCategoryCooldowns(spellInfo, proto->ItemId);
-            }
-        }
+        // NOTE: no manual cooldown on the item-cheat path (see UseAction::
+        // UseItemInternal). The core applies spell + category cooldowns in
+        // Spell::SendSpellCooldown after validation; pre-applying them here
+        // made the deferred SpellEvent re-validation see our own cooldown
+        // and cancel the just-started cast.
 
         ++count;
     }

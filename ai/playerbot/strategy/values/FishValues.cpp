@@ -1,7 +1,7 @@
 
 #include "playerbot/playerbot.h"
 #include "playerbot/ServerFacade.h"
-#include "playerbot/FishingSpotPolicy.h"
+#include "../../policy/loot/FishingSpotPolicy.h"
 #include "FishValues.h"
 #include "Timer.h"
 
@@ -15,7 +15,7 @@ bool CanFishValue::Calculate()
     // Levelling first, fishing as a side activity (review #402): pool bots
     // only, never swimming or fighting, bags with room, and an unspent
     // hourly session (5 casts / 5 min) with no levelling work pending.
-    if (!sRandomBotFacade.IsRandomBot(bot) || ai->HasRealPlayerMaster())
+    if (!sRandomBotFacade.IsFreeBot(bot) || ai->HasRealPlayerMaster())
         return false;
 
     if (bot->IsInWater() || bot->IsUnderwater())

@@ -2,6 +2,9 @@
 #include "playerbot/strategy/Action.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/PlayerbotAI.h"
+#include "playerbot/HealerManaPolicy.h"
+#include "playerbot/policy/heal/HealDownrankPolicy.h"
+#include "playerbot/strategy/values/CcMarkHoldPolicy.h"
 
 namespace ai
 {
@@ -47,6 +50,15 @@ namespace ai
         const uint32& GetSpellID() const { return spellId; }
         const std::string& GetSpellName() const { return spellName; }
         void SetSpellName(const std::string& name, std::string spellIDContextName = "spell id", bool force = false);
+        // Downrank swap: point this action at an already-chosen rank id
+        // (same spell line) and refresh the cached range. The id is an
+        // explicit override: the next Execute casts it instead of
+        // re-resolving the top rank from the spell name.
+        void SetSpellId(uint32 id);
+        // Drop a stale rank override and point back at the resolved rank
+        // (action objects live as long as the bot; an override set for one
+        // cast must not leak into the next). No-op when no override is set.
+        void ClearSpellIdOverride();
 
         Value<Unit*>* GetTargetValue() override;
         Unit* GetTarget() override;
@@ -62,6 +74,11 @@ namespace ai
     private:
         std::string spellName;
         uint32 spellId;
+        // Rank override from SetSpellId (0 = none, cast by spell name).
+        // resolvedSpellId is the id SetSpellName resolved, so clearing the
+        // override points back at it (spellId itself holds the swap).
+        uint32 resolvedSpellId = 0;
+        uint32 spellIdOverride = 0;
     };
 
     class CastPetSpellAction : public CastSpellAction
@@ -95,6 +112,33 @@ namespace ai
     {
     public:
         CastMeleeSpellAction(PlayerbotAI* ai, std::string spell) : CastSpellAction(ai, spell)
+        {
+            range = ATTACK_DISTANCE;
+        }
+
+    protected:
+        virtual std::string GetReachActionName() override { return "reach melee"; }
+    };
+
+    //---------------------------------------------------------------------------------------------------------------------
+    // The interrupt rows cast at the "interrupt target" pick - any engaged
+    // hostile in range casting an interruptible spell. Only rows fired by
+    // an interrupt trigger may use these: a shared action would drag
+    // non-interrupt rows off the current target.
+    class CastInterruptSpellAction : public CastSpellAction
+    {
+    public:
+        CastInterruptSpellAction(PlayerbotAI* ai, std::string spell) : CastSpellAction(ai, spell) {}
+
+    protected:
+        virtual std::string GetTargetName() override { return "interrupt target"; }
+        virtual std::string GetTargetQualifier() override { return GetSpellName(); }
+    };
+
+    class CastMeleeInterruptSpellAction : public CastInterruptSpellAction
+    {
+    public:
+        CastMeleeInterruptSpellAction(PlayerbotAI* ai, std::string spell) : CastInterruptSpellAction(ai, spell)
         {
             range = ATTACK_DISTANCE;
         }
@@ -179,6 +223,12 @@ namespace ai
         virtual std::string GetTargetName() override { return "self target"; }
         virtual bool isUseful() override;
         virtual bool Execute(Event& event) override;
+        // Self-cast buffs (death wish, bloodrage, shouts, racials) are not
+        // threat events: vetoing them at high threat starved every cooldown
+        // whose trigger fires through the fight (Patchwerk 2026-10-14: death
+        // wish x0, recklessness x0, blood fury x0 across 77 s at high threat).
+        // Donor parity: donor CastBuffSpellAction carries threat type None.
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
 
     protected:
         // Issue #378: retry window for one attempt on one target, out of combat.
@@ -262,7 +312,8 @@ namespace ai
     class CastHealingSpellAction : public CastAuraSpellAction
     {
     public:
-        CastHealingSpellAction(PlayerbotAI* ai, std::string spell, uint8 estAmount = 15.0f) : CastAuraSpellAction(ai, spell, true), estAmount(estAmount) {}
+        CastHealingSpellAction(PlayerbotAI* ai, std::string spell, uint8 estAmount, HealManaEfficiency efficiency) : CastAuraSpellAction(ai, spell, true), estAmount(estAmount), manaEfficiency(efficiency) {}
+        CastHealingSpellAction(PlayerbotAI* ai, std::string spell) : CastAuraSpellAction(ai, spell, true), estAmount(15), manaEfficiency(HealManaEfficiency::MEDIUM) {}
 
     protected:
         virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
@@ -271,12 +322,14 @@ namespace ai
 
     protected:
         uint8 estAmount;
+        HealManaEfficiency manaEfficiency;
     };
 
     class CastAoeHealSpellAction : public CastHealingSpellAction
     {
     public:
-	CastAoeHealSpellAction(PlayerbotAI* ai, std::string spell, uint8 estAmount = 15.0f) : CastHealingSpellAction(ai, spell, estAmount) {}
+	CastAoeHealSpellAction(PlayerbotAI* ai, std::string spell, uint8 estAmount, HealManaEfficiency efficiency) : CastHealingSpellAction(ai, spell, estAmount, efficiency) {}
+	CastAoeHealSpellAction(PlayerbotAI* ai, std::string spell) : CastHealingSpellAction(ai, spell) {}
 		virtual std::string GetTargetName() override { return "party member to heal"; }
         virtual bool isUseful() override;
     };
@@ -301,15 +354,34 @@ namespace ai
     class HealPartyMemberAction : public CastHealingSpellAction, public PartyMemberActionNameSupport
     {
     public:
-        HealPartyMemberAction(PlayerbotAI* ai, std::string spell, uint8 estAmount = 15.0f) : CastHealingSpellAction(ai, spell, estAmount), PartyMemberActionNameSupport(spell) {}
+        HealPartyMemberAction(PlayerbotAI* ai, std::string spell, uint8 estAmount, HealManaEfficiency efficiency) : CastHealingSpellAction(ai, spell, estAmount, efficiency), PartyMemberActionNameSupport(spell) {}
+        HealPartyMemberAction(PlayerbotAI* ai, std::string spell) : CastHealingSpellAction(ai, spell), PartyMemberActionNameSupport(spell) {}
         virtual std::string getName() override { return PartyMemberActionNameSupport::getName(); }
-		virtual std::string GetTargetName() override { return "party member to heal"; }
+        virtual std::string GetTargetName() override { return "party member to heal"; }
+        // Party heals never back off for threat: the threat value reads 100
+        // for any mob the tank has not touched yet, so while the tank is
+        // busy elsewhere the veto holds every heal and the healer watches
+        // the party die at full mana. The back-off is for damage that pulls
+        // a mob off the tank, not for keeping its victim alive.
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
+        virtual bool isUseful() override;
+        // Downrank: at cast start, swap the top-rank spell id for the
+        // cheapest known rank covering the wound (missing minus incoming).
+        virtual bool Execute(Event& event) override;
+    protected:
+        // Cheapest known rank covering the target's wound, the top rank on
+        // emergency, 0 when this line must not downrank (HoT/shield/hybrid,
+        // AoE, cooldown, one rank known, no wound left). Pure scan, no state.
+        // Protected so the self-target direct-heal lines (same wound logic,
+        // different target) can share it without the party name/target.
+        uint32 DownrankSpellId(Unit* target);
     };
-
     class HealHotPartyMemberAction : public HealPartyMemberAction
     {
     public:
+        HealHotPartyMemberAction(PlayerbotAI* ai, std::string spell, uint8 estAmount, HealManaEfficiency efficiency) : HealPartyMemberAction(ai, spell, estAmount, efficiency) {}
         HealHotPartyMemberAction(PlayerbotAI* ai, std::string spell) : HealPartyMemberAction(ai, spell) {}
+        virtual bool Execute(Event& event) override;
         virtual bool isUseful() override;
     };
 
@@ -423,6 +495,7 @@ namespace ai
         ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
         bool Execute(Event& event) override;
         bool isPossible() override;
+        bool isUseful() override;
 
     protected:
         virtual std::string GetReachActionName() override { return "reach spell"; }
@@ -434,6 +507,19 @@ namespace ai
         const Item* rangedWeapon;
         uint32 weaponDelay;
         bool needsAmmo;
+    };
+
+    // Stops a running wand so the next tick can cast (see WandPolicy.h).
+    // The GCD of the last wand shot runs until the next shot would fire, so
+    // the bot waits that long instead of re-picking "shoot" on the way.
+    // Used by the mage, priest and warlock "wand blocks ..." rows.
+    class StopWandAction : public Action
+    {
+    public:
+        StopWandAction(PlayerbotAI* ai) : Action(ai, "stop wand") {}
+
+        bool isUseful() override;
+        bool Execute(Event& event) override;
     };
 
     class RemoveBuffAction : public Action
@@ -464,10 +550,24 @@ namespace ai
     // spells
 
 
-    class CastWarStompAction : public CastSpellAction
+    // War Stomp is a self-centred 8-yd AoE stun (20549, range self, radius
+    // index 14). Cast it only where the bot stands: no reach prerequisite
+    // (the engine runs a prerequisite before isPossible, so a reach on a
+    // cooling-down Stomp walked casters and hunters into melee every tick),
+    // the current target must already be inside the radius, and the spell
+    // must be off cooldown. Donor 79bd428 casts it as a melee-range spell.
+    class CastWarStompAction : public CastMeleeAoeSpellAction
     {
     public:
-        CastWarStompAction(PlayerbotAI* ai) : CastSpellAction(ai, "war stomp") {}
+        CastWarStompAction(PlayerbotAI* ai) : CastMeleeAoeSpellAction(ai, "war stomp", 8.0f)
+        {
+            range = radius;
+        }
+
+        bool isUseful() override
+        {
+            return GetSpellID() && sServerFacade.IsSpellReady(bot, GetSpellID()) && CastMeleeAoeSpellAction::isUseful();
+        }
     };
     class CastManaTapAction : public CastSpellAction
     {
@@ -519,8 +619,29 @@ namespace ai
         bool IsCrowdControlAction() const override { return true; }
         std::string GetCrowdControlSpellName() const override { return GetSpellName(); }
 
+        // The chooser keeps an assigned mark as "cc target" at any range
+        // (so the reach can run); the cast itself starts only in line of
+        // sight and CcCastRangeMargin inside the spell's range, so a mark
+        // that moves during the cast bar does not leave range or sight and
+        // fail the cast when it finishes. "reach cc" closes to that distance.
+        bool isPossible() override
+        {
+            if (!CastRangedDebuffSpellAction::isPossible())
+                return false;
+            Unit* target = GetTarget();
+            if (!target || target == bot)
+                return true;
+            // The spell's own max range, not the action's `range` field: a
+            // subclass may narrow that for targeting while the cast gate
+            // must match "reach cc", which qualifies on the spell range.
+            float spellRange;
+            if (!ai->GetSpellRange(GetSpellName(), &spellRange))
+                return true;
+            return CcCastInReach(bot->GetDistance(target), spellRange, bot->IsWithinLOSInMap(target, true));
+        }
+
     private:
-        virtual std::string GetReachActionName() override { return "reach spell"; }
+        virtual std::string GetReachActionName() override { return "reach cc"; }
         virtual std::string GetTargetName() override { return "cc target"; }
         virtual std::string GetTargetQualifier() override { return GetSpellName(); }
         virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }

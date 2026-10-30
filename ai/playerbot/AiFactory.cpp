@@ -1,5 +1,10 @@
 #include "../../runtime/PlayerbotAIStorage.h"
+#include "../../runtime/policy/class/ShamanTankDetectionPolicy.h"
 #include "../../runtime/BotManager.h"
+#include "../../runtime/HireLifecycle.h"
+#include "../../runtime/AltBotService.h"
+#include "../../runtime/policy/class/ShamanTankKitPolicy.h"
+#include "../../runtime/policy/class/ShamanTankLevelingPolicy.h"
 #include "playerbot/playerbot.h"
 #include "playerbot/AiFactory.h"
 #include "playerbot/AiContextAugment.h"
@@ -29,6 +34,12 @@
 #include "../../runtime/PlayerbotAIStorage.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/RandomBotFacade.h"
+#include "playerbot/policy/dungeon/InstanceGuardPolicy.h"
+#include "playerbot/SurvivePolicy.h"
+#include "../../runtime/CommandedGroupQuery.h"
+#include "../../runtime/RemoteCommanderPolicy.h"
+#include "../../runtime/policy/pvp/WorldPvpSeekPolicy.h"
+#include "playerbot/strategy/values/WorldPvpSeekLog.h"
 #include "Battlegrounds/BattleGroundMgr.h"
 
 // The class context of a bot; the augmenters of other modules are applied on top in
@@ -178,6 +189,23 @@ int AiFactory::GetPlayerSpecTab(const Player* bot)
         }
         return tab;
     }
+}
+
+int AiFactory::GetKitSpecTab(const Player* player, PlayerbotAI* const facade)
+{
+    int const tab = GetPlayerSpecTab(player);
+    uint8 const role = facade ? facade->GetForcedRole() : static_cast<uint8>(BOT_ROLE_NONE);
+    if (!role || (role & BOT_ROLE_TANK))
+        return tab;
+
+    // `.bot role <bot> dps` on a protection warrior kept "protection",
+    // "tank assist" and "pull" from his talent tab, and he taunted the group
+    // tank's target off him. Only the Feral druid read the forced role.
+    if (player->GetClass() == CLASS_WARRIOR && tab == 2)
+        return 0; // arms
+    if (player->GetClass() == CLASS_PALADIN && tab == 1)
+        return (role & BOT_ROLE_HEALER) ? 0 : 2; // holy or retribution
+    return tab;
 }
 
 std::map<uint32, int32> AiFactory::GetPlayerSpecTabs(const Player* bot)
@@ -338,6 +366,128 @@ static bool HasRockbiterWeapon(const Player* player)
     return false;
 }
 
+// Key tank talents as HasSpell flags (top rank first; rank 2 in the spell
+// map does not imply rank 1, so both ranks are checked).
+static bool HasTotemicAlignmentTalent(const Player* player)
+{
+    return player->HasSpell(TortoiseBots::kShamanTankTalentTotemicAlignmentR2) ||
+        player->HasSpell(TortoiseBots::kShamanTankTalentTotemicAlignmentR1);
+}
+
+static bool HasSpiritArmorTalent(const Player* player)
+{
+    return player->HasSpell(TortoiseBots::kShamanTankTalentSpiritArmorR2) ||
+        player->HasSpell(TortoiseBots::kShamanTankTalentSpiritArmorR1);
+}
+
+// Spent ranks of a talent spec, by talent id.
+static TortoiseBots::ShamanTalentRanks TalentRanks(TalentSpec const& spec)
+{
+    TortoiseBots::ShamanTalentRanks ranks;
+    for (TalentSpec::TalentListEntry const& entry : spec.talents)
+        ranks[entry.entry] = entry.rank;
+    return ranks;
+}
+
+// The premade entry the appliers would use for this bot's level: the first
+// entry it can afford (ChangeTalentsAction::GetBestPremadeSpec) cropped to its
+// level (CropTalents), so the ranks are exactly what a bot following that path
+// carries.
+static TalentSpec BestPremadeEntryForLevel(TalentPath const& path, Player* bot)
+{
+    TalentSpec best = path.talentSpec.back();
+    uint32 const available = GetTotalTalentPoints_TB(bot);
+    for (TalentSpec const& entry : path.talentSpec)
+        if (entry.points >= available)
+        {
+            best = entry;
+            break;
+        }
+    best.CropTalents(bot);
+    return best;
+}
+
+// Issue #1125: below the first key tank talent the 7.3 levelling layout is the
+// durable half of the identity - talents live in the character, the forced
+// role does not. The tank entry for the bot's level has to match the spent
+// ranks on its own: at 10-14 the 7.3 and 7.1 links are identical, so a match
+// shared with another premade proves nothing and the read stays on the DPS
+// spec (runtime/ShamanTankLevelingPolicy.h).
+static bool HasShamanTankLevelingBuild(const Player* player)
+{
+    if (!player || player->GetClass() != CLASS_SHAMAN)
+        return false;
+    // At or above the first key talent the key-talent read is authoritative
+    // and free; the talent walk stays off that path.
+    if (player->GetLevel() >= TortoiseBots::kShamanTankFirstTalentLevel)
+        return false;
+
+    std::vector<TalentPath>& paths = sPlayerbotAIConfig.classSpecs[CLASS_SHAMAN].talentPath;
+    if (paths.empty())
+        return false;
+
+    Player* bot = const_cast<Player*>(player);
+    TortoiseBots::ShamanTalentRanks const current = TalentRanks(TalentSpec(bot));
+    bool tankEntryMatches = false;
+    int otherPremadeMatches = 0;
+    for (TalentPath& path : paths)
+    {
+        if (path.talentSpec.empty())
+            continue;
+        if (!TortoiseBots::ShamanTalentRanksEqual(current, TalentRanks(BestPremadeEntryForLevel(path, bot))))
+            continue;
+        if (path.id == TortoiseBots::kShamanTankPremadeSpec)
+            tankEntryMatches = true;
+        else
+            ++otherPremadeMatches;
+    }
+
+    return TortoiseBots::ShamanOnTankLevelingPath(tankEntryMatches, otherPremadeMatches);
+}
+
+// The gear-free build read behind the shaman kit decision. Only the 7.3 tank
+// premade takes Totemic Alignment or Spirit Armor, so no enhancement,
+// elemental or restoration shaman ever matches (issue #1125). Talents are
+// persisted, unlike the forced role - and below the first key talent the
+// levelling layout is read instead, so the identity survives a restart there
+// too.
+static bool HasShamanTankBuild(const Player* player)
+{
+    if (TortoiseBots::IsShamanTankBuild(HasTotemicAlignmentTalent(player), HasSpiritArmorTalent(player)))
+        return true;
+    return HasShamanTankLevelingBuild(player);
+}
+
+// Which shaman kit this bot plays (issue #1125): the explicit forced role
+// (`.bot role`, hire, dungeon finder) decides outright, else the bot's own
+// build does — a pool shaman that rolled the tank spec kept its tank talents
+// but came back from every restart and group leave with the DPS kit, because
+// the forced role that made it a tank lived in memory only.
+static bool PlaysShamanTankKit(const Player* player, PlayerbotAI* const facade)
+{
+    if (!player || player->GetClass() != CLASS_SHAMAN)
+        return false;
+    uint8 const role = facade ? facade->GetForcedRole() : static_cast<uint8>(BOT_ROLE_NONE);
+    return TortoiseBots::ShamanPlaysTankKit(role, HasShamanTankBuild(player));
+}
+
+// Shared gear+talent read behind GetRoleFromStanceOrGear and HasOtherTank:
+// shield equipped, Rockbiter on the main hand, and one key tank talent
+// (Totemic Alignment or Spirit Armor, either rank). Cheap Player::HasSpell
+// map lookups (top rank first); never GetPlayerSpecTabs here — it rewalks
+// the whole talent store per call and this runs per group member.
+// Forced roles are handled by the callers (player storage / bot AI) before
+// this is reached, so this is the pure detection signal only.
+static bool IsDetectedShamanTank(const Player* player)
+{
+    TortoiseBots::ShamanTankDetectionInputs inputs;
+    inputs.shieldEquipped = HasShieldEquipped(player);
+    inputs.rockbiterOnMainHand = HasRockbiterWeapon(player);
+    inputs.totemicAlignment = HasTotemicAlignmentTalent(player);
+    inputs.spiritArmor = HasSpiritArmorTalent(player);
+    return TortoiseBots::IsShamanTank(inputs);
+}
+
 static BotRoles GetRoleFromStanceOrGear(const Player* player)
 {
     switch (player->GetClass())
@@ -358,7 +508,7 @@ static BotRoles GetRoleFromStanceOrGear(const Player* player)
                 return BOT_ROLE_TANK;
             break;
         case CLASS_SHAMAN:
-            if (HasShieldEquipped(player) && HasRockbiterWeapon(player))
+            if (IsDetectedShamanTank(player))
                 return BOT_ROLE_TANK;
             break;
     }
@@ -410,6 +560,12 @@ static bool HasOtherTank(const Player* player)
             (GetTalentRoles(member) & BOT_ROLE_TANK) != 0)
             return true;
 
+        // A detected shaman tank is a real tank for the members scanned
+        // after it: gear+talent is as explicit as a talent tab here, and
+        // the shaman co-tanks instead of being suppressed.
+        if (memberClass == CLASS_SHAMAN && IsDetectedShamanTank(member))
+            return true;
+
         // If no explicit or talent tank exists, the first group-slot member
         // with a tank stance/form/gear signal owns the automatic tank role.
         // Counting later candidates would make two stance-shifters suppress
@@ -435,11 +591,23 @@ BotRoles AiFactory::GetPlayerRoles(const Player* player)
     if (botAi && botAi->GetForcedRole() != BOT_ROLE_NONE && botAi->HasActivePlayerMaster())
         return static_cast<BotRoles>(botAi->GetForcedRole());
 
+    // A bot that has the tank build counts as a tank on its own (issue
+    // #1125): the build lives in its talents, so it still reads tank after
+    // the restart or group leave that dropped the in-memory forced role.
+    // The forced-role returns above keep an explicit order in charge; real
+    // players keep the gear-gated read below (docs/classes/shaman.md).
+    if (botAi && botAi->GetForcedRole() == BOT_ROLE_NONE && PlaysShamanTankKit(player, botAi))
+        return BOT_ROLE_TANK;
+
     // Only scan the group when a current stance/form/gear signal could change
     // the talent role; without one, both paths return the talent role.
     BotRoles stateRole = GetRoleFromStanceOrGear(player);
     if (stateRole != BOT_ROLE_NONE)
     {
+        // A detected shaman tank co-tanks: another tank in the group never
+        // demotes it to its talent role (Enhancement DPS).
+        if (player->GetClass() == CLASS_SHAMAN && stateRole == BOT_ROLE_TANK)
+            return stateRole;
         if (HasOtherTank(player))
             return GetTalentRoles(player);
         return stateRole;
@@ -448,9 +616,34 @@ BotRoles AiFactory::GetPlayerRoles(const Player* player)
     return GetTalentRoles(player);
 }
 
+bool AiFactory::HasShamanTankTalents(const Player* player)
+{
+    if (!player || player->GetClass() != CLASS_SHAMAN)
+        return false;
+    return HasTotemicAlignmentTalent(player) || HasSpiritArmorTalent(player);
+}
+
+// Party back-off (threat): non-tank DPS/healer bots grouped with a real player
+// ride the shared tank's threat, so a full burn pulls the mob off the tank.
+// Masterless pool bots keep the old behavior: the multiplier is group-gated
+// anyway, and threat vetoes would stall their solo leveling burn. ThreatValue
+// returns 0 with no tank, so solo/no-tank parties are unaffected even when the
+// veto is present. A party a remote commander leads has no real-player master
+// (the commander stands outside it) and backs off the same way.
+bool AiFactory::KeepsPartyThreatBackoff(Player* player, PlayerbotAI* const facade)
+{
+    if (!player || !facade || player->InBattleGround())
+        return false;
+    bool const isTank = PlayerbotAI::IsTank(player);
+    if (facade->HasRealPlayerMaster())
+        return !isTank;
+    return TortoiseBots::RemoteCommander::KeepsCommandedThreatBackoff(
+        TortoiseBots::BotCommands::IsInCommandedGroup(player), isTank);
+}
+
 void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const facade, Engine* combatEngine)
 {
-    int tab = GetPlayerSpecTab(player);
+    int tab = GetKitSpecTab(player, facade);
 
     // Raid/dungeon transition engine: the "dungeon" strategy owns the
     // enter/leave <raid> triggers that swap in MC/Ony/BWL/Naxx tactics.
@@ -474,7 +667,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     }
     else
     {
-        combatEngine->addStrategies("racials", "default", "duel", "pvp", NULL);
+        combatEngine->addStrategies("racials", "default", "duel", "pvp", "cast time", NULL);
     }
 
     switch (player->GetClass())
@@ -485,12 +678,16 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
             {
                 combatEngine->addStrategy("discipline");
                 if (sPlayerbotAIConfig.enableOffSpecStrategies)
-                    combatEngine->addStrategy("offheal");
+                    // mod-playerbots parity (PRI-2): disc healer bots deal
+                    // off-spec damage by default; the player can `-offdps`.
+                    combatEngine->addStrategy("offdps");
             }
             else if (tab == 1)
             {
                 combatEngine->addStrategy("holy");
                 if (sPlayerbotAIConfig.enableOffSpecStrategies)
+                    // mod-playerbots parity (PRI-2): holy healer bots deal
+                    // off-spec damage by default; the player can `-offdps`.
                     combatEngine->addStrategy("offdps");
             }
             else
@@ -527,7 +724,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         {
             if (tab == 2)
             {
-                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", NULL);
+                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", "tank face", NULL);
             }
             else if (player->GetLevel() < 30 || tab == 0)
             {
@@ -544,6 +741,18 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
 
         case CLASS_SHAMAN:
         {
+            // A shaman with a tank role plays the tank kit (issue #1125):
+            // the "tank shaman" spec strategy plus the shared tank-framework
+            // pieces (warrior `:575` / bear `:667` pattern), then the shared
+            // shaman pieces that still apply. Deliberately no "dps assist"
+            // (threat race), no "behind" (tanks face the mob).
+            if (tab == 1 && PlaysShamanTankKit(player, facade))
+            {
+                for (std::string const& name : TortoiseBots::ShamanTankCombatKit())
+                    combatEngine->addStrategy(name);
+                break;
+            }
+
             if (tab == 0)
             {
                 combatEngine->addStrategies("elemental", "aoe", "cc", "flee", "ranged", NULL);
@@ -552,13 +761,15 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
             }
             else if (tab == 2)
             {
-                combatEngine->addStrategies("restoration", "flee", "ranged", NULL);
+                combatEngine->addStrategies("restoration", "aoe", "flee", "ranged", NULL);
                 if (sPlayerbotAIConfig.enableOffSpecStrategies)
                     combatEngine->addStrategy("offdps");
             }
             else
             {
-                combatEngine->addStrategies("enhancement", "aoe", "cc", "close", NULL);
+                // Melee DPS works the mob's rear via "behind" (set behind):
+                // without it enhancement never sidesteps off the mob's front.
+                combatEngine->addStrategies("enhancement", "aoe", "cc", "close", "behind", NULL);
                 if (sPlayerbotAIConfig.enableOffSpecStrategies)
                     combatEngine->addStrategy("offheal");
             }
@@ -571,7 +782,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         {
             if (tab == 1)
             {
-                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", NULL);
+                combatEngine->addStrategies("protection", "tank assist", "pull", "pull back", "close", "tank face", NULL);
 			}
             else if(tab == 0)
             {
@@ -581,7 +792,9 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
             }
             else
             {
-                combatEngine->addStrategies("retribution", "dps assist", "close", NULL);
+                // Melee DPS works the mob's rear via "behind" (set behind):
+                // without it retribution never sidesteps off the mob's front.
+                combatEngine->addStrategies("retribution", "dps assist", "close", "behind", NULL);
                 if (sPlayerbotAIConfig.enableOffSpecStrategies)
                     combatEngine->addStrategy("offheal");
             }
@@ -615,7 +828,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
 
                 if (tanking)
                 {
-                    combatEngine->addStrategies("tank feral", "tank assist", "pull", "pull back", "close", NULL);
+                    combatEngine->addStrategies("tank feral", "tank assist", "pull", "pull back", "close", "tank face", NULL);
                 }
                 else
                 {
@@ -711,7 +924,12 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         // druid/shaman/paladin kit below). Real-player masters are safe: the
         // trigger itself refuses to fire while one answers for the bot, and
         // dungeons/raids with a real master stay flee-free either way.
-        if (!player->GetGroup() || !facade->HasRealPlayerMaster())
+        // AiPlayerbot.PoolMeleeHoldGround (opt-in) leaves warriors and rogues
+        // without it: they fight on instead of breaking off (SurvivePolicy.h).
+        bool const rageOrEnergyClass = player->GetClass() == CLASS_WARRIOR ||
+            player->GetClass() == CLASS_ROGUE;
+        if ((!player->GetGroup() || !facade->HasRealPlayerMaster()) &&
+            ai::ShouldGrantPoolFlee(sPlayerbotAIConfig.poolMeleeHoldGround, rageOrEnergyClass))
             combatEngine->addStrategy("flee");
 
         if (!player->GetGroup())
@@ -734,7 +952,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
                 }
                 else
                 {
-                    combatEngine->addStrategies("tank feral", "tank assist", "close", NULL);
+                    combatEngine->addStrategies("tank feral", "tank assist", "close", "tank face", NULL);
                     combatEngine->removeStrategy("dps feral");
                     combatEngine->removeStrategy("dps assist");
                     combatEngine->removeStrategy("behind");
@@ -771,15 +989,37 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         if (sPlayerbotAIConfig.jumpChase)
             combatEngine->addStrategy("chase jump");
 
-        // remove threat for now
-        //engine->removeStrategy("threat");
-
+        // "dps assist" and "tank assist" are siblings, so the list's
+        // "+dps assist" swapped "tank assist" out on every pool tank
+        // (Protection warrior/paladin, bear) and it picked targets like dps
+        // instead of collecting loose mobs. The spec/role defaults above
+        // decide the assist strategy; the list must not undo it.
+        bool const specTankAssist = combatEngine->HasStrategy("tank assist");
         combatEngine->ChangeStrategy(sPlayerbotAIConfig.randomBotCombatStrategies);
+        if (specTankAssist && !combatEngine->HasStrategy("tank assist") && combatEngine->HasStrategy("dps assist"))
+            combatEngine->addStrategy("tank assist");
     }
     else
     {
         combatEngine->ChangeStrategy(sPlayerbotAIConfig.combatStrategies);
     }
+
+    // Applied after the configured strategy strings: the shipped default
+    // random-bot string carries -threat and would strip it again.
+    if (KeepsPartyThreatBackoff(player, facade) && !combatEngine->HasStrategy("threat"))
+    {
+        combatEngine->addStrategy("threat");
+        // Given for a commander's binding (a bot that joined the bound party
+        // after the bind, or a reset while bound): the binding owns it.
+        if (!facade->HasRealPlayerMaster())
+            TortoiseBots::BotCommands::NoteCommanderThreat(player);
+    }
+
+    // Healers cancel a cast-time heal whose target another healer already
+    // topped up (HealingCastPolicy). The strategy existed but nothing added
+    // it: Patchwerk with 17 healers measured ~63% overheal on the tanks.
+    if (facade->IsHeal(player) && !combatEngine->HasStrategy("heal interrupt"))
+        combatEngine->addStrategy("heal interrupt");
 
     // Battleground switch
     if (player->InBattleGround())
@@ -812,14 +1052,35 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         combatEngine->removeStrategy("conserve mana");
         combatEngine->removeStrategy("cast time");
 
-        if (player->GetClass() == CLASS_SHAMAN && tab == 2)
+        // A healing spec stays a healer in a battleground, as in mod-playerbots:
+        // its BG switch adds objectives and pvp on top but keeps the talent
+        // spec. Re-adding the spec strategy drops its sibling, so a "+dps"
+        // (the priest Shadow placeholder) in the combat strategy list or the
+        // ungrouped pool kit (elemental/balance/retribution) cannot turn the
+        // team's healers into damage dealers. Stored strategies and a forced
+        // role are applied after this, so a player's explicit order still wins.
+        if (player->GetClass() == CLASS_PRIEST && tab == 0)
         {
-            combatEngine->addStrategies("elemental", "aoe", "cc", NULL);
+            combatEngine->addStrategy("discipline");
         }
 
-        if (player->GetClass() == CLASS_DRUID && tab == 2)
+        if (player->GetClass() == CLASS_PRIEST && tab == 1)
         {
-            combatEngine->addStrategies("balance", NULL);
+            combatEngine->addStrategy("holy");
+        }
+
+        // Below level 10 a druid runs the "leveling" kit instead of a spec.
+        if ((player->GetClass() == CLASS_SHAMAN ||
+             (player->GetClass() == CLASS_DRUID && player->GetLevel() >= 10)) && tab == 2)
+        {
+            combatEngine->addStrategies("restoration", "ranged", NULL);
+            combatEngine->removeStrategy("close");
+        }
+
+        if (player->GetClass() == CLASS_PALADIN && tab == 0)
+        {
+            combatEngine->addStrategies("holy", "ranged", NULL);
+            combatEngine->removeStrategy("close");
         }
 
         if (player->GetClass() == CLASS_DRUID && tab == 1)
@@ -829,7 +1090,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
                 : (player->HasSpell(16961) || player->HasSpell(16958));
             if (bgTanking)
             {
-                combatEngine->addStrategies("tank feral", "close", NULL);
+                combatEngine->addStrategies("tank feral", "close", "tank face", NULL);
             }
             else
             {
@@ -853,9 +1114,149 @@ Engine* AiFactory::createCombatEngine(Player* player, PlayerbotAI* const facade,
     return engine;
 }
 
+namespace
+{
+    // Issue #218: the open-world non-combat strategies the instance guard holds
+    // back in a dungeon or raid. Bit i of PlayerbotAI::instanceGuardWithheld
+    // stands for entry i. Main's RealMasterSafeNonCombatStrategies strips the
+    // same entry set via StripOpenWorldNonCombatStrategies; keep both lists
+    // identical.
+    char const* const kInstanceGuardStrategies[] = { "grind", "travel", "tfish", "rpg", "rpg craft", "wander" };
+    uint8 const kInstanceGuardStrategyCount = sizeof(kInstanceGuardStrategies) / sizeof(kInstanceGuardStrategies[0]);
+    uint8 const kInstanceGuardWander = 5;
+
+    inline uint8 InstanceGuardBit(uint8 index) { return uint8(1u << index); }
+}
+
+std::string AiFactory::HireSafeNonCombatStrategies(PlayerbotAI* ai, std::string const& strategies)
+{
+    // Ledger-based: holds from the first strategy build (before any group
+    // forms) and through master-offline grace. Owned alts are not hires.
+    if (!ai || !ai->GetBot() || !TortoiseBots::HireLifecycle::Instance().IsHired(ai->GetBot()->GetObjectGuid()))
+        return strategies;
+
+    return StripOpenWorldNonCombatStrategies(strategies);
+}
+
+std::string AiFactory::RealMasterSafeNonCombatStrategies(PlayerbotAI* ai, std::string const& strategies)
+{
+    // A pool bot in a real player's party follows that player. "+wander" is a
+    // sibling of "follow" and replaces it, and the open-world adds re-arm what
+    // the player may have switched off, so the list skips them for such a bot.
+    if (!ai || !ai->HasRealPlayerMaster())
+        return strategies;
+
+    return StripOpenWorldNonCombatStrategies(strategies);
+}
+
+std::string AiFactory::CommandedSafeNonCombatStrategies(Player* player, std::string const& strategies, uint32* held)
+{
+    // A bound bot holds or follows on its commander's orders: the list's
+    // "+wander" would replace the binding's stay/follow, and its open-world
+    // adds would start walks of its own. held: the dropped adds the binding
+    // gives back on release ("+wander" is not one: a movement mode).
+    if (!TortoiseBots::BotCommands::IsInCommandedGroup(player))
+        return strategies;
+
+    if (held)
+        *held |= TortoiseBots::RemoteCommander::CommanderAutonomyAdds(strategies);
+
+    return StripOpenWorldNonCombatStrategies(strategies);
+}
+
+std::string AiFactory::StripOpenWorldNonCombatStrategies(std::string const& strategies)
+{
+    std::string kept;
+    for (std::string const& entry : split(strategies, ','))
+    {
+        bool drop = false;
+        if (!entry.empty() && entry[0] == '+')
+        {
+            for (uint8 i = 0; i < kInstanceGuardStrategyCount; ++i)
+            {
+                if (entry.compare(1, std::string::npos, kInstanceGuardStrategies[i]) == 0)
+                {
+                    drop = true;
+                    break;
+                }
+            }
+        }
+
+        if (drop)
+            continue;
+
+        if (!kept.empty())
+            kept += ",";
+        kept += entry;
+    }
+    return kept;
+}
+
+bool AiFactory::IsWorldPvpSeekEligible(Player* player, PlayerbotAI* const facade)
+{
+    if (!player || !facade)
+        return false;
+
+    TortoiseBots::WorldPvpSeekInputs inputs;
+    inputs.seekEnabled = sPlayerbotAIConfig.worldPvpSeek != 0;
+    inputs.freePoolBot = sRandomBotFacade.IsFreeBot(player);
+    inputs.ownedBot = facade->IsOwnedBot();
+    inputs.hiredBot = TortoiseBots::HireLifecycle::Instance().IsHired(player->GetObjectGuid());
+    inputs.inBattleground = player->InBattleGround();
+
+    if (Group* group = player->GetGroup())
+    {
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            Player* member = sObjectAccessor.FindPlayer(slot.guid);
+            if (member && member != player && member->IsInWorld() && facade->IsRealPlayer(member))
+            {
+                inputs.groupedWithRealPlayer = true;
+                break;
+            }
+        }
+    }
+
+    return TortoiseBots::WorldPvpSeekEligible(inputs);
+}
+
+void AiFactory::RollWorldPvpSeek(Player* player, PlayerbotAI* const facade)
+{
+    if (!player || !facade)
+        return;
+
+    if (!IsWorldPvpSeekEligible(player, facade))
+    {
+        facade->ChangeStrategy("-world pvp", BotState::BOT_STATE_NON_COMBAT);
+        facade->ChangeStrategy("-world pvp", BotState::BOT_STATE_COMBAT);
+        return;
+    }
+
+    uint32 percent = sPlayerbotAIConfig.worldPvpSeekBotPercent;
+    if (percent > 100)
+        percent = 100;
+    bool const grant = percent > 0 && urand(0, 99) < percent;
+    bool const held = facade->HasStrategy("world pvp", BotState::BOT_STATE_NON_COMBAT);
+    if (grant && !held)
+    {
+        facade->ChangeStrategy("+world pvp", BotState::BOT_STATE_NON_COMBAT);
+        facade->ChangeStrategy("+world pvp", BotState::BOT_STATE_COMBAT);
+        ai::WorldPvpSeekLog::LogGrant(facade, player);
+    }
+    else if (!grant && held)
+    {
+        facade->ChangeStrategy("-world pvp", BotState::BOT_STATE_NON_COMBAT);
+        facade->ChangeStrategy("-world pvp", BotState::BOT_STATE_COMBAT);
+    }
+    facade->worldPvpSeekRollMs_ = WorldTimer::getMSTime();
+}
+
 void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const facade, Engine* nonCombatEngine)
 {
-    const int tab = GetPlayerSpecTab(player);
+    // What the config lists below would have given a bound bot of the
+    // open-world kit (CommandedSafeNonCombatStrategies): noted for its release.
+    uint32 commandedListHeld = 0;
+    const int tab = GetKitSpecTab(player, facade);
     switch (player->GetClass())
     {
         case CLASS_PRIEST:
@@ -917,13 +1318,23 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
 
         case CLASS_SHAMAN:
         {
+            // Tank-role shaman keeps the tank kit outside combat too (druid
+            // `:1180-1192` pattern): spec strategy + "tank assist" on top of
+            // the shared shaman noncombat pieces, never "dps assist".
+            if (tab == 1 && PlaysShamanTankKit(player, facade))
+            {
+                for (std::string const& name : TortoiseBots::ShamanTankNonCombatKit())
+                    nonCombatEngine->addStrategy(name);
+                break;
+            }
+
             if (tab == 0)
             {
                 nonCombatEngine->addStrategies("elemental", "aoe", "cc", NULL);
             }
             else if (tab == 2)
             {
-                nonCombatEngine->addStrategies("restoration", NULL);
+                nonCombatEngine->addStrategies("restoration", "aoe", NULL);
             }
             else
             {
@@ -1061,6 +1472,11 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
     if(sPlayerbotAIConfig.llmEnabled == 2)
         nonCombatEngine->addStrategy("ai chat");
 
+    // A hire follows its master and never talks to quest NPCs on its own:
+    // the DefaultQuestStrategy gossip-hello triggers stay off the hire
+    // (explicit orders still run through the action). Owned alts keep it.
+    bool const hireNoQuestTalk = TortoiseBots::HireLifecycle::Instance().IsHired(player->GetObjectGuid());
+
     if (!player->InBattleGround())
     {
         PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(player);
@@ -1068,13 +1484,15 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
 
         if (master && master->GetSession() && master->GetSession()->HasNetworkTransport())
         {
-            const char* wanderFollow = sPlayerbotAIConfig.useWanderAsDefaultFollowStrategy ? "wander" : "follow";
-            nonCombatEngine->addStrategies("racials", "nc", "food", wanderFollow, "default", "quest", "loot", "gather", "duel", "emote", "buff", "mount", NULL);
+            // A real player's bot rebuilds with "follow" (GetDefaultMovementStrategy,
+            // mod-playerbots parity): a role change or regroup reset must not swap
+            // the follow it got on invite for UseWanderAsDefaultFollowStrategy's wander.
+            nonCombatEngine->addStrategies("racials", "nc", "food", "follow", "default", hireNoQuestTalk ? "loot" : "quest", "loot", "gather", "duel", "emote", "buff", "mount", "force rebuff", NULL);
         }
         else
         {
-            const char* wanderFollow = sPlayerbotAIConfig.useWanderAsDefaultFollowStrategy ? "wander" : "follow";
-            nonCombatEngine->addStrategies("racials", "nc", "food", wanderFollow, "default", "quest", "loot", "gather", "duel", "emote", "buff", "mount", NULL);
+            const char* wanderFollow = hireNoQuestTalk ? "follow" : (sPlayerbotAIConfig.useWanderAsDefaultFollowStrategy ? "wander" : "follow");
+            nonCombatEngine->addStrategies("racials", "nc", "food", wanderFollow, "default", hireNoQuestTalk ? "loot" : "quest", "loot", "gather", "duel", "emote", "buff", "mount", "force rebuff", NULL);
         }
     }
 
@@ -1091,17 +1509,24 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
     if (!player->InBattleGround() && sPlayerbotAIConfig.jumpFollow)
         nonCombatEngine->addStrategy("follow jump");
 
+    // A rebuild starts with nothing held back; the guarded branch below
+    // records what it skips inside an instance (Issue #218).
+    facade->instanceGuardWithheld = 0;
+
     if ((facade->IsRealPlayer() || sRandomBotFacade.IsFreeBot(player)) && !player->InBattleGround())
     {
         Player* master = facade->GetMaster();
 
         nonCombatEngine->addStrategy("roll");
 
-        // let 25% of free bots start duels.
-        if (!urand(0, 3))
+        // let 25% of free bots start duels (never an alt-bot, issue #872:
+        // it is the player's own character).
+        if (!urand(0, 3) && !TortoiseBots::AltBotService::Instance().IsAutonomous(player->GetObjectGuid()))
         {
             nonCombatEngine->addStrategy("start duel");
         }
+
+        RollWorldPvpSeek(player, facade);
 
         if (!player->GetGroup() || facade->IsGroupLeader())
         {
@@ -1111,12 +1536,20 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
                 nonCombatEngine->addStrategy("attack tagged");
             }
 
+            // Hired companions follow their master and never run their own
+            // questing/travel: the config list below runs through the same
+            // master guard as the grouped branch, so a hire gets only the
+            // follower kit (no grind/travel/tfish/rpg/wander) while owned
+            // alts keep their explicit orders (ledger check, not master
+            // presence). The direct adds above stay for pool bots.
+            bool const isHire = TortoiseBots::HireLifecycle::Instance().IsHired(player->GetObjectGuid());
             nonCombatEngine->addStrategy("collision");
-            nonCombatEngine->addStrategy("grind");
+            if (!isHire)
+                nonCombatEngine->addStrategy("grind");
             nonCombatEngine->addStrategy("group");
             nonCombatEngine->addStrategy("guild");
 
-            if (sPlayerbotAIConfig.autoDoQuests)
+            if (sPlayerbotAIConfig.autoDoQuests && !isHire)
             {
                 nonCombatEngine->addStrategy("travel");
                 nonCombatEngine->addStrategy("tfish");
@@ -1128,7 +1561,7 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
                 nonCombatEngine->addStrategy("maintenance");
             }
 
-            nonCombatEngine->ChangeStrategy(sPlayerbotAIConfig.randomBotNonCombatStrategies);
+            nonCombatEngine->ChangeStrategy(CommandedSafeNonCombatStrategies(player, HireSafeNonCombatStrategies(facade, sPlayerbotAIConfig.randomBotNonCombatStrategies), &commandedListHeld));
         }
         else
         {
@@ -1142,25 +1575,42 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
                         // world: grind/travel/tfish/rpg wander inside the
                         // instance otherwise (Issue #218).
                         bool const inInstance = player->GetMap() && (player->GetMap()->IsDungeon() || player->GetMap()->IsRaid());
+                        // What the guard drops from the list below is what
+                        // leaving the instance gives back
+                        // (ApplyInstanceGuardOnMapChange): the out-param records
+                        // only entries actually present in the list, so a list
+                        // without +grind never restores grind.
+                        uint8 withheld = 0;
+                        // A hire never carries the autonomy kit evenGrouped with an
+                        // offline master (grace-period guard duty): the ledger
+                        // strip, not just the live-master guard.
+                        bool const isHire = TortoiseBots::HireLifecycle::Instance().IsHired(player->GetObjectGuid());
                         nonCombatEngine->addStrategy("collision");
-                        if (!inInstance)
+                        if (!inInstance && !isHire)
                             nonCombatEngine->addStrategy("grind");
                         nonCombatEngine->addStrategy("group");
                         nonCombatEngine->addStrategy("guild");
 
-                        if (sPlayerbotAIConfig.autoDoQuests && !inInstance)
+                        if (sPlayerbotAIConfig.autoDoQuests && !inInstance && !isHire)
                         {
                             nonCombatEngine->addStrategy("travel");
                             nonCombatEngine->addStrategy("tfish");
                             nonCombatEngine->addStrategy("rpg");
                         }
 
-                        if (!master || (master->GetSession() && !master->GetSession()->HasNetworkTransport()))
+                        if ((!master || (master->GetSession() && !master->GetSession()->HasNetworkTransport())) && !isHire)
                         {
                             nonCombatEngine->addStrategy("maintenance");
                         }
 
-                        nonCombatEngine->ChangeStrategy(sPlayerbotAIConfig.randomBotNonCombatStrategies);
+                        // The config list runs last, so it must honour the instance guard
+                        // too, and its "+wander" must not replace a player's bot's follow.
+                        // What the guard drops here is recorded in withheld, so leaving
+                        // the instance gives back only those entries
+                        // (ApplyInstanceGuardOnMapChange).
+                        nonCombatEngine->ChangeStrategy(CommandedSafeNonCombatStrategies(player, HireSafeNonCombatStrategies(facade, RealMasterSafeNonCombatStrategies(facade,
+                            InstanceSafeNonCombatStrategies(player, sPlayerbotAIConfig.randomBotNonCombatStrategies, &withheld))), &commandedListHeld));
+                        facade->instanceGuardWithheld = withheld;
                     }
                     else
                     {
@@ -1205,6 +1655,10 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
         }
     }
 
+    // A bot a remote commander has bound moves only on its orders: whatever
+    // open-world kit the branches above gave it (a group leader's grind,
+    // travel and rpg, also inside an instance) comes off until the release.
+    TortoiseBots::BotCommands::HoldCommanderAutonomy(player, facade, true, commandedListHeld);
 }
 
 Engine* AiFactory::createNonCombatEngine(Player* player, PlayerbotAI* const facade, AiObjectContext* AiObjectContext)
@@ -1215,6 +1669,104 @@ Engine* AiFactory::createNonCombatEngine(Player* player, PlayerbotAI* const faca
 	return nonCombatEngine;
 }
 
+std::string AiFactory::InstanceSafeNonCombatStrategies(Player* player, std::string const& strategies, uint8* withheld)
+{
+    if (!player || !player->GetMap() || !(player->GetMap()->IsDungeon() || player->GetMap()->IsRaid()))
+        return strategies;
+
+    // Issue #218: inside an instance the party kit stays in charge. Drop the
+    // list's open-world adds, and its "+wander" so the movement mode the bot
+    // already has (follow for a player's bot) keeps its leash.
+    std::string kept;
+    for (std::string const& entry : split(strategies, ','))
+    {
+        bool drop = false;
+        if (!entry.empty() && entry[0] == '+')
+        {
+            for (uint8 i = 0; i < kInstanceGuardStrategyCount; ++i)
+            {
+                if (entry.compare(1, std::string::npos, kInstanceGuardStrategies[i]) == 0)
+                {
+                    drop = true;
+                    if (withheld)
+                        *withheld |= InstanceGuardBit(i);
+                    break;
+                }
+            }
+        }
+
+        if (drop)
+            continue;
+
+        if (!kept.empty())
+            kept += ",";
+        kept += entry;
+    }
+    return kept;
+}
+
+void AiFactory::ApplyInstanceGuardOnMapChange(Player* player, PlayerbotAI* ai)
+{
+    if (!player || !ai || !player->GetMap() || player->InBattleGround())
+        return;
+
+    // A commander's release inside a dungeon kept the bot's open-world kit
+    // back: out in the open world it comes back (any bot, group leaders too).
+    TortoiseBots::BotCommands::CommanderAutonomyMapChange(player, ai);
+
+    // The bots the guarded branch of AddDefaultNonCombatStrategies builds: a
+    // pool bot in a group it does not lead, with a master. Without this the
+    // kit from the open world rode along through the instance portal until
+    // something rebuilt the strategies (Issue #218).
+    if (!sRandomBotFacade.IsFreeBot(player) || !player->GetGroup() || ai->IsGroupLeader() || !ai->GetMaster())
+        return;
+
+    bool const hasFollow = ai->HasStrategy("follow", BotState::BOT_STATE_NON_COMBAT);
+    bool const inInstance = player->GetMap()->IsDungeon() || player->GetMap()->IsRaid();
+    if (inInstance)
+    {
+        // Strip only what the bot has and remember exactly that, so leaving
+        // gives back nothing the player had turned off. "-rpg" also drops its
+        // children (rpg quest/vendor/explore/maintenance). "wander" goes only
+        // next to "follow", so a bot whose movement mode is wander keeps one.
+        std::string strip;
+        uint8 removed = 0;
+        for (uint8 i = 0; i < kInstanceGuardStrategyCount; ++i)
+        {
+            if (i == kInstanceGuardWander && !hasFollow)
+                continue;
+            if (!ai->HasStrategy(kInstanceGuardStrategies[i], BotState::BOT_STATE_NON_COMBAT))
+                continue;
+            removed |= InstanceGuardBit(i);
+            strip += strip.empty() ? "-" : ",-";
+            strip += kInstanceGuardStrategies[i];
+        }
+        if (!strip.empty())
+            ai->ChangeStrategy(strip, BotState::BOT_STATE_NON_COMBAT);
+        // OR, not assign: a move between two instance maps keeps what the
+        // first one withheld.
+        ai->instanceGuardWithheld |= removed;
+        return;
+    }
+
+    // Back in the open world: give back only what the guard held, so neither
+    // a boat ride nor a dungeon run undoes a player's own "-grind" or "-rpg".
+    // A bot with a real-player master never gets the open-world kit back
+    // (RealMasterSafeNonCombatStrategies, #741): it keeps following its
+    // player. Only masterless pool bots get the restore.
+    uint8 const withheld = ai->instanceGuardWithheld;
+    ai->instanceGuardWithheld = 0;
+    std::string const restore =
+        ai::InstanceGuardRestore(withheld, ai->HasRealPlayerMaster(), hasFollow);
+    if (!restore.empty())
+    {
+        ai->ChangeStrategy(restore, BotState::BOT_STATE_NON_COMBAT);
+        // A bound bot leaving the instance (a wipe's graveyard) gets no own
+        // walks back: the binding holds them until its release.
+        TortoiseBots::BotCommands::HoldCommanderAutonomy(player, ai, false);
+    }
+}
+
 void AiFactory::AddDefaultDeadStrategies(Player* player, PlayerbotAI* const facade, Engine* deadEngine)
 {
     deadEngine->addStrategies("dead", "stay", "default", "follow", "group", NULL);
@@ -1223,11 +1775,16 @@ void AiFactory::AddDefaultDeadStrategies(Player* player, PlayerbotAI* const faca
         deadEngine->removeStrategy("follow");
     }
 
-    const int tab = GetPlayerSpecTab(player);
+    const int tab = GetKitSpecTab(player, facade);
     switch (player->GetClass())
     {
         case CLASS_SHAMAN:
         {
+            if (tab == 1 && PlaysShamanTankKit(player, facade))
+            {
+                deadEngine->addStrategy("tank shaman");
+                break;
+            }
             if (tab == 0)
             {
                 deadEngine->addStrategy("elemental");
@@ -1425,11 +1982,16 @@ void AiFactory::AddDefaultReactionStrategies(Player* player, PlayerbotAI* const 
 {
     reactionEngine->addStrategies("react", "chat", "avoid aoe", "potions", NULL);
 
-    const int tab = GetPlayerSpecTab(player);
+    const int tab = GetKitSpecTab(player, facade);
     switch (player->GetClass())
     {
         case CLASS_SHAMAN:
         {
+            if (tab == 1 && PlaysShamanTankKit(player, facade))
+            {
+                reactionEngine->addStrategy("tank shaman");
+                break;
+            }
             if (tab == 0)
             {
                 reactionEngine->addStrategy("elemental");

@@ -4,6 +4,12 @@
 #include "playerbot/strategy/ItemVisitors.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 #include "playerbot/strategy/values/MaintenanceValues.h"
+#include "playerbot/policy/gear/SellRefusalPolicy.h"
+#include "../../../runtime/ClaimLifecycle.h"
+#include "../../../runtime/policy/hire/ClaimedBotPolicy.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
+#include "../../../../runtime/RunGivenItemRegistry.h"
 
 using namespace ai;
 
@@ -55,8 +61,37 @@ bool SellAction::Execute(Event& event)
     //straight back. Liquidation is then all or nothing.
     bool const allOrNothing = event.GetSource() == "rpg action" && ShouldSellValue::CantAffordNextSpell(ai);
 
+    bool const isClaimed = TortoiseBots::ClaimLifecycle::Instance().IsClaimed(bot->GetGUIDLow());
+    // Issue #872: an autonomous alt vendors only greys and unneeded whites
+    // (B10), never soulbound or equipped items.
+    bool const isAltBot = TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid());
+
     for (std::list<Item*>::iterator i = items.begin(); i != items.end(); ++i)
     {
+        // Issue #489: Claimed bots never auto-vendor gear at level 60, and never vendor blue/epic items while leveling
+        if (isClaimed && event.GetSource() == "rpg action")
+        {
+            ItemPrototype const* proto = (*i)->GetProto();
+            uint32 quality = proto ? proto->Quality : 0;
+            if (!TortoiseBots::MayClaimedBotAutoVendor(bot->GetLevel(), quality, true))
+                continue;
+        }
+        if (isAltBot)
+        {
+            Item* item = *i;
+            ItemPrototype const* proto = item ? item->GetProto() : nullptr;
+            uint32 quality = proto ? proto->Quality : 0;
+            bool equipped = false;
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+                if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot) == item)
+                {
+                    equipped = true;
+                    break;
+                }
+            if (!TortoiseBots::AltBotMayVendorItem(quality, item && item->IsSoulBound(), equipped))
+                continue;
+        }
+
         if (Sell(requester, *i))
             soldItems++;
 
@@ -132,9 +167,30 @@ bool SellAction::HasVendorStock(Creature* vendor)
     return (items && !items->Empty()) || (templateItems && !templateItems->Empty());
 }
 
+std::string SellAction::RefusalReason(PlayerbotAI* botAI)
+{
+    Player* player = botAI->GetBot();
+    std::string const greyFilter = "gray";
+    std::size_t const greyItems = botAI->InventoryParseItems(greyFilter, IterateItemsMask::ITERATE_ITEMS_IN_BAGS).size();
+    bool vendorInReach = false;
+    std::list<ObjectGuid> vendors = botAI->GetAiObjectContext()->GetValue<std::list<ObjectGuid> >("nearest npcs")->Get();
+    for (ObjectGuid const& vendorguid : vendors)
+    {
+        if (HasVendorStock(player->GetNPCIfCanInteractWith(vendorguid, UNIT_NPC_FLAG_VENDOR)))
+        {
+            vendorInReach = true;
+            break;
+        }
+    }
+    return SellRefusalReason(greyItems, vendorInReach);
+}
+
 bool SellAction::Sell(Player* requester, Item* item)
 {
     bool didSell = false;
+    // A dungeon run's given item is never sold: the run takes it back.
+    if (item && TortoiseBots::RunGivenItems::Has(item->GetGUIDLow()))
+        return false;
 
     std::ostringstream out;
     std::list<ObjectGuid> vendors = ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid> >("nearest npcs")->Get();

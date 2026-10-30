@@ -11,7 +11,7 @@ namespace ai
     class PossibleAttackTargetsValue : public ObjectGuidListCalculatedValue, public Qualified
 	{
 	public:
-        PossibleAttackTargetsValue(PlayerbotAI* ai) : ObjectGuidListCalculatedValue(ai, "possible attack targets", 2), Qualified() {}
+        PossibleAttackTargetsValue(PlayerbotAI* ai) : ObjectGuidListCalculatedValue(ai, "possible attack targets", 2), Qualified() { this->keepLegacyRefresh = true; }
         std::list<ObjectGuid> Calculate() override;
         static bool IsValid(Unit* target, Player* player, float range = sPlayerbotAIConfig.sightDistance, bool ignoreCC = false, bool checkAttackerValid = true);
         static bool IsPossibleTarget(Unit* target, Player* player, float range, bool ignoreCC);
@@ -22,6 +22,10 @@ namespace ai
         // off CC'd/banished targets on manual attacks.
         static bool IsImmuneToDamage(Unit* target, Player* player);
         static bool HasIgnoreCCRti(Unit* target, Player* player);
+        // Deliberate damage-breakable CC that splash damage would waste
+        // (sheep, sap, gouge, trap, ...). Frost Nova's frozen state is left
+        // out on purpose: nova + AoE is normal play. Skull opts out.
+        static bool HoldsBreakableCc(PlayerbotAI* ai, Unit* unit, Player* bot);
         virtual std::string Format() override;
 
 #ifdef GenerateBotHelp

@@ -3,12 +3,19 @@
 #include "playerbot/strategy/actions/GenericActions.h"
 #include "playerbot/strategy/actions/UseItemAction.h"
 #include "playerbot/AoeFearPolicy.h"
+#include "../../../runtime/policy/pet/VoidwalkerPolicy.h"
+#include "WarlockPetTaunt.h"
+#include "../../../runtime/policy/pet/DevourMagicPolicy.h"
+#include "../../../runtime/policy/pet/HealthFunnelPolicy.h"
+#include "../../../runtime/policy/pet/SeductionPolicy.h"
+#include "../../../../runtime/policy/class/WarlockSoulstonePolicy.h"
 
 namespace ai
 {
 	SNARE_ACTION(CastDeathCoilSnareAction, "death coil");
+	SNARE_ACTION(CastCurseOfExhaustionSnareAction, "curse of exhaustion");
 	ENEMY_HEALER_ACTION(CastDeathCoilOnHealerAction, "death coil");
-	SPELL_ACTION(CastDeathCoilAction, "death coil");
+	INTERRUPT_SPELL_ACTION(CastDeathCoilAction, "death coil");
     BUFF_ACTION(CastShadowWardAction, "shadow ward");
 
 	class CastDemonSkinAction : public CastBuffSpellAction
@@ -22,6 +29,18 @@ namespace ai
 	public:
 		CastDemonArmorAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "demon armor") {}
 	};
+
+    class CastUnendingBreathAction : public CastBuffSpellAction
+    {
+    public:
+        CastUnendingBreathAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "unending breath") {}
+    };
+
+    class CastUnendingBreathOnPartyAction : public BuffOnPartyAction
+    {
+    public:
+        CastUnendingBreathOnPartyAction(PlayerbotAI* ai) : BuffOnPartyAction(ai, "unending breath") {}
+    };
 
     BEGIN_RANGED_SPELL_ACTION(CastShadowBoltAction, "shadow bolt")
     END_SPELL_ACTION()
@@ -107,30 +126,7 @@ namespace ai
     private:
         uint32 GetItemId() override
         {
-            uint32 itemId = 0;
-            const uint32 level = bot->GetLevel();
-            if (level >= 18 && level < 30)
-            {
-                itemId = 5232;
-            }
-            else if (level >= 30 && level < 40)
-            {
-                itemId = 16892;
-            }
-            else if (level >= 40 && level < 50)
-            {
-                itemId = 16893;
-            }
-            else if (level >= 50 && level < 60)
-            {
-                itemId = 16895;
-            }
-            else if (level >= 60)
-            {
-                itemId = 16896;
-            }
-
-            return itemId;
+            return TortoiseBots::PickSoulstoneItem(bot->GetLevel(), [this](uint32 itemId) { return bot->GetItemCount(itemId); });
         }
     };
 
@@ -158,10 +154,85 @@ namespace ai
 		}
 	};
 
-    class CastCurseOfExhaustionAction : public CastRangedDebuffSpellAction
+    // PET-6: Health Funnel channels owner health into the demon. Owner-cast
+    // (the warlock knows the spell, the pet doesn't) on the pet target.
+    // The policy gate repeats here for the evaluation-to-execution gap: the
+    // trigger may have fired ticks ago while the owner dropped below the
+    // drain floor since.
+    class CastHealthFunnelAction : public CastSpellAction
     {
     public:
-		CastCurseOfExhaustionAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of exhaustion") {}
+        CastHealthFunnelAction(PlayerbotAI* ai) : CastSpellAction(ai, "health funnel") {}
+        std::string GetTargetName() override { return "pet target"; }
+        bool isUseful() override
+        {
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            if (!pet)
+                return false;
+            TortoiseBots::HealthFunnelGateInputs gate;
+            gate.hasPet = true;
+            gate.petAlive = pet->IsAlive();
+            gate.petHealth = AI_VALUE2(uint8, "health", "pet target");
+            gate.ownerHealth = AI_VALUE2(uint8, "health", "self target");
+            gate.ownerInCombat = bot->IsInCombat();
+            return TortoiseBots::CanCastHealthFunnel(gate) && CastSpellAction::isUseful();
+        }
+    };
+
+    // Raid curses: one curse per warlock per target (the core keeps several
+    // warlocks' curses side by side, but a warlock's new curse replaces its
+    // own old one). A curse cast claims its curse name on the target so
+    // another warlock picks a different curse, and claims the caster's own
+    // slot so its queued second curse row cannot overwrite the first before
+    // the aura lands. Live H9 (Patchwerk, 8 warlocks): the old one-curse-per-
+    // target claim left the boss with Shadow alone until Elements landed at
+    // 44 s, and one warlock overwrote its own Recklessness with Shadow 1 s
+    // later. Follows the blessing-claim precedent (BuffClaimRegistry).
+    class CastCurseSlotAction : public CastRangedDebuffSpellAction
+    {
+    public:
+        CastCurseSlotAction(PlayerbotAI* ai, std::string spell) : CastRangedDebuffSpellAction(ai, spell) {}
+        bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            if (!target)
+                return false;
+            // Own pending cast: a claim by anyone but the null guid is ours.
+            if (BuffClaimRegistry::IsClaimedByOther(ObjectGuid(), target->GetObjectGuid(), OwnSlotKey()))
+                return false;
+            static const char* const curses[] = {
+                "curse of agony", "curse of doom", "curse of recklessness",
+                "curse of shadow", "curse of the elements", "curse of weakness",
+                "curse of tongues", "curse of exhaustion"
+            };
+            for (const char* curse : curses)
+            {
+                if (GetSpellName() != curse && ai->HasAura(curse, target, false, true))
+                    return false;
+            }
+            if (BuffClaimRegistry::IsTargetClaimedByOther(bot, target, GetSpellName()))
+                return false;
+            return CastRangedDebuffSpellAction::isUseful();
+        }
+        bool Execute(Event& event) override
+        {
+            if (!CastRangedDebuffSpellAction::Execute(event))
+                return false;
+            if (Unit* target = GetTarget())
+            {
+                BuffClaimRegistry::Claim(bot->GetObjectGuid(), target->GetObjectGuid(), GetSpellName());
+                BuffClaimRegistry::Claim(bot->GetObjectGuid(), target->GetObjectGuid(), OwnSlotKey());
+            }
+            return true;
+        }
+    private:
+        std::string OwnSlotKey() const { return "curse slot " + std::to_string(bot->GetObjectGuid().GetRawValue()); }
+    };
+
+    class CastCurseOfExhaustionAction : public CastCurseSlotAction
+    {
+    public:
+        CastCurseOfExhaustionAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of exhaustion") {}
     };
 
 	class CastCorruptionAction : public CastRangedDebuffSpellAction
@@ -174,12 +245,15 @@ namespace ai
 	{
 	public:
 	    CastCorruptionOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "corruption") {}
+
+    protected:
+        std::string GetTargetName() override { return "attacker without my aura"; }
 	};
 
-    class CastCurseOfAgonyAction : public CastRangedDebuffSpellAction
+    class CastCurseOfAgonyAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfAgonyAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of agony") {}
+        CastCurseOfAgonyAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of agony") {}
     };
 
     class CastCurseOfAgonyOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -188,10 +262,10 @@ namespace ai
         CastCurseOfAgonyOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of agony") {}
     };
 
-    class CastCurseOfDoomAction : public CastRangedDebuffSpellAction
+    class CastCurseOfDoomAction : public CastCurseSlotAction
     {
     public:
-		CastCurseOfDoomAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of doom") {}
+        CastCurseOfDoomAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of doom") {}
     };
 
     class CastCurseOfDoomOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -200,10 +274,11 @@ namespace ai
 		CastCurseOfDoomOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of doom") {}
     };
 
-    class CastCurseOfTheElementsAction : public CastRangedDebuffSpellAction
+
+    class CastCurseOfTheElementsAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfTheElementsAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of the elements") {}
+        CastCurseOfTheElementsAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of the elements") {}
     };
 
     class CastCurseOfTheElementsOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -212,10 +287,10 @@ namespace ai
         CastCurseOfTheElementsOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of the elements") {}
     };
 
-    class CastCurseOfRecklessnessAction : public CastRangedDebuffSpellAction
+    class CastCurseOfRecklessnessAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfRecklessnessAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of recklessness") {}
+        CastCurseOfRecklessnessAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of recklessness") {}
     };
 
     class CastCurseOfRecklessnessOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -224,10 +299,10 @@ namespace ai
         CastCurseOfRecklessnessOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of recklessness") {}
     };
 
-    class CastCurseOfWeaknessAction : public CastRangedDebuffSpellAction
+    class CastCurseOfWeaknessAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfWeaknessAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of weakness") {}
+        CastCurseOfWeaknessAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of weakness") {}
     };
 
     class CastCurseOfWeaknessOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -236,10 +311,10 @@ namespace ai
         CastCurseOfWeaknessOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of weakness") {}
     };
 
-    class CastCurseOfTonguesAction : public CastRangedDebuffSpellAction
+    class CastCurseOfTonguesAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfTonguesAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of tongues") {}
+        CastCurseOfTonguesAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of tongues") {}
     };
 
     class CastCurseOfTonguesOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -248,10 +323,10 @@ namespace ai
         CastCurseOfTonguesOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "curse of tongues") {}
     };
 
-    class CastCurseOfShadowAction : public CastRangedDebuffSpellAction
+    class CastCurseOfShadowAction : public CastCurseSlotAction
     {
     public:
-        CastCurseOfShadowAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "curse of shadow") {}
+        CastCurseOfShadowAction(PlayerbotAI* ai) : CastCurseSlotAction(ai, "curse of shadow") {}
     };
 
     class CastCurseOfShadowOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
@@ -283,6 +358,60 @@ namespace ai
     {
     public:
         CastSpellLockAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "spell lock") {}
+
+        // Cast at the interrupt pick - any engaged hostile in range casting
+        // an interruptible spell - not only the current target. Matches the
+        // SpellLockTrigger read.
+    protected:
+        std::string GetTargetName() override { return "interrupt target"; }
+        std::string GetTargetQualifier() override { return GetSpellName(); }
+    };
+
+    class CastDevourMagicPurgeAction : public CastPetSpellAction
+    {
+    public:
+        CastDevourMagicPurgeAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "devour magic") {}
+        std::string getName() override { return "devour magic purge"; }
+        bool isPossible() override
+        {
+            // Actions are cached singletons: the ctor-resolved spellId stays
+            // 0 when no Felhunter is out at first creation (and goes stale
+            // across rank upgrades), which would fail the pet HasSpell check
+            // forever. Refresh before the base checks.
+            SetSpellName("devour magic", "spell id", true);
+            return CastPetSpellAction::isPossible();
+        }
+        bool isUseful() override
+        {
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            TortoiseBots::DevourMagicGateInputs gate;
+            gate.hasPet = pet != nullptr;
+            gate.currentPetEntry = pet ? pet->GetEntry() : 0;
+            return TortoiseBots::CanCastDevourMagic(gate) && CastPetSpellAction::isUseful();
+        }
+    };
+
+    class CastDevourMagicCleanseAction : public CastPetSpellAction
+    {
+    public:
+        CastDevourMagicCleanseAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "devour magic") {}
+        std::string GetTargetName() override { return "party member to dispel"; }
+        std::string GetTargetQualifier() override { return std::to_string(DISPEL_MAGIC); }
+        std::string getName() override { return "devour magic cleanse"; }
+        bool isPossible() override
+        {
+            // Same cached-singleton refresh as the purge action above.
+            SetSpellName("devour magic", "spell id", true);
+            return CastPetSpellAction::isPossible();
+        }
+        bool isUseful() override
+        {
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            TortoiseBots::DevourMagicGateInputs gate;
+            gate.hasPet = pet != nullptr;
+            gate.currentPetEntry = pet ? pet->GetEntry() : 0;
+            return TortoiseBots::CanCastDevourMagic(gate) && CastPetSpellAction::isUseful();
+        }
     };
 
     class CastSpellLockOnEnemyHealerAction : public CastPetSpellAction
@@ -302,7 +431,83 @@ namespace ai
         {
             Unit* target = GetTarget();
             Unit* pet = AI_VALUE(Unit*, "pet target");
+            // With a live tank in the group the Voidwalker never taunts: a
+            // pet peel is top threat the party cannot afford (same
+            // permission read as the autocast stand-down). Solo or tankless,
+            // this rescues the owner bot: the "has aggro" trigger requires
+            // victim == bot, so it can never take a mob the tank holds.
+            if (!ai::IsPetTauntAllowed(ai, bot))
+                return false;
             return target && pet && target->GetVictim() != pet;
+        }
+    };
+
+    // PET-8a: Voidwalker AoE taunt. Pet-cast on the current target; the
+    // trigger holds the pack-size and PET-3 permission gates, the policy
+    // repeats here for the evaluation-to-execution gap.
+    class CastSufferingAction : public CastPetSpellAction
+    {
+    public:
+        CastSufferingAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "suffering") {}
+        // Suffering radiates from the demon (implicit target A, caster src),
+        // so the pet is the target — never the owner's current target, which
+        // may be null or far away while the pet tanks the pack.
+        std::string GetTargetName() override { return "pet target"; }
+        bool isPossible() override
+        {
+            // Actions are cached singletons: the ctor-resolved spellId stays
+            // 0 when no Voidwalker is out at first creation (and goes stale
+            // across rank upgrades), which would fail the pet HasSpell check
+            // forever. Refresh before the base checks (same as the Devour
+            // actions above).
+            SetSpellName("suffering", "spell id", true);
+            return CastPetSpellAction::isPossible();
+        }
+        bool isUseful() override
+        {
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            if (!pet)
+                return false;
+            TortoiseBots::SufferingGateInputs gate;
+            gate.hasPet = true;
+            gate.currentPetEntry = pet->GetEntry();
+            gate.petTauntAllowed = ai::WarlockPetTauntAllowed(ai, bot);
+            gate.attackerCount = static_cast<uint8_t>(pet->GetAttackers().size());
+            return TortoiseBots::CanCastSuffering(gate) && CastPetSpellAction::isUseful();
+        }
+    };
+
+    // PET-8c: Voidwalker channeled self-heal. Pet-cast on itself; NC-only
+    // via the trigger (the channel breaks on damage, combat would waste it).
+    class CastConsumeShadowsAction : public CastPetSpellAction
+    {
+    public:
+        CastConsumeShadowsAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "consume shadows") {}
+        std::string GetTargetName() override { return "pet target"; }
+        bool isPossible() override
+        {
+            // Same cached-singleton refresh as above (VW summoned at 10,
+            // Consume rank 1 at 18).
+            SetSpellName("consume shadows", "spell id", true);
+            return CastPetSpellAction::isPossible();
+        }
+        bool isUseful() override
+        {
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            if (!pet)
+                return false;
+            // Don't re-order mid-channel: the core refuses with
+            // SPELL_FAILED_SPELL_IN_PROGRESS, which burns the NC decision.
+            if (pet->IsNonMeleeSpellCasted(false))
+                return false;
+            TortoiseBots::ConsumeShadowsGateInputs gate;
+            gate.hasPet = true;
+            gate.currentPetEntry = pet->GetEntry();
+            gate.petAlive = pet->IsAlive();
+            gate.petHealth = AI_VALUE2(uint8, "health", "pet target");
+            gate.ownerInCombat = bot->IsInCombat();
+            gate.mounted = AI_VALUE2(bool, "mounted", "self target");
+            return TortoiseBots::CanCastConsumeShadows(gate) && CastPetSpellAction::isUseful();
         }
     };
 
@@ -413,6 +618,29 @@ namespace ai
         std::string GetTargetName() override { return "self target"; }
         };
 
+    // Equips a bag firestone into an empty off-hand (WAR-4). Not a
+    // UseSpellItemAction: UseItemInternal refuses equippable items sitting
+    // in bags, and firestones have no on-use spell anyway (on-equip aura).
+    class EquipFirestoneAction : public Action
+    {
+    public:
+        EquipFirestoneAction(PlayerbotAI* ai) : Action(ai, "firestone") {}
+        bool Execute(Event& event) override;
+    };
+
+    // Equips a bag spellstone into an empty off-hand (WAR-4), same vanilla
+    // off-hand semantics as firestone: the stone's equip aura (Increased
+    // Critical Spell) then applies, and its on-use dispel/absorb stays
+    // available through normal use once worn. Never a weapon temp-enchant:
+    // the on-use spell targets the caster, and UseItemInternal refuses
+    // equippable items sitting in bags.
+    class EquipSpellstoneAction : public Action
+    {
+    public:
+        EquipSpellstoneAction(PlayerbotAI* ai) : Action(ai, "spellstone") {}
+        bool Execute(Event& event) override;
+    };
+
 	class CastCreateFirestoneAction : public CastSpellAction
 	{
 	public:
@@ -434,18 +662,110 @@ namespace ai
         virtual std::string GetTargetName() override { return "snare target"; }
         virtual std::string GetTargetQualifier() override { return GetSpellName(); }
         virtual ActionThreatType getThreatType() { return ActionThreatType::ACTION_THREAT_NONE; }
+        bool isPossible() override
+        {
+            // Same gate as CastBanishOnCcAction: Banish only lands on demons
+            // and elementals, and a target immune to its effects (a boss such
+            // as Magmadar) wastes the cast and the GCD.
+            Unit* target = GetTarget();
+            if (!target || target->IsPlayer())
+                return false;
+            uint32 type = target->GetCreatureType();
+            if (type != CREATURE_TYPE_DEMON && type != CREATURE_TYPE_ELEMENTAL)
+                return false;
+            if (SpellEntry const* spellInfo = sServerFacade.LookupSpellInfo(GetSpellID()))
+            {
+                for (int32 i = EFFECT_INDEX_0; i <= EFFECT_INDEX_2; ++i)
+                {
+                    if (target->IsImmuneToSpellEffect(spellInfo, (SpellEffectIndex)i, false))
+                        return false;
+                }
+            }
+            return CastSpellAction::isPossible();
+        }
     };
 
     class CastBanishOnCcAction : public CastCrowdControlSpellAction
     {
     public:
         CastBanishOnCcAction(PlayerbotAI* ai) : CastCrowdControlSpellAction(ai, "banish") {}
+        bool isPossible() override
+        {
+            // Banish only lands on demons and elementals; the core rejects
+            // other types, so firing there wastes mana and the GCD.
+            Unit* target = GetTarget();
+            if (!target || target->IsPlayer())
+                return false;
+            uint32 type = target->GetCreatureType();
+            if (type != CREATURE_TYPE_DEMON && type != CREATURE_TYPE_ELEMENTAL)
+                return false;
+            return CastCrowdControlSpellAction::isPossible();
+        }
+    };
+
+    // PET-2: succubus Seduction as warlock CC for humanoids. Pet-cast (range
+    // and cooldown resolve against the demon) with the CC shape: target is
+    // the assigned "cc target" and the CC flags mark it for CC discipline.
+    // No positioning: isPossible fails while the succubus is out of range,
+    // so this only fires when she is already near the mark (owner CC covers
+    // the rest). Break-protection comes free — "seduction" is in the
+    // breakable-CC list, so pet attacks hold fire once the aura lands.
+    class CastSeductionOnCcAction : public CastPetSpellAction
+    {
+    public:
+        CastSeductionOnCcAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "seduction") {}
+        std::string GetTargetName() override { return "cc target"; }
+        std::string GetTargetQualifier() override { return GetSpellName(); }
+        std::string getName() override { return "seduction on cc"; }
+        bool IsCrowdControlAction() const override { return true; }
+        std::string GetCrowdControlSpellName() const override { return GetSpellName(); }
+        // CC, not DPS: banish/fear are THREAT_NONE so the threat multiplier
+        // never zeroes them — seduction must match or it fails exactly when
+        // the warlock is under pressure.
+        ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
+        bool isPossible() override
+        {
+            // Succubus out on a humanoid mark — the only type the core lets
+            // Seduction land on. Firing elsewhere wastes the succubus GCD.
+            // Cached-singleton refresh (see the devour actions): the
+            // ctor-resolved spellId stays 0 when no succubus is out at first
+            // creation, which would fail the pet HasSpell check forever.
+            Unit* target = GetTarget();
+            // A dotted mark breaks on the first tick and re-seduces forever:
+            // refuse it like the free-pick and auto-CC choosers already do.
+            if (target && target->HasAuraType(SPELL_AURA_PERIODIC_DAMAGE))
+                return false;
+            TortoiseBots::SeductionGateInputs gate;
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            gate.hasPet = pet != nullptr;
+            gate.currentPetEntry = pet ? pet->GetEntry() : 0;
+            gate.targetIsPlayer = target && target->IsPlayer();
+            gate.targetCreatureType = target ? target->GetCreatureType() : 0;
+            if (!TortoiseBots::CanCastSeduction(gate))
+                return false;
+            SetSpellName("seduction", "spell id", true);
+            return CastPetSpellAction::isPossible();
+        }
+        bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            Unit* pet = AI_VALUE(Unit*, "pet target");
+            TortoiseBots::SeductionGateInputs gate;
+            gate.hasPet = pet != nullptr;
+            gate.currentPetEntry = pet ? pet->GetEntry() : 0;
+            gate.targetIsPlayer = target && target->IsPlayer();
+            gate.targetCreatureType = target ? target->GetCreatureType() : 0;
+            return TortoiseBots::CanCastSeduction(gate) && CastPetSpellAction::isUseful();
+        }
     };
 
     class CastRainOfFireAction : public CastSpellAction
     {
     public:
         CastRainOfFireAction(PlayerbotAI* ai) : CastSpellAction(ai, "rain of fire") {}
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
     };
     class CastInfernoAction : public CastSpellAction
     {
@@ -459,6 +779,15 @@ namespace ai
     {
     public:
         CastImmolateAction(PlayerbotAI* ai) : CastRangedDebuffSpellAction(ai, "immolate") {}
+    };
+
+    class CastImmolateOnAttackerAction : public CastRangedDebuffSpellOnAttackerAction
+    {
+    public:
+        CastImmolateOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "immolate") {}
+
+    protected:
+        std::string GetTargetName() override { return "attacker without my aura"; }
     };
 
     class CastConflagrateAction : public CastSpellAction
@@ -477,6 +806,18 @@ namespace ai
     {
     public:
         CastFearOnCcAction(PlayerbotAI* ai) : CastCrowdControlSpellAction(ai, "fear") {}
+        bool isPossible() override
+        {
+            // Fear never lands on undead or mechanical targets; the core
+            // rejects them, so firing there wastes mana and the GCD.
+            Unit* target = GetTarget();
+            if (!target || target->IsPlayer())
+                return false;
+            uint32 type = target->GetCreatureType();
+            if (type == CREATURE_TYPE_UNDEAD || type == CREATURE_TYPE_MECHANICAL)
+                return false;
+            return CastCrowdControlSpellAction::isPossible();
+        }
     };
 
     class CastLifeTapAction: public CastSpellAction
@@ -523,6 +864,9 @@ namespace ai
     {
     public:
         CastSiphonLifeOnAttackerAction(PlayerbotAI* ai) : CastRangedDebuffSpellOnAttackerAction(ai, "siphon life") {}
+
+    protected:
+        std::string GetTargetName() override { return "attacker without my aura"; }
     };
 
     class CastHowlOfTerrorAction : public CastMeleeAoeSpellAction

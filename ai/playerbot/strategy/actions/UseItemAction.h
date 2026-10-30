@@ -1,8 +1,10 @@
 #pragma once
 #include "playerbot/PlayerbotAI.h"
+#include "playerbot/policy/combat/BandageSafetyPolicy.h"
 #include "GenericActions.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/RandomItemMgr.h"
+#include "playerbot/strategy/values/TargetValue.h"
 
 namespace ai
 {
@@ -55,6 +57,19 @@ namespace ai
         bool UseItemInternal(Player* requester, uint32 itemId, Unit* target, GameObject* gameObjectTarget, Item* itemTarget);
         bool UseQuestGiverItem(Player* requester, Item* item);
         bool OpenItem(Player* requester, Item* item);
+    };
+
+    // `.bot cmd use` / `.bot cmd open` of the remote commander: use an item (on a unit or a game
+    // object) or a game object, named exactly. Param: "<itemId> <none|unit|go> <guid>" (itemId 0 = the
+    // game object itself). Unlike "use", nothing is matched by name, so a nearby object of a similar
+    // name cannot take the order's place. A refused cast check is kept for the caller (NoteCastCheckFail).
+    class CommanderUseAction : public UseAction
+    {
+    public:
+        CommanderUseAction(PlayerbotAI* ai) : UseAction(ai, "commander use") {}
+
+    protected:
+        virtual bool Execute(Event& event) override;
     };
 
     class UseItemIdAction : public UseAction
@@ -354,7 +369,13 @@ namespace ai
         UseOilOfImmolationAction(PlayerbotAI* ai) : UseItemIdAction(ai, "oil of immolation") {}
         virtual bool isUseful() override
         {
-            return UseItemIdAction::isUseful() && bot->GetLevel() >= 31 && !ai->HasAura(11350, bot);
+            if (!UseItemIdAction::isUseful() || bot->GetLevel() < 31 || ai->HasAura(11350, bot))
+                return false;
+            // The oil burns every mob near the user for its whole duration:
+            // never start it beside a sheeped mob or a CC mark about to be
+            // sheeped (same rule as Blade Flurry).
+            CcGuard ccGuard(ai);
+            return !ccGuard.ProtectedEnemyNear(bot, 8.0f, true);
         }
 
         virtual uint32 GetItemId() override { return 8956; }
@@ -434,6 +455,22 @@ namespace ai
         }
     };
 
+    // A hostile within melee reach breaks the bandage channel with its next
+    // swing even when it has not threatened the bot yet, so scan the group
+    // attacker list, not just the bot's own attackers.
+    inline bool HasHostileInMeleeReach(PlayerbotAI* ai, Player* bot)
+    {
+        const std::list<ObjectGuid>& attackers =
+            ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("attackers")->Get();
+        for (const ObjectGuid& attackerGuid : attackers)
+        {
+            Unit* attacker = ai->GetUnit(attackerGuid);
+            if (attacker && sServerFacade.IsAlive(attacker) && attacker->CanReachWithMeleeAutoAttack(bot))
+                return true;
+        }
+        return false;
+    }
+
     class UseBandageAction : public UseTargetedItemIdAction
     {
     public:
@@ -444,10 +481,10 @@ namespace ai
             if (!UseTargetedItemIdAction::isUseful())
                 return false;
 
-            if (bot->HasAura(11196))
-                return false;
-
-            if (AI_VALUE(uint8, "my attacker count") > 0 || bot->HasAuraType(SPELL_AURA_PERIODIC_DAMAGE))
+            if (BandageGateCheck(bot->HasAura(11196),
+                                 AI_VALUE(uint8, "my attacker count") > 0,
+                                 bot->HasAuraType(SPELL_AURA_PERIODIC_DAMAGE),
+                                 HasHostileInMeleeReach(ai, bot)) != BANDAGE_OK)
                 return false;
 
             if (bot->GetSkillValue(129) < 1)
@@ -542,9 +579,19 @@ namespace ai
             if(!UseItemIdAction::isUseful())
                 return false;
 
-
-            if (bot->GetClass() == CLASS_MAGE) // mage should use mana gem, shares cd with dark rune
-                return false;
+            if (bot->GetClass() == CLASS_MAGE)
+            {
+                // Gem and rune share a cooldown line: prefer the free gem
+                // while one is held and ready; fall through to the rune
+                // once the gem is spent or on cooldown. Live H8: the old
+                // blanket mage block silenced the rune row for the whole
+                // fight, so mages burned the gem hourly-on-cooldown then
+                // wanded below 5% mana with the rune never firing.
+                static const uint32 gemIds[] = { 8008, 8007, 5513, 5514 };
+                for (uint32 gemId : gemIds)
+                    if (bot->HasItemCount(gemId, 1) && !HasItemCooldown(gemId))
+                        return false;
+            }
 
             return bot->GetHealth() > 1000;
         }
@@ -563,6 +610,20 @@ namespace ai
         }
 
         virtual uint32 GetItemId() override { return 13457; }
+    };
+
+    // Greater Protection Potion for the listed raid boss among the bot's
+    // attackers (ProtectionPotionPolicy.h); 0 when none is in the fight.
+    uint32 FindBossProtectionPotion(PlayerbotAI* ai, uint32* buffSpellId = nullptr);
+
+    class UseBossProtectionPotionAction : public UseItemIdAction
+    {
+    public:
+        UseBossProtectionPotionAction(PlayerbotAI* ai) : UseItemIdAction(ai, "boss protection potion") {}
+
+        virtual bool isUseful() override;
+
+        virtual uint32 GetItemId() override { return FindBossProtectionPotion(ai); }
     };
 
     class UseFreeActionPotionAction : public UseItemIdAction
@@ -590,6 +651,19 @@ namespace ai
 
         virtual uint32 GetItemId() override { return 5634; }
     };
+
+    // Eating and drinking rest the bot between fights (#133). Sitting down
+    // while the group is already fighting puts the AI to sleep for the whole
+    // meal, so the bot missed the pull and any CC order. "has attackers" is
+    // the cached value the combat-start trigger reads anyway; the member
+    // check catches the first seconds of a pull before that cache refreshes,
+    // and it is the same test that wakes an eating bot (PlayerbotAI::UpdateAI),
+    // so a woken bot does not sit straight back down.
+    inline bool GroupIsFighting(PlayerbotAI* ai)
+    {
+        return ai->GetAiObjectContext()->GetValue<bool>("has attackers")->Get() ||
+            ai->IsGroupMemberNearInCombat();
+    }
 
     class DrinkAction : public UseAction
     {
@@ -662,7 +736,7 @@ namespace ai
 
         bool isUseful() override
         {
-            return UseAction::isUseful() && AI_VALUE(bool, "should drink");
+            return UseAction::isUseful() && AI_VALUE(bool, "should drink") && !GroupIsFighting(ai);
         }
 
         bool isPossible() override
@@ -738,7 +812,20 @@ namespace ai
 
         bool isUseful() override
         {
-            return UseAction::isUseful() && AI_VALUE(bool, "should eat");
+            if (!UseAction::isUseful() || !AI_VALUE(bool, "should eat") || GroupIsFighting(ai))
+                return false;
+
+            // A CC bot whose mark is alive and in sight does not sit down to
+            // top up from MediumHealth: only free-food bots eat that high,
+            // and the meal would run into the pull. "rti cc" is Moon on every
+            // bot until a .bot action cc order gives the mark to one bot, so
+            // a real need (below MediumHealth) still eats and drinking is
+            // not touched.
+            if (AI_VALUE2(uint8, "health", "self target") >= sPlayerbotAIConfig.mediumHealth &&
+                ai->HasStrategy("cc", BotState::BOT_STATE_COMBAT) && AI_VALUE(Unit*, "rti cc target"))
+                return false;
+
+            return true;
         }
 
         bool isPossible() override

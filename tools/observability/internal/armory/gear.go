@@ -14,22 +14,27 @@ const (
 	slotTabard = 18
 )
 
-// GearRollup returns every pool bot's equipped-gear summary in one query over
-// character_inventory: the average item level of the filled equipment slots
-// plus the quality census of those pieces. Empty slots are not averaged in, so
-// a bot in a half-finished outfit is not scored as if it wore ilvl-0 gear. It
-// is a diagnostic snapshot the daemon runs on a slow timer (minutes), never
-// per tick.
+// GearRollup returns every pool bot's equipped-gear summary plus every online
+// player character's (Issue #872: the roster and the level bands show gear
+// for players and alts too) in one query over character_inventory: the
+// average item level of the filled equipment slots plus the quality census
+// of those pieces. Empty slots are not averaged in, so a bot in a
+// half-finished outfit is not scored as if it wore ilvl-0 gear. It is a
+// diagnostic snapshot the daemon runs on a slow timer (minutes), never per
+// tick. Hired characters are pool-account rows like any pool bot; player
+// characters join by guid (players are few, characters.online is indexed).
 func (s *Service) GearRollup() (map[uint32]model.BotGear, error) {
 	query := fmt.Sprintf(`
-		SELECT c.guid, it.quality, it.item_level
+		SELECT ci.guid, it.quality, it.item_level
 		FROM character_inventory ci
-		JOIN characters c ON c.guid = ci.guid
-		JOIN tortoise_bots_pool_account p ON p.account_id = c.account
 		JOIN %s.item_template it ON it.entry = ci.item_template
-		WHERE c.deleteDate IS NULL
-		  AND ci.bag = 0 AND ci.slot >= 0 AND ci.slot < %d
+		WHERE ci.bag = 0 AND ci.slot >= 0 AND ci.slot < %d
 		  AND ci.slot NOT IN (%d, %d)
+		  AND (EXISTS (SELECT 1 FROM characters c
+		               JOIN tortoise_bots_pool_account p ON p.account_id = c.account
+		               WHERE c.guid = ci.guid AND c.deleteDate IS NULL)
+		       OR EXISTS (SELECT 1 FROM characters c2
+		                  WHERE c2.guid = ci.guid AND c2.deleteDate IS NULL AND c2.online <> 0))
 	`, s.cfg.WorldDB, EquipmentSlotEnd, slotShirt, slotTabard)
 
 	rows, err := s.db.Query(query)
@@ -82,4 +87,107 @@ func (s *Service) GearRollup() (map[uint32]model.BotGear, error) {
 		out[guid] = gear
 	}
 	return out, nil
+}
+
+// CompletedQuestsRollup returns the lifetime completed quest count for every pool bot.
+// ExistingCharacters returns the guid of every character that still exists,
+// so the activity rollup can forget the ones a pool reset deleted.
+func (s *Service) ExistingCharacters() (map[uint32]struct{}, error) {
+	rows, err := s.db.Query(`SELECT guid FROM characters WHERE deleteDate IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[uint32]struct{})
+	for rows.Next() {
+		var guid uint32
+		if err := rows.Scan(&guid); err != nil {
+			return nil, err
+		}
+		out[guid] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+func (s *Service) CompletedQuestsRollup() (map[uint32]uint64, error) {
+	query := `
+		SELECT c.guid, COUNT(*)
+		FROM character_queststatus qs
+		JOIN characters c ON c.guid = qs.guid
+		JOIN tortoise_bots_pool_account p ON p.account_id = c.account
+		WHERE c.deleteDate IS NULL AND qs.status = 1
+		GROUP BY c.guid`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[uint32]uint64)
+	for rows.Next() {
+		var guid uint32
+		var count uint64
+		if err := rows.Scan(&guid, &count); err != nil {
+			return nil, err
+		}
+		out[guid] = count
+	}
+	return out, rows.Err()
+}
+
+// SpellsLearnedRollup returns the lifetime known spell count for every pool bot.
+func (s *Service) SpellsLearnedRollup() (map[uint32]uint64, error) {
+	query := `
+		SELECT c.guid, COUNT(*)
+		FROM character_spell cs
+		JOIN characters c ON c.guid = cs.guid
+		JOIN tortoise_bots_pool_account p ON p.account_id = c.account
+		WHERE c.deleteDate IS NULL AND cs.active = 1
+		GROUP BY c.guid`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[uint32]uint64)
+	for rows.Next() {
+		var guid uint32
+		var count uint64
+		if err := rows.Scan(&guid, &count); err != nil {
+			return nil, err
+		}
+		out[guid] = count
+	}
+	return out, rows.Err()
+}
+
+// OpenQuestsRollup returns the currently active (in progress or ready to hand in) quests for every pool bot.
+func (s *Service) OpenQuestsRollup() (map[uint32][]uint32, error) {
+	query := `
+		SELECT c.guid, qs.quest
+		FROM character_queststatus qs
+		JOIN characters c ON c.guid = qs.guid
+		JOIN tortoise_bots_pool_account p ON p.account_id = c.account
+		WHERE c.deleteDate IS NULL AND qs.status IN (0, 3)`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[uint32][]uint32)
+	for rows.Next() {
+		var guid uint32
+		var quest uint32
+		if err := rows.Scan(&guid, &quest); err != nil {
+			return nil, err
+		}
+		out[guid] = append(out[guid], quest)
+	}
+	return out, rows.Err()
 }

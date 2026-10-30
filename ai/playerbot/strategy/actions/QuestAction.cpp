@@ -1,8 +1,10 @@
-
 #include "playerbot/playerbot.h"
 #include "QuestAction.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "playerbot/ServerFacade.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireQuestPolicy.h"
+#include "../../../../runtime/AltBotService.h"
 
 using namespace ai;
 
@@ -11,6 +13,9 @@ bool QuestAction::Execute(Event& event)
     ObjectGuid guid = event.getObject();
 
     Player* master = GetMaster();
+
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
+        return false;
 
     if (!guid)
     {
@@ -74,7 +79,7 @@ bool QuestAction::CompleteQuest(Player* player, uint32 entry)
         uint8 msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, count - curItemCount);
         if (msg == EQUIP_ERR_OK)
         {
-            Item* item = player->StoreNewItem(dest, id, true);
+            Item* item = player->StoreNewItem(dest, id, true, Item::GenerateItemRandomPropertyId(id));
             player->SendNewItem(item, count - curItemCount, true, false);
         }
     }
@@ -158,6 +163,13 @@ bool QuestAction::ProcessQuests(WorldObject* questGiver)
     for (uint32 blocked : challengeQuestNpcs)
         if (questGiver->GetEntry() == blocked)
             return false;
+
+    // A hired companion never talks to a <Mercenary Hire> recruiter, even on
+    // an explicit order (play-test 2026-10-13: fresh hires walked up to the
+    // recruiter). Pool bots and owned alts are untouched.
+    if (TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) &&
+        TortoiseBots::IsHireQuestRecruiterEntry(questGiver->GetEntry()))
+        return false;
 
     ObjectGuid guid = questGiver->getObjectGuid();
 
@@ -259,6 +271,11 @@ bool QuestAction::AcceptQuest(Player* requester, Quest const* quest, uint64 ques
         {
             Object* pObject = bot->GetObjectByTypeMask((ObjectGuid)questGiver, TYPEMASK_CREATURE_GAMEOBJECT_PLAYER_OR_ITEM);
             bot->AddQuest(quest, pObject);
+            // Objective-less quests complete on accept, as in the core handler.
+            if (bot->CanCompleteQuest(questId))
+                bot->CompleteQuest(questId);
+            if (quest->GetSrcSpell() > 0)
+                bot->CastSpell(bot, quest->GetSrcSpell(), true);
         }
         else if (bot->GetQuestStatus(questId) == QUEST_STATUS_NONE && IsNearGroupedMaster())
         {
@@ -269,7 +286,14 @@ bool QuestAction::AcceptQuest(Player* requester, Quest const* quest, uint64 ques
             // object givers only; the bot must be eligible.
             Object* pObject = bot->GetObjectByTypeMask((ObjectGuid)questGiver, TYPEMASK_CREATURE_OR_GAMEOBJECT);
             if (pObject && bot->CanTakeQuest(quest, false) && bot->CanAddQuest(quest, false))
+            {
                 bot->AddQuest(quest, pObject);
+                // Objective-less quests complete on accept, as in the core handler.
+                if (bot->CanCompleteQuest(questId))
+                    bot->CompleteQuest(questId);
+                if (quest->GetSrcSpell() > 0)
+                    bot->CastSpell(bot, quest->GetSrcSpell(), true);
+            }
         }
 
         if (bot->GetQuestStatus(questId) != QUEST_STATUS_NONE && bot->GetQuestStatus(questId) != QUEST_STATUS_AVAILABLE)
@@ -277,6 +301,9 @@ bool QuestAction::AcceptQuest(Player* requester, Quest const* quest, uint64 ques
             BroadcastHelper::BroadcastQuestAccepted(ai, bot, quest);
 
             sPlayerbotAIConfig.logEvent(ai, "AcceptQuestAction", quest->GetTitle(), std::to_string(quest->GetQuestId()));
+            // Issue #872: remember quests the autonomous alt took itself so
+            // only those may be abandoned later.
+            TortoiseBots::AltBotService::Instance().AddTakenQuest(bot, questId);
             outputMessage = BOT_TEXT2("quest_accepted", args);
             success = true;
         }

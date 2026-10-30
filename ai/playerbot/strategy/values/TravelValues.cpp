@@ -1,9 +1,14 @@
 #include "playerbot/playerbot.h"
+#include <algorithm>
+#include <typeinfo>
 #include "TravelValues.h"
 #include "playerbot/TravelMgr.h"
+#include "playerbot/policy/rpg/LocalPickPolicy.h"
+#include "playerbot/policy/rpg/ZoneMigratePolicy.h"
 #include "MaintenanceValues.h"
 #include "QuestValues.h"
 #include "SharedValueContext.h"
+#include "runtime/AltBotService.h"
 #include "BudgetValues.h"
 #include "GuildValues.h"
 #include "Guild/GuildMgr.h"
@@ -63,8 +68,8 @@ static uint32 GameObjectLockSkill(GameObjectInfo const* gInfo)
 
 EntryTravelPurposeMap EntryTravelPurposeMapValue::Calculate()
 {
-    EntryQuestRelationMap relationMap = GAI_VALUE(EntryQuestRelationMap, "entry quest relation");
-    EntryGuidps guidpMap = GAI_VALUE(EntryGuidps, "entry guidps");
+    EntryQuestRelationMap const& relationMap = GAI_VALUE_REF(EntryQuestRelationMap, "entry quest relation");
+    EntryGuidps const& guidpMap = GAI_VALUE_REF(EntryGuidps, "entry guidps");
 
     EntryTravelPurposeMap entryPurposeMap;
 
@@ -147,7 +152,8 @@ EntryTravelPurposeMap EntryTravelPurposeMapValue::Calculate()
         {
             if (cInfo->rank == 1)
             {
-                if (guidpMap[entry].size() == 1)
+                auto it = guidpMap.find(entry);
+                if (it != guidpMap.end() && it->second.size() == 1)
                     purpose |= (uint32)TravelDestinationPurpose::Boss;
             }
             else
@@ -271,11 +277,18 @@ bool NeedTravelPurposeValue::Calculate()
         // pool bot holding spendable gold walks to its auction house on its
         // own feet and bids on arrival (no buyer teleport). Phase gate first:
         // it is the cheap clock check, so the purse/position work below only
-        // runs in the open slice (review finding 7).
-        if (!AI_VALUE2(bool, "has strategy", "free"))
-            break;
-        if (!ai::BuyerTripPhaseOpen(ai->GetFixedBotNumber(BotTypeNumber::RPG_PHASE_NUMBER, ai::kBuyerTripPhaseMax, 1)))
-            break;
+        // runs in the open slice (review finding 7). No "free" strategy gate
+        // (issue #779): pool bots wander, so it shut every one of them out.
+        // This value is also the stored condition of a trip already walking
+        // to the AH, so the 3-minute slice only gates new picks - a walk
+        // longer than the slice is not dropped when it closes.
+        {
+            TravelTarget* target = AI_VALUE(TravelTarget*, "travel target");
+            TravelDestination* dest = target ? target->GetDestination() : nullptr;
+            bool const walkingToAh = dest && dest->GetPurpose() == TravelDestinationPurpose::AH;
+            if (!walkingToAh && !ai::BuyerTripPhaseOpen(ai->GetFixedBotNumber(BotTypeNumber::RPG_PHASE_NUMBER, ai::kBuyerTripPhaseMax, 1)))
+                break;
+        }
         if (ai::AhBuyerTripNeeded(ai))
             return true;
         break;
@@ -285,12 +298,30 @@ bool NeedTravelPurposeValue::Calculate()
     case TravelDestinationPurpose::GatherMining:
     case TravelDestinationPurpose::GatherHerbalism:
         skill = gatheringSkills.at(purpose);
-        if (bot->GetSkillValue(skill) < std::min(bot->GetSkillMax(skill), bot->GetSkillMaxForLevel(bot)))
-        {
-            return true;
-        }
+        if (bot->GetSkillValue(skill) >= std::min(bot->GetSkillMax(skill), bot->GetSkillMaxForLevel(bot)))
+            return false;
 
-        return false;
+        // Empty-search probe, same shape as the trainer class/trade probe
+        // below: skill headroom alone raised the need while no node in the
+        // window would be accepted, so the bot requested, searched, parked
+        // a minute and re-asked (live: 414 empty GatherMining + 107 empty
+        // GatherHerbalism searches in 23 min, mostly "0:empty"). Refuse
+        // when no destination in the request window is active. Same window
+        // the purpose request searches (RequestTravelTargetAction), same
+        // entry source (all entries) and same acceptance (IsActive): a
+        // picked node is always inside the window it was picked from, so
+        // this stays true while walking its own trip.
+        if (!activeNodeProbe.Get([&]()
+            {
+                PlayerTravelInfo const info(bot);
+                DestinationList const nodes = sTravelMgr.GetDestinations(info,
+                    (uint32)purpose, {}, true, 10000.0f);
+                return std::any_of(nodes.begin(), nodes.end(),
+                    [&](TravelDestination* node) { return node->IsActive(bot, info); });
+            }))
+            return false;
+
+        return true;
     case TravelDestinationPurpose::Boss:
         return AI_VALUE(bool, "can fight boss");
     case TravelDestinationPurpose::Mail:
@@ -313,7 +344,7 @@ bool NeedTravelPurposeValue::Calculate()
         // below level 5), so the last 15 minutes of each hour leave a level 1-4
         // pool bot with quests parked and no errand at all (issue #393). Let
         // them grind around the clock instead of idling at an NPC.
-        bool const beginner = bot->GetLevel() < 5 && sRandomBotFacade.IsRandomBot(bot) && !ai->HasRealPlayerMaster();
+        bool const beginner = bot->GetLevel() < 5 && sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster();
         if (!beginner)
         {
             uint32 rpgPhase = ai->GetFixedBotNumber(BotTypeNumber::RPG_PHASE_NUMBER, 60, 1);
@@ -345,16 +376,18 @@ bool ShouldTravelNamedValue::Calculate()
         if (!botPos.isOverworld())
             return false;
 
+        uint32 rpgPhase = ai->GetFixedBotNumber(BotTypeNumber::RPG_PHASE_NUMBER, ai::kBuyerTripPhaseMax, 1);
+
         // A city trip without capital business is a 3000 yd walk to nowhere
         // (live: 1614 "city" picks, 917 move failures, 520 drops against no
         // buyer/seller need of its own). Gate it on the same needs the
         // capital serves: stock to post at the AH, or an affordable AH
         // purchase. Trainer/vendor/mail trips carry their own need gates;
         // the battlemaster leg is gone (bots never queue on their own).
-        if (!AI_VALUE(bool, "should ah sell") && !ai::AhBuyerTripNeeded(ai))
+        // Only buyer leg is phase-gated to avoid checking AhBuyerTripNeeded continuously.
+        bool shouldAhSell = AI_VALUE(bool, "should ah sell");
+        if (!shouldAhSell && !(ai::BuyerTripPhaseOpen(rpgPhase) && ai::AhBuyerTripNeeded(ai)))
             return false;
-
-        uint32 rpgPhase = ai->GetFixedBotNumber(BotTypeNumber::RPG_PHASE_NUMBER, 60, 1);
 
         if (rpgPhase > 20) //Only first 20 minutes of the hour allow generic city pvp without reason.
             return false;
@@ -446,10 +479,16 @@ bool ShouldTravelNamedValue::Calculate()
     }
     else if (name == "reagent vendor")
     {
+        // Issue #872 (B11): autonomous alts never travel to buy reagents.
+        if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+            return false;
         return AI_VALUE(bool, "needs profession reagents");
     }
     else if (name == "mount")
     {
+        // Issue #872 (B11): autonomous alts never buy mounts.
+        if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+            return false;
         if (AI_VALUE(bool, "can buy mount"))
             return true;
 
@@ -457,9 +496,25 @@ bool ShouldTravelNamedValue::Calculate()
     }
     else if (name.find("trainer") == 0)
     {
-        if (ai->HasRealPlayerMaster())
+        // Issue #872 (B11): autonomous alts train class spells only.
+        if (name != "trainer class" &&
+            TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+            return false;
+        // Park pre-gate (perf): a parked trainer need stays parked until the
+        // purse covers the cheapest rank (money park) or a level-up clears it
+        // (AutoLearnSpellAction). The full probe below walks the trainer map
+        // and the destination window; skip it while the park timestamp the
+        // tail of this branch reads is still in the future and the purse
+        // cannot have lifted it. Same verdict, no destination walk: a money
+        // park with no new money still refuses, a teaching park still refuses.
+        // The tail re-reads the timestamp, so a park that expired (or was
+        // cleared by a ding) since the last visit falls through to the probe.
+        if (AI_VALUE2(time_t, "manual time", "no travel purpose until::" + name) > time(0) &&
+            !AI_VALUE2(bool, "manual bool", "trainer park needs money"))
             return false;
 
+        if (ai->HasRealPlayerMaster())
+            return false;
         TrainerType trainerType = TRAINER_TYPE_CLASS;
         NeedMoneyFor budgetType = NeedMoneyFor::spells;
 
@@ -482,6 +537,45 @@ bool ShouldTravelNamedValue::Calculate()
         if (AI_VALUE2(uint32, "train cost", trainerType) == 0) //Has nothing to train
             return false;
 
+        // Class and trade trips need a trainer of the bot's OWN class/craft in
+        // reach: "train cost" counts every green rank in the world, so without
+        // this a bot with nothing learnable nearby still raised the trigger,
+        // requested, and parked for a minute, every minute (live: ~1000 empty
+        // + ~400 rejected "trainer class" searches in 20 min, ~33 wasted trade
+        // picks/h at level 5). The search uses the same window. The need
+        // doubles as the in-flight trip's stored condition, so this must stay
+        // true while walking: a picked trainer is always inside the window it
+        // was picked from, and learning only ever removes entries, which is
+        // exactly when the trip should end.
+        if (name == "trainer class" || name == "trainer trade")
+        {
+            std::vector<int32> entries =
+                AI_VALUE2(std::vector<int32>, "available trainers", (uint32)trainerType);
+            if (entries.empty())
+                return false;
+
+            bool const masterless = sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster();
+            // Same window the request searches (ChooseTravelTargetAction).
+            float const window = name == "trainer class" ?
+                ClassTrainerRequestMaxDistance(masterless, bot->GetLevel(),
+                    AI_VALUE2(std::vector<TrainerSpell const*>, "trainable spells", (uint32)TRAINER_TYPE_CLASS).size(), 10000.0f) :
+                CampRequestMaxDistance(masterless, bot->GetLevel(), 10000.0f);
+            // Only trainers the pick would accept: possible (level, outgrown
+            // town) and active (not hostile, not just visited). Counting every
+            // listed trainer raised the need for an enemy-faction or outgrown
+            // trainer nearby, and the search then refused them all and parked
+            // a minute, every minute (1836 "inactive" refusals in 20 min).
+            if (!activeTrainerProbe.Get([&]()
+                {
+                    PlayerTravelInfo const info(bot);
+                    DestinationList const trainers = sTravelMgr.GetDestinations(info,
+                        (uint32)TravelDestinationPurpose::Trainer, entries, true, window);
+                    return std::any_of(trainers.begin(), trainers.end(),
+                        [&](TravelDestination* trainer) { return trainer->IsActive(bot, info); });
+                }))
+                return false;
+        }
+
         // Partial-purse rule: travel when at least the cheapest trainable spell
         // fits the free-money budget. The old "has all money for" check demanded
         // the full batch price up front, so bots never visited until they could
@@ -498,23 +592,10 @@ bool ShouldTravelNamedValue::Calculate()
         uint32 const freeMoney = AI_VALUE2(uint32, "free money for", (uint32)budgetType);
         bool const canAfford = freeMoney >= minSpellCost;
 
-        // One trainer journey at a time. "train cost" is summed over every trainer in
-        // the world, so this need stays true for as long as any affordable rank exists
-        // anywhere - and the row outranks Grind (6.89 vs 6.35), so every time the
-        // bot's travel target died before arrival it re-requested a trainer instead of
-        // grinding. Measured on the cycle-3 pool at level 5: 1,124 trainer-class picks
-        // from 172 bots in 90 min (cycle 2: 497) against only ~130 learns, 57% of them
-        // from 15 stationary bots, 638 of 952 consecutive picks made from the same
-        // coordinate - the bot never walked, it only re-picked. The park below only
-        // covers a visit that reached a trainer; a trip that never got there (travel
-        // target expired on its short timer, unstuck reset, drop) left nothing behind,
-        // so the loop was unbounded. This timestamp is set when an errand is actually
-        // started (RequestNamedTravelTargetAction) and cleared by a successful learn
-        // (TrainerAction) or a level-up (AutoLearnSpellAction, next to the park clear),
-        // so the bot tries the walk once and grinds until the window is up.
-        time_t const trainerTripSince = AI_VALUE2(time_t, "manual time", "trainer trip since");
-        if (trainerTripSince && time(0) - trainerTripSince < 10 * MINUTE)
-            return false;
+        // One trainer journey at a time is enforced request-side
+        // (RequestNamedTravelTargetAction::isAllowed): this value doubles as the
+        // in-flight trip's stored condition, and the 10-minute window here
+        // turned every new trainer trip to cooldown on its first step.
 
         // A fruitless visit parks the trainer (TrainerAction). The park is a
         // cooling-off for the training need that visit found, not a ban, and it must
@@ -581,7 +662,7 @@ bool ShouldLeaveOutgrownZoneValue::Calculate()
     if (!sPlayerbotAIConfig.leaveOutgrownZones)
         return false;
 
-    if (!sRandomBotFacade.IsRandomBot(bot) || ai->HasRealPlayerMaster())
+    if (!sRandomBotFacade.IsFreeBot(bot) || ai->HasRealPlayerMaster())
         return false;
 
     if (!bot->IsAlive())
@@ -589,6 +670,42 @@ bool ShouldLeaveOutgrownZoneValue::Calculate()
 
     if (bot->GetLevel() < 10)
         return false;
+
+    // Targetless leave (ZoneMigratePolicy.h): two minutes of back-to-back
+    // `reset travel target` mean no errand below is going to start, so the
+    // yields below (hand-in quest, capital service needs) no longer hold the
+    // bot. Checked first for that reason. Once due, the value stays true
+    // until the next real pick (bounded wait), then for the Grind trip that
+    // pick starts, because this value is that trip's stored condition. The
+    // trip hold ends with the trip itself, not on a clock: a bot that
+    // finished its trip in a zone that fits is not sent on again.
+    {
+        if (AI_VALUE2(bool, "manual bool", "targetless leave trip"))
+        {
+            TravelTarget* const trip = AI_VALUE(TravelTarget*, "travel target");
+            TravelDestination* const tripDest = trip ? trip->GetDestination() : nullptr;
+            TravelStatus const tripStatus = trip ? trip->GetStatus() : TravelStatus::TRAVEL_STATUS_NONE;
+            if (tripDest && typeid(*tripDest) != typeid(NullTravelDestination) &&
+                (tripStatus == TravelStatus::TRAVEL_STATUS_READY ||
+                 tripStatus == TravelStatus::TRAVEL_STATUS_TRAVEL ||
+                 tripStatus == TravelStatus::TRAVEL_STATUS_WORK))
+                return true;
+            SET_AI_VALUE2(bool, "manual bool", "targetless leave trip", false);
+        }
+
+        time_t const now = time(0);
+        if (AI_VALUE2(time_t, "manual time", "targetless leave until") > now)
+            return true;
+
+        time_t const targetlessSince = AI_VALUE2(time_t, "manual time", "targetless since");
+        if (ai::TargetlessLeaveDue(targetlessSince, now))
+        {
+            SET_AI_VALUE2(time_t, "manual time", "targetless leave until", now + ai::TARGETLESS_LEAVE_LATCH_SECONDS);
+            sPlayerbotAIConfig.logEvent(ai, "TargetlessLeave", WorldPosition(bot).GetAreaName(true, true),
+                std::to_string((long long)(now - targetlessSince)));
+            return true;
+        }
+    }
 
     // No IsActive early-out here: this value doubles as the travel condition
     // stored on the Grind target it requests, and bailing while a target is
@@ -665,6 +782,16 @@ bool ShouldLeaveOutgrownZoneValue::Calculate()
             return false;
         return true;
     }
+
+    // A zone that is not outgrown can still be barren for this bot: two
+    // Grind searches in a row found nothing (all spots out of level, out of
+    // reach or in enemy territory). Leaving it is the same move - grind in
+    // another zone that fits the bot's level - instead of standing between
+    // empty searches (83 of 2000 pool bots had no target for a whole 5-min
+    // window, live 2026-10-09).
+    if (AI_VALUE2(int32, "manual int", "grind empty streak") >= 2 &&
+        AI_VALUE2(time_t, "manual time", "grind empty at") + 10 * MINUTE > time(0))
+        return true;
 
     // Fail closed: unknown area levels never trigger the rule (zoneKnown
     // above covers the unresolvable/unknown case).

@@ -3,6 +3,7 @@
 #include "PaladinTriggers.h"
 #include "PaladinAiObjectContext.h"
 #include "playerbot/strategy/NamedObjectContext.h"
+#include "PaladinBuffStrategies.h"
 #include "HolyPaladinStrategy.h"
 #include "ProtectionPaladinStrategy.h"
 #include "RetributionPaladinStrategy.h"
@@ -166,6 +167,8 @@ namespace ai
                 creators["aura fire"] = [](PlayerbotAI* ai) { return new PaladinManualAuraStrategy(ai, "aura fire", "fire resistance aura", "fire resistance aura"); };
                 creators["aura crusader"] = [](PlayerbotAI* ai) { return new PaladinManualAuraStrategy(ai, "aura crusader", "crusader aura", "crusader aura"); };
                 creators["aura sanctity"] = [](PlayerbotAI* ai) { return new PaladinManualAuraStrategy(ai, "aura sanctity", "sanctity aura", "sanctity aura"); };
+                creators["rfire"] = [](PlayerbotAI* ai) { return new PaladinFireResistanceStrategy(ai); };
+                creators["rshadow"] = [](PlayerbotAI* ai) { return new PaladinShadowResistanceStrategy(ai); };
             }
         };
 
@@ -227,6 +230,9 @@ namespace ai
                 creators["judgement of wisdom"] = [](PlayerbotAI* ai) { return new JudgementOfWisdomTrigger(ai); };
                 creators["judgement of light"] = [](PlayerbotAI* ai) { return new JudgementOfLightTrigger(ai); };
                 creators["seal"] = [](PlayerbotAI* ai) { return new SealTrigger(ai); };
+                creators["judgement upkeep seal of wisdom"] = [](PlayerbotAI* ai) { return new JudgementUpkeepTrigger(ai, "judgement upkeep seal of wisdom", JudgementUpkeepTrigger::Step::SealWisdom); };
+                creators["judgement upkeep seal of light"] = [](PlayerbotAI* ai) { return new JudgementUpkeepTrigger(ai, "judgement upkeep seal of light", JudgementUpkeepTrigger::Step::SealLight); };
+                creators["judgement upkeep"] = [](PlayerbotAI* ai) { return new JudgementUpkeepTrigger(ai, "judgement upkeep", JudgementUpkeepTrigger::Step::Judge); };
                 creators["art of war"] = [](PlayerbotAI* ai) { return new ArtOfWarTrigger(ai); };
                 creators["blessing"] = [](PlayerbotAI* ai) { return new BlessingTrigger(ai); };
                 creators["greater blessing"] = [](PlayerbotAI* ai) { return new GreaterBlessingTrigger(ai); };
@@ -352,6 +358,7 @@ namespace ai
                 creators["crusader aura"] = [](PlayerbotAI* ai) { return new CastCrusaderAuraAction(ai); };
                 creators["redemption"] = [](PlayerbotAI* ai) { return new CastRedemptionAction(ai); };
                 creators["crusader strike"] = [](PlayerbotAI* ai) { return new CastCrusaderStrikeAction(ai); };
+                creators["crusader strike in reach"] = [](PlayerbotAI* ai) { return new CastCrusaderStrikeInReachAction(ai); };
                 creators["holy strike"] = [](PlayerbotAI* ai) { return new CastHolyStrikeAction(ai); };
                 creators["bulwark of the righteous"] = [](PlayerbotAI* ai) { return new CastBulwarkAction(ai); };
                 creators["retribution aura"] = [](PlayerbotAI* ai) { return new CastRetributionAuraAction(ai); };
@@ -407,6 +414,7 @@ namespace ai
                 creators["blessing of freedom"] = [](PlayerbotAI* ai) { return new CastBlessingOfFreedomAction(ai); };
                 creators["blessing of sacrifice"] = [](PlayerbotAI* ai) { return new CastBlessingOfSacrificeAction(ai); };
                 creators["hand of reckoning"] = [](PlayerbotAI* ai) { return new CastHandOfReckoningAction(ai); };
+                creators["hand of reckoning on attacker"] = [](PlayerbotAI* ai) { return new CastHandOfReckoningOnAttackerAction(ai); };
                 creators["righteous defense"] = [](PlayerbotAI* ai) { return new CastRighteousDefenseAction(ai); };
                 creators["update pve strats"] = [](PlayerbotAI* ai) { return new UpdatePaladinPveStrategiesAction(ai); };
                 creators["update pvp strats"] = [](PlayerbotAI* ai) { return new UpdatePaladinPvpStrategiesAction(ai); };

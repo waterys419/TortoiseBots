@@ -1,19 +1,32 @@
 
+#include "playerbot/GroupMembers.h"
 #include "playerbot/playerbot.h"
 #include "GenericActions.h"
 #include "AttackAction.h"
 #include "playerbot/PlayerbotFactory.h"
 #include <algorithm>
 #include <vector>
-#include "../../../runtime/PetUpkeepPolicy.h"
+#include "../../../runtime/policy/pet/PetUpkeepPolicy.h"
 #include "../../../runtime/HunterPetPolicy.h"
-#include "../../../runtime/PetSpellRankPolicy.h"
-#include "../../../runtime/WarlockPetPolicy.h"
+#include "../../../runtime/policy/pet/PetSpellRankPolicy.h"
+#include "../../../runtime/policy/pet/WarlockPetPolicy.h"
+#include "../../../runtime/policy/pet/PetTauntPolicy.h"
+#include "../../../runtime/AttackOrderPolicy.h"
 
 using namespace ai;
 
 bool MeleeAction::isUseful()
 {
+    // Already swinging at the current target and facing it: nothing to do.
+    // Unit::Attack would refuse the same victim, so running melee only
+    // logged "melee - FAILED" every tick. USELESS lets the tick fall through
+    // to lower actions (a success here would end it and starve them).
+    // A bot that turned away still runs melee, which faces the target again.
+    Unit* target = GetTarget();
+    if (target && bot->GetVictim() == target &&
+        TortoiseBots::IsAlreadyAttackingTarget(true, ArmsMeleeSwing(), bot->HasUnitState(UNIT_STAT_MELEE_ATTACKING)) &&
+        sServerFacade.isInFront(bot, target, sPlayerbotAIConfig.sightDistance, CAST_ANGLE_IN_FRONT))
+        return false;
     return true;
 }
 
@@ -136,32 +149,42 @@ bool InitializePetAction::Execute(Event& event)
         // drive the missing-rank check, so this teaches exactly what
         // isUseful named: top rank per line + singles, skipping ids with no
         // SpellEntry (unteachable) and pinning autocast.
+        // PET-3: the teach tick pins autocast per spell; taunt spells follow
+        // the same situation read as the sweep so a fresh rank doesn't flip
+        // Growl/Torment back on under a live tank until the next sweep.
+        bool const tauntAllowed = ai::IsPetTauntAllowed(ai, bot);
+        auto autocastDefault = [tauntAllowed](uint32 spellId)
+        {
+            if (TortoiseBots::IsPetTauntSpell(spellId) && !tauntAllowed)
+                return false;
+            return TortoiseBots::ShouldPetSpellAutocastDefault(spellId);
+        };
         if (bot->GetClass() == CLASS_HUNTER)
         {
             CreatureInfo const* petInfo = sObjectMgr.GetCreatureTemplate(pet->GetEntry());
             uint32 beastFamily = petInfo ? petInfo->beast_family : 0;
             TortoiseBots::ForEachHunterWantedSpell(beastFamily, pet->GetLevel(),
-                [pet](TortoiseBots::PetWantedSpell wanted)
+                [pet, &autocastDefault](TortoiseBots::PetWantedSpell wanted)
             {
                 if (!sSpellMgr.GetSpellEntry(wanted.spellId))
                     return;
                 if (!pet->HasSpell(wanted.spellId))
                     pet->LearnSpell(wanted.spellId);
                 if (!wanted.passive && pet->HasSpell(wanted.spellId) && !IsPassiveSpell(wanted.spellId))
-                    pet->ToggleAutocast(wanted.spellId, TortoiseBots::ShouldPetSpellAutocastDefault(wanted.spellId));
+                    pet->ToggleAutocast(wanted.spellId, autocastDefault(wanted.spellId));
             });
         }
         else
         {
             TortoiseBots::ForEachWarlockWantedSpell(pet->GetEntry(), pet->GetLevel(),
-                [pet](TortoiseBots::PetWantedSpell wanted)
+                [pet, &autocastDefault](TortoiseBots::PetWantedSpell wanted)
             {
                 if (!sSpellMgr.GetSpellEntry(wanted.spellId))
                     return;
                 if (!pet->HasSpell(wanted.spellId))
                     pet->LearnSpell(wanted.spellId);
                 if (pet->HasSpell(wanted.spellId) && !IsPassiveSpell(wanted.spellId))
-                    pet->ToggleAutocast(wanted.spellId, TortoiseBots::ShouldPetSpellAutocastDefault(wanted.spellId));
+                    pet->ToggleAutocast(wanted.spellId, autocastDefault(wanted.spellId));
             });
         }
         return true;
@@ -191,8 +214,24 @@ bool InitializePetAction::isUseful()
     {
         if (bot->GetClass() == CLASS_HUNTER)
         {
-            bool hasTamedPet = bot->GetPet();
-            if (!hasTamedPet)
+            // Issue #1178: the character_pet query below runs on the "often"
+            // trigger, but its answer only changes when the pet state changes.
+            // Ask the cache first; it re-queries at most once per live-pet
+            // presence flip (tame/summon/dismiss/death) or 60 s, so a hunter
+            // with a stored but not-live pet stops hitting the character DB
+            // every 5 ticks. StoredPetLookupCache::kRecheckSeconds bounds the
+            // staleness of answers for row changes no flip can show (e.g.
+            // abandoning a pet from a stable slot).
+            bool hasLivePet = bot->GetPet();
+            bool hasTamedPet = false;
+            if (hasLivePet)
+            {
+                // Presence flip tracking only: with a live pet the query is
+                // never reached (hasTamedPet is true below either way).
+                storedPetLookup.ShouldQuery(true, time(nullptr));
+                hasTamedPet = true;
+            }
+            else if (storedPetLookup.ShouldQuery(false, time(nullptr)))
             {
                 std::unique_ptr<QueryResult> queryResult(CharacterDatabase.PQuery("SELECT id, entry, owner "
                                                                                     "FROM character_pet WHERE owner = '%u' AND (slot = '%u' OR slot > '%u') ",
@@ -204,6 +243,11 @@ bool InitializePetAction::isUseful()
                     const uint32 entry = fields[1].GetUInt32();
                     hasTamedPet = sObjectMgr.GetCreatureTemplate(entry);
                 }
+                storedPetLookup.Store(time(nullptr), hasTamedPet);
+            }
+            else
+            {
+                hasTamedPet = storedPetLookup.CachedHasStoredPet();
             }
             if (hasTamedPet)
             {
@@ -303,6 +347,9 @@ bool SetPetAction::Execute(Event& event)
 
                     const bool autocastActive = IsAutocastActive();
                     pet->ToggleAutocast(spellId, !autocastActive);
+                    // PET-3: an ordered taunt beats the group-tank sweep.
+                    if (TortoiseBots::IsPetTauntSpell(spellId))
+                        ai->SetPetTauntAutocastOrdered();
 
                     std::ostringstream out;
                     out << (autocastActive ? "Disabling" : "Enabling") << " pet autocast for ";
@@ -538,9 +585,39 @@ bool SetPetAction::Execute(Event& event)
 
 bool TogglePetSpellAutoCastAction::isPossible()
 {
-    // Pool bots only: a player who owns or hired the bot sets its pet's
-    // autocast and stance themselves, and this must not override them.
-    return bot->GetPet() != nullptr && !ai->HasRealPlayerMaster();
+    // A player who owns, hired or groups with the bot sets its pet's
+    // autocast themselves (`pet autocast`), and this must not override
+    // them; the one exception is PET-3's taunt stand-down, kept until the
+    // player orders a taunt (runtime/PetTauntPolicy.h ShouldSweepPetSpell).
+    return bot->GetPet() != nullptr &&
+        (!ai->HasRealPlayerMaster() || !ai->IsPetTauntAutocastOrdered());
+}
+
+// PET-3: live input gathering for runtime/PetTauntPolicy.h. Solo bots skip
+// the member walk (no group, pet is the tank); grouped bots look for any
+// member filling the tank role — real players via talents/forced role, bots
+// via tank strategy — using the same IsTank read the rest of the AI uses.
+bool ai::IsPetTauntAllowed(PlayerbotAI* ai, Player* bot)
+{
+    if (!bot || !bot->GetGroup())
+        return true;
+    TortoiseBots::PetTauntInputs inputs;
+    inputs.grouped = true;
+    for (Player* member : LiveGroupMembers(bot->GetGroup()))
+    {
+        if (!member || member == bot)
+            continue;
+        // A dead tank holds nothing: the pet is the fallback until the tank
+        // is back up.
+        if (!member->IsAlive())
+            continue;
+        if (PlayerbotAI::IsTank(member))
+        {
+            inputs.tankInGroup = true;
+            break;
+        }
+    }
+    return TortoiseBots::ShouldPetTaunt(inputs);
 }
 
 // Autonomous autocast sweep (E01): ported from mod-playerbots
@@ -549,24 +626,40 @@ bool TogglePetSpellAutoCastAction::isPossible()
 // spells are skipped via IsPassiveSpell (the cmangos-compat-shim documents
 // that 1.12 has no separate NO_AUTOCAST_AI bit, and Pet::ToggleAutocast
 // refuses passives the same way) and stale autocast entries are pruned via
-// Pet::HasSpell, which already excludes PETSPELL_REMOVED. Silence (no
-// toggle, pet fresh from InitPet) returns true so the per-tick "has pet"
-// node stays cheap instead of FAILED-logged.
+// Pet::HasSpell, which already excludes PETSPELL_REMOVED. Returns true only
+// when something changed, like the donor: at relevance 60 a no-op "success"
+// took the bot's only decision of the visit, and a pool bot visited every
+// ~15 s at 2000 bots then never moved.
 bool TogglePetSpellAutoCastAction::Execute(Event& /*event*/)
 {
     Pet* pet = bot->GetPet();
     if (!pet)
         return false;
 
+    // PET-3: Growl/Torment autocast follows the taunt situation — on while
+    // the pet must hold aggro (solo or tankless group), off when grouped
+    // with a real tank. Computed once per sweep (the "has pet" trigger
+    // throttles this), not per spell.
+    bool const tauntAllowed = ai::IsPetTauntAllowed(ai, bot);
+    // With a real-player master (the player's party, or hired) only the
+    // taunts are swept, so Growl/Torment stop peeling off the party's tank.
+    bool const playerMaster = ai->HasRealPlayerMaster();
+    bool const tauntOrdered = ai->IsPetTauntAutocastOrdered();
+
+    bool changed = false;
     std::vector<uint32> stale;
-    for (uint32 autocast : pet->m_autospells)
-        if (!pet->HasSpell(autocast))
-            stale.push_back(autocast);
+    if (!playerMaster)
+        for (uint32 autocast : pet->m_autospells)
+            if (!pet->HasSpell(autocast))
+                stale.push_back(autocast);
     for (uint32 spellId : stale)
     {
         auto it = std::find(pet->m_autospells.begin(), pet->m_autospells.end(), spellId);
         if (it != pet->m_autospells.end())
+        {
             pet->m_autospells.erase(it);
+            changed = true;
+        }
     }
 
     for (PetSpellMap::const_iterator itr = pet->m_petSpells.begin(); itr != pet->m_petSpells.end(); ++itr)
@@ -577,17 +670,26 @@ bool TogglePetSpellAutoCastAction::Execute(Event& /*event*/)
         uint32 spellId = itr->first;
         if (IsPassiveSpell(spellId))
             continue;
+        if (!TortoiseBots::ShouldSweepPetSpell(playerMaster, tauntOrdered,
+                TortoiseBots::IsPetTauntSpell(spellId)))
+            continue;
 
         bool active = std::find(pet->m_autospells.begin(), pet->m_autospells.end(), spellId) != pet->m_autospells.end();
+        bool const disabled = TortoiseBots::IsDisabledPetAutocast(spellId) ||
+            (TortoiseBots::IsPetTauntSpell(spellId) && !tauntAllowed);
         TortoiseBots::PetAutocastDecision decision =
-            TortoiseBots::DecidePetAutocast(active, TortoiseBots::IsDisabledPetAutocast(spellId));
+            TortoiseBots::DecidePetAutocast(active, disabled);
         if (decision == TortoiseBots::PetAutocastDecision::LeaveAlone)
             continue;
 
         pet->ToggleAutocast(spellId, decision == TortoiseBots::PetAutocastDecision::Enable);
+        // Counted only when the toggle took: a spell the core refuses would
+        // otherwise "change" on every visit and hog the bot again.
+        if (active != (std::find(pet->m_autospells.begin(), pet->m_autospells.end(), spellId) != pet->m_autospells.end()))
+            changed = true;
     }
 
-    return true;
+    return changed;
 }
 
 bool SetPetStanceAction::isPossible()

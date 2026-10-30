@@ -1,4 +1,10 @@
 tortoise-observability
+tortoise-observability-linux-amd64
+*.tag
 *.exe
 *.test
 *.out
+.icon-cache/
+*.log
+# Zone art generated locally from your own client (scripts/gen_zone_maps.py).
+/maps/

@@ -6,6 +6,7 @@
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/BudgetValues.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
+#include "playerbot/TravelMgr.h"
 
 using namespace ai;
 
@@ -39,6 +40,18 @@ bool AhAction::Execute(Event& event)
         bool doneAuction = ExecuteCommand(requester, text, npc);
 
         sRandomBotFacade.m_ahActionMutex.unlock();
+
+        // Fruitless seller errand: the bot stood at the auctioneer and posted
+        // nothing (deposit, price or profit check refused every item), but its
+        // AH stock still raises the seller need, so it re-picked the AH every
+        // ~35 s without leaving. Park the AH purpose like ParkVendorErrand.
+        if (!doneAuction && text == "vendor" && event.GetSource() == "rpg action" && getName() == "ah")
+        {
+            std::string const purposeKey = std::to_string((uint32)TravelDestinationPurpose::AH);
+            SET_AI_VALUE2(bool, "no active travel destinations", purposeKey, true);
+            SET_AI_VALUE2(time_t, "manual time", "no travel purpose until::" + purposeKey, time(0) + 10 * MINUTE);
+            sPlayerbotAIConfig.logEvent(ai, "ErrandParked", "post items on ah", WorldPosition(bot).GetAreaName());
+        }
 
         return doneAuction;
     }
@@ -233,6 +246,9 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             if (!AuctionItemCount(auction))
                 continue;
 
+            if (sRandomItemMgr.IsTransmogClone(auction->itemTemplate))
+                continue;
+
             uint32 totalCost = std::min(auction->buyout, uint32(std::max(auction->bid, auction->startbid) * frand(1.05f, 1.25f)));
             uint32 const auctionItemCount = AuctionItemCount(auction);
             if (!auctionItemCount)
@@ -372,6 +388,10 @@ bool AhBidAction::ExecuteCommand(Player* requester, std::string text, Unit* auct
             continue;
 
         if (!strstri(proto->Name1, text.c_str()))
+            continue;
+
+        // A clone carries the base item's name, so the search can match one.
+        if (sRandomItemMgr.IsTransmogClone(proto))
             continue;
 
         if (price && curAuction.bid + 5 > price)

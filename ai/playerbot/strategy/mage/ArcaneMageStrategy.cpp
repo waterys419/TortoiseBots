@@ -14,7 +14,15 @@ public:
     }
 
 private:
-    ACTION_NODE_A(arcane_missiles, "arcane missiles", "shoot");
+    // No "shoot" alternative, as for Frostbolt (MageStrategy.cpp): a GCD
+    // refusal must not start the wand that renews the GCD.
+    static ActionNode* arcane_missiles(PlayerbotAI* ai)
+    {
+        return new ActionNode("arcane missiles",
+            /*P*/ NULL,
+            /*A*/ NULL,
+            /*C*/ NULL);
+    }
 };
 
 ArcaneMageStrategy::ArcaneMageStrategy(PlayerbotAI* ai) : MageStrategy(ai)
@@ -31,6 +39,19 @@ NextAction** ArcaneMageStrategy::GetDefaultCombatActions()
 void ArcaneMageStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     MageStrategy::InitCombatTriggers(triggers);
+
+    // MAG-5: rupture (damage + self buff) while the missiles buff is down;
+    // the arcane-missiles default owns the GCD while buffed.
+    triggers.push_back(new TriggerNode(
+        "arcane rupture",
+        NextAction::array(0, new NextAction("arcane rupture", ACTION_NORMAL + 1), NULL)));
+
+    // The filler has no "shoot" fallback (a GCD or threat-veto refusal
+    // must not start the wand); wand only while its mana cost is out of
+    // reach, below every spell row (NukeUnaffordable, WandPolicy.h).
+    triggers.push_back(new TriggerNode(
+        "arcane missiles unaffordable",
+        NextAction::array(0, new NextAction("shoot", ACTION_DEFAULT), NULL)));
 }
 
 void ArcaneMageStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -123,6 +144,20 @@ void ArcaneMageRaidStrategy::InitDeadTriggers(std::list<TriggerNode*>& triggers)
 void ArcaneMageAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     MageAoeStrategy::InitCombatTriggers(triggers);
+
+    // MAG-2: donor sequences flamestrike->blizzard for arcane as well;
+    // both spells are trained by every spec.
+    triggers.push_back(new TriggerNode(
+        "flamestrike window",
+        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH + 2), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "ranged medium aoe",
+        NextAction::array(0, new NextAction("flamestrike", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "ranged medium aoe",
+        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "enemy too close for spell",

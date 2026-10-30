@@ -1,10 +1,15 @@
 #pragma once
+#include "playerbot/GroupMembers.h"
 #include "playerbot/strategy/Trigger.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/HealReachPolicy.h"
+#include "playerbot/strategy/values/HealerCoverage.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/generic/CombatStrategy.h"
 #include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
 #include "playerbot/strategy/values/Formations.h"
+#include "playerbot/FormationStationPolicy.h"
+#include "playerbot/MagmaHazardPolicy.h"
 
 namespace ai
 {
@@ -58,11 +63,57 @@ namespace ai
                 if (bot->GetMap()->IsRaid())
                     isRaid = true;
 
+                // Party keep-away: a tank-held mob standing on a caster never
+                // fires the victim gate below, so the caster stands in melee.
+                // When the mob is in melee reach of THIS bot and a live tank
+                // groupmate exists to take it, step out anyway: Flee() runs
+                // to the tank when one is near. Solo bots keep the slow-kite
+                // guard above, never this row. Hunters keep their own gate.
+                if (bot->GetClass() != CLASS_HUNTER && !isVictim && bot->GetGroup() &&
+                    bot->CanReachWithMeleeAutoAttack(target))
+                {
+                    // A party healer holds its ground here while a groupmate
+                    // needs a real heal (below medium health): Flee() runs up
+                    // to twice the flee range in the open world, out of heal
+                    // range of the member it should be saving. Only this case:
+                    // the mob is not on the healer (victim cases below still
+                    // back off), raids keep the keep-away, and the healer's
+                    // own low health still lets it go.
+                    if (!isRaid && ai->IsHeal(bot) &&
+                        AI_VALUE2(uint8, "health", "self target") >= sPlayerbotAIConfig.lowHealth &&
+                        AI_VALUE2(uint8, "health", "party member to heal") < sPlayerbotAIConfig.mediumHealth)
+                        return false;
+
+                    for (Player* member : LiveGroupMembers(bot->GetGroup()))
+                    {
+                        if (member && member != bot && sServerFacade.IsAlive(member) &&
+                            bot->GetMapId() == member->GetMapId() && ai->IsTank(member))
+                            return true;
+                    }
+                }
                 // Casters have no minimum range — only flee if the mob is actually targeting/attacking this bot.
-                // Hunters are excluded: their ranged weapons have a ~8 yd minimum range so they must
-                // maintain distance even when the mob is focused on someone else.
                 if (bot->GetClass() != CLASS_HUNTER && !isVictim && target->GetVictim() != bot)
                     return false;
+
+                // Hunters have a dead zone (Auto Shot minimum range, melee reach
+                // as fallback). While the pet, a tank or anyone else holds the
+                // mob, step out only from inside it; beyond it the hunter can
+                // shoot, so it stays and shoots. Donor mod-playerbots
+                // (RangeTriggers.cpp) gates the same flee on melee range.
+                // Inside the dead zone the hunter's own one-shot step-out row
+                // ("hunter dead zone step out", HunterStrategy.cpp) owns the
+                // move: this generic flee re-fired every tick there without
+                // moving. Only a hunter without Auto Shot range data keeps the
+                // melee-reach flee.
+                if (bot->GetClass() == CLASS_HUNTER && !isVictim && target->GetVictim() != bot)
+                {
+                    float maxShotRange = 0.0f;
+                    float minShotRange = 0.0f;
+                    if (ai->GetSpellRange("auto shot", &maxShotRange, &minShotRange) && minShotRange > 0.0f)
+                        return false;
+
+                    return bot->CanReachWithMeleeAutoAttack(target);
+                }
 
                 //if (isBoss || isRaid)
                 //    return sServerFacade.IsDistanceLessThan(targetDistance, (ai->GetRange("spell") + combatReach) / 2);
@@ -288,7 +339,24 @@ namespace ai
             if (!target)
                 return false;
 
-            return target && (bot->GetDistance(target, SizeFactor::CombatReach) > (distance - sPlayerbotAIConfig.contactDistance)) || !bot->IsWithinLOSInMap(target, true);
+            // The value names a tank even at full health. Out of combat that
+            // pulled the healer to the tank instead of following its leader
+            // (HealReachPolicy.h): only a member who needs a heal counts there.
+            if (!HealReachWanted(ai->IsStateActive(BotState::BOT_STATE_COMBAT), target->GetHealthPercent(),
+                    float(sPlayerbotAIConfig.almostFullHealth)))
+                return false;
+
+            bool const outOfRange = (bot->GetDistance(target, SizeFactor::CombatReach) > (distance - sPlayerbotAIConfig.contactDistance)) ||
+                !bot->IsWithinLOSInMap(target, true);
+            if (!outOfRange)
+                return false;
+
+            // In combat another healer with the ally in heal range covers it
+            // (issue #904): the walk is the one that killed healers. Looked up
+            // only when the ally really is out of reach.
+            bool const inCombat = ai->IsStateActive(BotState::BOT_STATE_COMBAT);
+            return HealReachWanted(inCombat, target->GetHealthPercent(), float(sPlayerbotAIConfig.almostFullHealth),
+                inCombat && AnotherHealerCoversAlly(ai, target, HealReachLimit(ai)));
         }
     };
 
@@ -379,6 +447,52 @@ namespace ai
         }
     };
 
+    // Idle station-keeping for formations. "update follow" only fires past
+    // 5 yd from the master, but a formation slot sits ~1.5 yd out, so an
+    // idle bot inside the dead zone never walks to a newly set formation
+    // (queue, circle, shield, ... visibly do nothing). This fires once per
+    // formation change or leader stop while the bot stands off its slot, and "follow" then
+    // walks it there with the formation's angle/offset. Later ticks stay quiet:
+    // chaos re-rolls its slot every 3 s, and chasing each new roll would
+    // fidget the bot in place.
+    class FormationStationTrigger : public Trigger
+    {
+    public:
+        FormationStationTrigger(PlayerbotAI* ai) : Trigger(ai, "formation station", 3) {}
+
+        virtual bool IsActive() override
+        {
+            if (ai->IsStateActive(BotState::BOT_STATE_COMBAT))
+                return false;
+            Unit* followTarget = AI_VALUE(Unit*, "follow target");
+            if (!followTarget || !ai->IsSafe(followTarget))
+                return false;
+            // A walking leader is the core follow's job; a slot point taken
+            // mid-walk is stale by the time the bot gets there. Each stop
+            // re-arms one station walk, so the party lines up again after a move.
+            if (sServerFacade.isMoving(followTarget))
+            {
+                memory = FormationStationMemory();
+                return false;
+            }
+            Formation* formation = AI_VALUE(Formation*, "formation");
+            if (!formation)
+                return false;
+            WorldLocation loc = formation->GetLocation();
+            if (Formation::IsNullLocation(loc) || loc.mapId == -1 || bot->GetMapId() != loc.mapId)
+                return false;
+            // A slot in magma is no station (the lead tank's slot once lay in
+            // a lava basin); MoveTo2 would refuse the walk anyway
+            // (MagmaHazardPolicy.h).
+            if (MagmaGuardApplies(bot->GetMap()->IsDungeon()) && WorldPosition(loc).isInMagma())
+                return false;
+            return FormationStationStep(memory, formation->GetSerial(), bot->GetPositionX(), bot->GetPositionY(), loc.x, loc.y);
+        }
+
+    private:
+        FormationStationMemory memory;
+    };
+
     class StopFollowTrigger : public Trigger
     {
     public:
@@ -422,7 +536,7 @@ namespace ai
 
         bool IsActive() override
         {
-            return !AI_VALUE2(bool, "can free move", "wandermin") && AI_VALUE2(bool, "can free move", "wandermaz");
+            return !AI_VALUE2(bool, "can free move", "wandermin") && AI_VALUE2(bool, "can free move", "wandermax");
         }
     };
 

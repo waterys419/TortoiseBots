@@ -36,6 +36,22 @@ void RestorationDruidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigg
         "rebirth",
         NextAction::array(0, new NextAction("rebirth", ACTION_EMERGENCY), NULL)));
 
+    // mod-playerbots parity (DRU-2): Nature's Swiftness emergency chain.
+    // The pop outranks Swiftmend (donor order): NS is the top emergency
+    // cooldown, and when it is spent/on cooldown the BuffTrigger base
+    // refuses so the queue falls through to Swiftmend cleanly — no stale
+    // basket left behind to burn the cooldown a tick late. The spend row
+    // keys off the bare aura trigger (not a health TwoTriggers): if the
+    // target rises above critical between pop and spend, the instant HT
+    // still lands on whoever needs it via the party-heal target scan.
+    triggers.push_back(new TriggerNode(
+        "party member critical health",
+        NextAction::array(0, new NextAction("nature's swiftness", ACTION_CRITICAL_HEAL + 4), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "nature's swiftness active",
+        NextAction::array(0, new NextAction("healing touch on party", ACTION_CRITICAL_HEAL + 3), NULL)));
+
     triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("swiftmend", ACTION_CRITICAL_HEAL + 2),
@@ -48,9 +64,12 @@ void RestorationDruidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigg
                              new NextAction("regrowth on party", ACTION_CRITICAL_HEAL + 1),
                              new NextAction("healing touch on party", ACTION_CRITICAL_HEAL), NULL)));
 
+    // Regrowth is not recast while its own HoT runs; Healing Touch fills
+    // that gap. Below Barkskin in the medium band so the cooldown keeps its slot.
     triggers.push_back(new TriggerNode(
         "low health",
-        NextAction::array(0, new NextAction("regrowth", ACTION_MEDIUM_HEAL), NULL)));
+        NextAction::array(0, new NextAction("regrowth", ACTION_MEDIUM_HEAL),
+                             new NextAction("healing touch", ACTION_MEDIUM_HEAL - 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "medium health",
@@ -58,23 +77,29 @@ void RestorationDruidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigg
 
     triggers.push_back(new TriggerNode(
         "party member low health",
-        NextAction::array(0, new NextAction("regrowth on party", ACTION_MEDIUM_HEAL), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "medium aoe heal",
-        NextAction::array(0, new NextAction("tranquility", ACTION_MEDIUM_HEAL + 2), NULL)));
+        NextAction::array(0, new NextAction("regrowth on party", ACTION_MEDIUM_HEAL),
+                             new NextAction("healing touch on party", ACTION_MEDIUM_HEAL - 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "medium health",
-        NextAction::array(0, new NextAction("regrowth", ACTION_MEDIUM_HEAL + 1), NULL)));
+        NextAction::array(0, new NextAction("regrowth", ACTION_MEDIUM_HEAL + 1),
+                             new NextAction("healing touch", ACTION_MEDIUM_HEAL - 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "party member medium health",
-        NextAction::array(0, new NextAction("regrowth on party", ACTION_MEDIUM_HEAL), NULL)));
+        NextAction::array(0, new NextAction("regrowth on party", ACTION_MEDIUM_HEAL),
+                             new NextAction("healing touch on party", ACTION_MEDIUM_HEAL - 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "almost full health",
         NextAction::array(0, new NextAction("rejuvenation", ACTION_LIGHT_HEAL + 1), NULL)));
+
+    // mod-playerbots parity (DRU-4): spend Omen of Clarity procs on a free
+    // Rejuvenation — Lifebloom does not exist in 1.18.1, so the free HoT
+    // lands here, above the normal almost-full-health HoT rows.
+    triggers.push_back(new TriggerNode(
+        "clearcasting",
+        NextAction::array(0, new NextAction("rejuvenation on party", ACTION_LIGHT_HEAL + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
         "party member almost full health",
@@ -160,6 +185,14 @@ void RestorationDruidRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& t
 {
     RestorationDruidStrategy::InitCombatTriggers(triggers);
     DruidRaidStrategy::InitCombatTriggers(triggers);
+    // Raid debuff duty: keep Faerie Fire on the boss while every heal
+    // outbids it. The trigger skips when anyone already holds the aura and
+    // the action refuses without the spell, so non-resto specs and
+    // low-level druids see no change. Below the offdps nukes in spirit:
+    // armor debuff first, damage only when nobody needs healing.
+    triggers.push_back(new TriggerNode(
+        "faerie fire",
+        NextAction::array(0, new NextAction("faerie fire", ACTION_NORMAL), NULL)));
 }
 
 void RestorationDruidRaidStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -183,6 +216,12 @@ void RestorationDruidRaidStrategy::InitDeadTriggers(std::list<TriggerNode*>& tri
 void RestorationDruidAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     DruidAoeStrategy::InitCombatTriggers(triggers);
+
+    // Group-size-scaled gate (mod-playerbots parity, HEAL-1): fires
+    // Tranquility when enough of the group is hurt at once.
+    triggers.push_back(new TriggerNode(
+        "medium group heal setting",
+        NextAction::array(0, new NextAction("tranquility", ACTION_MEDIUM_HEAL + 2), NULL)));
 }
 
 void RestorationDruidAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -237,9 +276,12 @@ void RestorationDruidBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& t
     // Tortoise Tree of Life (45705): spirit-scaling heal modifier + party aura
     // + polymorph immunity at the cost of movement speed. No spell lockouts
     // beyond standard shapeshift rules (core-enforced); emergency exits go
-    // through the shared caster-form node. Maintain like Bear/Cat forms.
+    // through the shared caster-form node. Maintain like Bear/Cat forms —
+    // except while the opt-in offdps kit is running (donor "no healer dps
+    // strategy" gate): otherwise exit/re-enter livelocks, tick N shifting
+    // out for a nuke and tick N+1 shifting back before it casts.
     triggers.push_back(new TriggerNode(
-        "tree form",
+        "tree form and no offdps",
         NextAction::array(0, new NextAction("tree form", ACTION_HIGH), NULL)));
 }
 
@@ -287,10 +329,6 @@ void RestorationDruidBuffRaidStrategy::InitNonCombatTriggers(std::list<TriggerNo
 void RestorationDruidBoostStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     DruidBoostStrategy::InitCombatTriggers(triggers);
-
-    triggers.push_back(new TriggerNode(
-        "nature's swiftness",
-        NextAction::array(0, new NextAction("nature's swiftness", ACTION_HIGH), NULL)));
 }
 
 void RestorationDruidBoostStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)

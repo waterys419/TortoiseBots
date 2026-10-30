@@ -26,3 +26,49 @@ func TestServerInfoPayloadAcceptsMixedBotsValues(t *testing.T) {
 		t.Fatalf("scalar fields lost: %+v", info)
 	}
 }
+
+// Issue #872: pre-v11 modules send no kind; the daemon backfills it from the
+// player/alt flags so old and new servers render the same.
+func TestKindFromFlags(t *testing.T) {
+	if KindFromFlags(true, true) != KindPlayer {
+		t.Fatalf("player must win over alt")
+	}
+	if KindFromFlags(false, true) != KindAlt {
+		t.Fatalf("alt flag must map to alt")
+	}
+	if KindFromFlags(false, false) != KindPool {
+		t.Fatalf("no flags must map to pool")
+	}
+	raw := `{"name":"Old","guid":7,"player":false,"alt":true,"role":"","level":1,"hp":1,"max_hp":1,"power":0,"max_power":0,"state":"idle"}`
+	var b BotSnapshot
+	if err := json.Unmarshal([]byte(raw), &b); err != nil {
+		t.Fatalf("batch row must unmarshal: %v", err)
+	}
+	if b.Kind != "" || !b.Alt || b.Player {
+		t.Fatalf("old row must carry flags and no kind: %+v", b)
+	}
+	if KindFromFlags(b.Player, b.Alt) != KindAlt {
+		t.Fatalf("old alt row must backfill to alt")
+	}
+}
+
+// Guild rows are additive: a new module sends the name, an older one omits
+// it and the row reads guildless.
+func TestGuildField(t *testing.T) {
+	raw := `{"name":"New","guid":8,"role":"","level":1,"hp":1,"max_hp":1,"power":0,"max_power":0,"guild":"Knights","state":"idle"}`
+	var b BotSnapshot
+	if err := json.Unmarshal([]byte(raw), &b); err != nil {
+		t.Fatalf("batch row must unmarshal: %v", err)
+	}
+	if b.Guild != "Knights" {
+		t.Fatalf("guild name lost: %+v", b)
+	}
+	old := `{"name":"Old","guid":7,"role":"","level":1,"hp":1,"max_hp":1,"power":0,"max_power":0,"state":"idle"}`
+	var o BotSnapshot
+	if err := json.Unmarshal([]byte(old), &o); err != nil {
+		t.Fatalf("old batch row must unmarshal: %v", err)
+	}
+	if o.Guild != "" {
+		t.Fatalf("old row must read guildless: %+v", o)
+	}
+}

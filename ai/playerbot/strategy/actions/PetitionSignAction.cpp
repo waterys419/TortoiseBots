@@ -1,6 +1,10 @@
 
 #include "playerbot/playerbot.h"
 #include "PetitionSignAction.h"
+#include "playerbot/PlayerbotAIConfig.h"
+#include "runtime/AltBotPolicy.h"
+#include "runtime/AltBotService.h"
+#include "../../../runtime/HireLifecycle.h"
 
 using namespace ai;
 
@@ -35,6 +39,12 @@ bool PetitionSignAction::Execute(Event& event)
             accept = false;
         }
 
+        if (TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()))
+        {
+            ai->TellError(requester, "I am a hired mercenary and cannot sign a guild charter.");
+            accept = false;
+        }
+
         // check for same acc id
         /*QueryResult* result = CharacterDatabase.PQuery("SELECT playerguid FROM petition_sign WHERE player_account = '%u' AND petitionguid = '%u'", bot->GetSession()->GetAccountId(), petitionGuid.GetCounter());
 
@@ -52,6 +62,19 @@ bool PetitionSignAction::Execute(Event& event)
 
     if (_inviter == bot)
         return false;
+    // Issue #872 (F40): an autonomous alt signs a charter only for the
+    // owner's account. Same gate as the guild invite (GuildAcceptAction).
+    if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+    {
+        WorldSession const* inviterSession = _inviter->GetSession();
+        bool const isGm = inviterSession && inviterSession->GetSecurity() > SEC_PLAYER;
+        uint32_t const ownerAccount =
+            TortoiseBots::AltBotService::Instance().GetOwnerAccount(bot->GetGUIDLow());
+        bool const sameAccount = inviterSession && ownerAccount != 0 &&
+            inviterSession->GetAccountId() == ownerAccount;
+        if (!TortoiseBots::AltBotMayAcceptGuildInvite(sameAccount, isGm))
+            accept = false;
+    }
 
     if (!accept || !ai->GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_GUILD, false, _inviter, true))
     {
@@ -66,7 +89,10 @@ bool PetitionSignAction::Execute(Event& event)
         WorldPacket data(CMSG_PETITION_SIGN, 20);
         data << petitionGuid << unk;
         bot->GetSession()->HandlePetitionSignOpcode(data);
-        bot->Say("Thanks for the invite!", LANG_UNIVERSAL);
+        // Issue #1108: the sign itself is functional, the "thanks" in /say is
+        // ambient chatter and follows AiPlayerbot.EnableBroadcasts.
+        if (sPlayerbotAIConfig.enableBroadcasts)
+            bot->Say("Thanks for the invite!", LANG_UNIVERSAL);
         sLog.outDetail("Bot #%d <%s> accepts guild invite", bot->GetGUIDLow(), bot->GetName());
         return true;
     }

@@ -41,6 +41,28 @@ namespace ai
         }
     };
 
+    // HEAL-3/LD-8: thorns pinned on the designated main tank (donor
+    // BuffOnMainTankTrigger). Inherits the melee + fire-shield guards from
+    // ThornsOnPartyTrigger; only the target changes from party scan to MT.
+    class ThornsOnMainTankTrigger : public ThornsOnPartyTrigger
+    {
+    public:
+        ThornsOnMainTankTrigger(PlayerbotAI* ai) : ThornsOnPartyTrigger(ai) {}
+
+        virtual Value<Unit*>* GetTargetValue() override;
+        virtual std::string getName() { return "thorns on main tank"; }
+    };
+    // mod-playerbots parity (DRU-7): Thorns lands on the tank first.
+    // BuffOnTankTrigger targets "party tank without aura", so the tank is
+    // covered before the party blanket below; the fire-shield conflict
+    // skip mirrors ThornsOnPartyTrigger. Name resolves to "thorns on tank".
+    class ThornsOnTankTrigger : public BuffOnTankTrigger
+    {
+    public:
+        ThornsOnTankTrigger(PlayerbotAI* ai) : BuffOnTankTrigger(ai, "thorns", 4) {}
+        bool IsActive() override;
+    };
+
     class ThornsTrigger : public BuffTrigger
     {
     public:
@@ -170,8 +192,8 @@ namespace ai
     class TreeFormTrigger : public BuffTrigger
     {
     public:
-        TreeFormTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "tree of life") {}
-        virtual bool IsActive() override { return !ai->HasAura("tree of life", bot); }
+        TreeFormTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "tree of life form") {}
+        virtual bool IsActive() override { return !ai->HasAura("tree of life form", bot); }
     };
 
     class MoonkinFormTrigger : public BuffTrigger
@@ -186,6 +208,17 @@ namespace ai
     public:
         CatFormTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "cat form") {}
         virtual bool IsActive() override { return !ai->HasAura("cat form", bot); }
+    };
+
+    // State signal (not a buff request): true while the bot sits in Bear,
+    // Dire Bear or Cat form. The leveling kit uses it to stand down: a
+    // shapeshifted 10+ druid already runs a feral kit, so the caster
+    // wrath/moonfire/heal nodes must not outbid the form rotation.
+    class InFeralFormTrigger : public Trigger
+    {
+    public:
+        InFeralFormTrigger(PlayerbotAI* ai) : Trigger(ai, "in feral form") {}
+        bool IsActive() override;
     };
 
     // Tortoise Balance redesign: Eclipse capstone (talent 320, spell 51444).
@@ -219,6 +252,15 @@ namespace ai
     {
     public:
         NaturesSwiftnessTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "nature's swiftness") {}
+    };
+
+    // mod-playerbots parity (DRU-2): true while the Nature's Swiftness buff
+    // sits on the bot, so the emergency instant-Healing-Touch row can spend
+    // it immediately. Mirrors shaman AncestralSwiftnessAuraTrigger.
+    class NaturesSwiftnessActiveTrigger : public HasAuraTrigger
+    {
+    public:
+        NaturesSwiftnessActiveTrigger(PlayerbotAI* ai) : HasAuraTrigger(ai, "nature's swiftness") {}
     };
 
     class EnrageTrigger : public BuffTrigger
@@ -343,10 +385,65 @@ namespace ai
         }
     };
 
+    // Bear-tank daze fix: true root only (SPELL_AURA_MOD_ROOT, not mere
+    // slows) plus a reason to move (live enemy out of melee reach/LOS).
+    // The old "rooted" cure row fired on any MOD_DECREASE_SPEED, so a
+    // tank holding mobs in place dropped Bear Form on every melee daze.
+    class RootedAndNeedToMoveTrigger : public Trigger
+    {
+    public:
+        RootedAndNeedToMoveTrigger(PlayerbotAI* ai) : Trigger(ai, "rooted and need to move") {}
+
+        bool IsActive() override
+        {
+            if (!bot->HasAuraType(SPELL_AURA_MOD_ROOT))
+                return false;
+            Unit* target = AI_VALUE(Unit*, "current target");
+            if (!target || !target->IsAlive())
+                return false;
+            return !bot->CanReachWithMeleeAutoAttack(target) || !bot->IsWithinLOSInMap(target, true);
+        }
+    };
+
     class FerociousBiteTrigger : public ComboPointsAvailableTrigger
     {
     public:
         FerociousBiteTrigger(PlayerbotAI* ai) : ComboPointsAvailableTrigger(ai, 5) {}
+    };
+
+    // mod-playerbots parity (DRU-5): Ferocious Bite execute window — a
+    // dying target dies to bite before Rip ticks out. Port of donor
+    // FerociousBiteExecuteTrigger minus the WotLK clauses (no savage roar
+    // in 1.18.1; the raw <20k-HP clause scaled to a plain HP% gate —
+    // vanilla health pools make an absolute gate meaningless). Defined in
+    // DruidTriggers.cpp.
+    class FerociousBiteExecuteTrigger : public Trigger
+    {
+    public:
+        FerociousBiteExecuteTrigger(PlayerbotAI* ai) : Trigger(ai, "ferocious bite execute") {}
+        bool IsActive() override;
+    };
+
+    // mod-playerbots parity (DRU-5): Ferocious Bite timing window — at 5
+    // combo points bite only when Rip is absent or healthy (>10 s left),
+    // so bite never clips a Rip refresh. Port of donor
+    // FerociousBiteTimeTrigger minus the savage-roar clause (no such spell
+    // in 1.18.1). Defined in DruidTriggers.cpp.
+    class FerociousBiteTimeTrigger : public Trigger
+    {
+    public:
+        FerociousBiteTimeTrigger(PlayerbotAI* ai) : Trigger(ai, "ferocious bite time") {}
+        bool IsActive() override;
+    };
+
+    // Bear rage dump (B2): Savage Bite (45736, Bear/Dire Bear only, 30
+    // rage, trained at 58) fires at 50+ rage or free under Clearcasting.
+    // Defined in DruidTriggers.cpp.
+    class SavageBiteTrigger : public SpellCanBeCastedTrigger
+    {
+    public:
+        SavageBiteTrigger(PlayerbotAI* ai) : SpellCanBeCastedTrigger(ai, "savage bite") {}
+        bool IsActive() override;
     };
 
     BOOST_TRIGGER(BerserkTrigger, "berserk");
@@ -361,6 +458,23 @@ namespace ai
         {
             return SpellTargetTrigger::IsTargetValid(target) && target->IsDead();
         }
+    };
+
+    // mod-playerbots parity (DRU-1): out-of-combat resurrection. Vanilla
+    // druids have no normal resurrect, only Rebirth, so a dead party member
+    // out of combat sits until a priest/paladin/shaman wakes up — or the
+    // druid burns its 30 min battle rez. This trigger stays quiet while any
+    // living groupmate of a resurrecting class (priest/paladin/shaman) is
+    // around; their normal rez is always preferred. Gates on IsTargetValid
+    // (public) rather than IsActive (private in SpellTargetTrigger), so the
+    // base cooldown/spellbook checks and manual revive-target assignment
+    // keep working untouched. Defined in DruidTriggers.cpp.
+    class OocRebirthTrigger : public RebirthTrigger
+    {
+    public:
+        OocRebirthTrigger(PlayerbotAI* ai) : RebirthTrigger(ai) {}
+        std::string getName() override { return "ooc rebirth"; }
+        bool IsTargetValid(Unit* target) override;
     };
 
     class InnervateTrigger : public SpellTargetTrigger
@@ -380,9 +494,21 @@ namespace ai
         }
     };
 
+
     class ClearcastingTrigger : public HasAuraTrigger
     {
     public:
         ClearcastingTrigger(PlayerbotAI* ai) : HasAuraTrigger(ai, "clearcasting") {}
+    };
+
+    // mod-playerbots parity (DRU-8): donor "no healer dps strategy" gate.
+    // True while the opt-in offdps kit is NOT running, so Tree of Life
+    // maintenance stands down during healer-dps instead of livelocking
+    // against the caster-form exit. Defined in DruidTriggers.cpp.
+    class NoOffdpsTrigger : public Trigger
+    {
+    public:
+        NoOffdpsTrigger(PlayerbotAI* ai) : Trigger(ai, "no offdps") {}
+        bool IsActive() override;
     };
 }

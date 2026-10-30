@@ -9,6 +9,13 @@ void DungeonStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     // Custom Turtle raids (807/532/800) gate behind EnableCustomRaidTactics
     // in both paths, so a disabled custom gate cannot re-arm mid-fight.
     // Add this combat triggers in case the bot gets summoned into the dungeon and goes straight into combat
+
+    // Data-driven boss tactics (ai_boss_tactic): the trigger holds the gate, see
+    // BossTacticsPolicy.h. Off unless AiPlayerbot.DungeonTactics or a commander binding.
+    triggers.push_back(new TriggerNode(
+        "enter boss tactics",
+        NextAction::array(0, new NextAction("enable boss tactics strategy", 100.0f), NULL)));
+
     triggers.push_back(new TriggerNode(
         "enter onyxia's lair",
         NextAction::array(0, new NextAction("enable onyxia's lair strategy", 100.0f), NULL)));
@@ -22,8 +29,20 @@ void DungeonStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         NextAction::array(0, new NextAction("enable blackwing lair strategy", 100.0f), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "enter zul'gurub",
+        NextAction::array(0, new NextAction("enable zul'gurub strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "enter ruins of ahn'qiraj",
+        NextAction::array(0, new NextAction("enable ruins of ahn'qiraj strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "enter naxxramas",
         NextAction::array(0, new NextAction("enable naxxramas strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "enter ahn'qiraj temple",
+        NextAction::array(0, new NextAction("enable ahn'qiraj temple strategy", 100.0f), NULL)));
 
     if (sPlayerbotAIConfig.enableCustomRaidTactics)
     {
@@ -44,6 +63,12 @@ void DungeonStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 
 void DungeonStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // Data-driven boss tactics (ai_boss_tactic): the trigger holds the gate, see
+    // BossTacticsPolicy.h. Off unless AiPlayerbot.DungeonTactics or a commander binding.
+    triggers.push_back(new TriggerNode(
+        "enter boss tactics",
+        NextAction::array(0, new NextAction("enable boss tactics strategy", 100.0f), NULL)));
+
     triggers.push_back(new TriggerNode(
         "enter onyxia's lair",
         NextAction::array(0, new NextAction("enable onyxia's lair strategy", 100.0f), NULL)));
@@ -69,12 +94,36 @@ void DungeonStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
         NextAction::array(0, new NextAction("disable blackwing lair strategy", 100.0f), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "enter zul'gurub",
+        NextAction::array(0, new NextAction("enable zul'gurub strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "leave zul'gurub",
+        NextAction::array(0, new NextAction("disable zul'gurub strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "enter ruins of ahn'qiraj",
+        NextAction::array(0, new NextAction("enable ruins of ahn'qiraj strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "leave ruins of ahn'qiraj",
+        NextAction::array(0, new NextAction("disable ruins of ahn'qiraj strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "enter naxxramas",
         NextAction::array(0, new NextAction("enable naxxramas strategy", 100.0f), NULL)));
 
     triggers.push_back(new TriggerNode(
         "leave naxxramas",
         NextAction::array(0, new NextAction("disable naxxramas strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "enter ahn'qiraj temple",
+        NextAction::array(0, new NextAction("enable ahn'qiraj temple strategy", 100.0f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "leave ahn'qiraj temple",
+        NextAction::array(0, new NextAction("disable ahn'qiraj temple strategy", 100.0f), NULL)));
 
     if (sPlayerbotAIConfig.enableCustomRaidTactics)
     {

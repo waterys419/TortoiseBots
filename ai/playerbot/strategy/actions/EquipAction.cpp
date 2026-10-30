@@ -4,10 +4,18 @@
 
 #include <set>
 
+#include "playerbot/policy/gear/DualWieldPolicy.h"
 #include "playerbot/RandomItemMgr.h"
 #include "playerbot/ServerFacade.h"
 #include "playerbot/strategy/values/ItemCountValue.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
+#include "../../../runtime/ClaimLifecycle.h"
+#include "../../../runtime/policy/hire/ClaimedBotPolicy.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
+#include "../../../runtime/policy/hire/HireSourceGuardPolicy.h"
+#include "../../../runtime/policy/hire/HireGearPolicy.h"
 
 using namespace ai;
 
@@ -319,11 +327,18 @@ void EquipAction::EquipItem(PlayerbotAI* ai, Player* requester, Item* item, bool
                     Item* content = oldBagBag->GetItemByPos(i);
                     if (!content)
                         continue;
-                    oldBagBag->RemoveItem(i, false);
+                    // Player::RemoveItem, not Bag::RemoveItem: StoreItem
+                    // re-registers a timed item (quest items with a
+                    // duration), so the bag-only removal left it twice in
+                    // the player's duration list and the copy dangled once
+                    // the item expired (SIGSEGV in Item::UpdateDuration).
+                    bot->RemoveItem(oldBagBag->GetSlot(), i, true);
                     ItemPosCountVec dest;
                     if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, content, false) != EQUIP_ERR_OK)
                     {
-                        oldBagBag->StoreItem(i, content, false);
+                        ItemPosCountVec back;
+                        if (bot->CanStoreItem(oldBagBag->GetSlot(), i, back, content, false) == EQUIP_ERR_OK)
+                            bot->StoreItem(back, content, true);
                         contentsMoved = false;
                         break;
                     }
@@ -409,6 +424,19 @@ bool EquipUpgradesAction::Execute(Event& event)
     if (!sPlayerbotAIConfig.autoEquipUpgradeLoot && !sRandomBotFacade.IsRandomBot(bot))
         return false;
 
+    // Issue #489: Claimed bots at max level (60) NEVER auto-replace gear on their own
+    bool const isClaimed = TortoiseBots::ClaimLifecycle::Instance().IsClaimed(bot->GetGUIDLow());
+    if (!TortoiseBots::MayClaimedBotSelfEquip(bot->GetLevel(), isClaimed))
+        return false;
+    // Issue #490: level-60 hires at tier >= 1 wear a static set; loot
+    // auto-equip must not replace it (player-equipped and traded items via
+    // EquipAction still apply: those are explicit orders, not automation).
+    if (TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) &&
+        TortoiseBots::HireGearTierEligible(bot->GetLevel(),
+            sPlayerbotAIConfig.hireGearTiersEnabled,
+            TortoiseBots::EffectiveHireGearTier(
+                sPlayerbotAIConfig.hireGearTiersEnabled, sPlayerbotAIConfig.hireGearStartTier)))
+        return false;
     // Worn gear is never touched in combat. This action is reachable from the
     // combat engine - WorldPacketHandlerStrategy::InitCombatTriggers installs
     // the same node list as the non-combat one, and bots ding on the killing
@@ -548,6 +576,17 @@ bool EquipUpgradesAction::Execute(Event& event)
         {
             continue;
         }
+        // Issue #490 (bug part): hired bots never auto-equip source-gated
+        // gear (pure rule in runtime/HireSourceGuardPolicy.h). BG blues score
+        // high against seed greens, so the audit would dress every hire in
+        // PvP on first loot. The item stays in the bags; explicit `.bot
+        // equip` / master trade still work. Pool bots keep the organic
+        // behaviour (earned PvP is wearable).
+        if (!TortoiseBots::MayHireAutoTakeSource(
+                sRandomItemMgr.GetSourceFlags(item->GetProto()->ItemId),
+                TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()),
+                sPlayerbotAIConfig.randomGearAllowPvP, sPlayerbotAIConfig.randomGearAllowReputation))
+            continue;
 
         // Bags and quivers never go through slot resolution below: core's
         // INVTYPE_BAG probe resolves to a single slot (the first free one, or
@@ -590,6 +629,28 @@ bool EquipUpgradesAction::Execute(Event& event)
             continue;
         }
 
+        // The displaced main hand for the cascade below: captured before the
+        // equip moves it to the bags. Only a 1H upgrade on a dual-wielder
+        // displaces a demotable hand (a 2H upgrade blocks the off hand).
+        Item* displacedMH = nullptr;
+        if (slot == EQUIPMENT_SLOT_MAINHAND && proto->Class == ITEM_CLASS_WEAPON &&
+            proto->InventoryType != INVTYPE_2HWEAPON && bot->CanDualWield())
+            displacedMH = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        // Issue #872: an autonomous alt auto-equips upgrades only if the old
+        // piece fits in the bags (B14). Core SwapItem needs one free slot
+        // once the worn piece leaves its slot; without it the audit stops
+        // equipping and the bot keeps playing.
+        if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+        {
+            Item* oldItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (oldItem)
+            {
+                ItemPosCountVec dest;
+                if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, oldItem, false) != EQUIP_ERR_OK ||
+                    !TortoiseBots::AltBotMayAutoEquip(true))
+                    continue;
+            }
+        }
         filledSlots.insert(slot);
         didEquip = true;
 
@@ -607,6 +668,47 @@ bool EquipUpgradesAction::Execute(Event& event)
         else
         {
             EquipItemToSlot(GetMaster(), item, slot);
+        }
+
+        // MH->OH cascade (AG-2): the upgrade above pushed the old main hand
+        // to the bags; demote it to the off hand when it fits there and
+        // beats what is equipped. Donor mod-playerbots priority-1 demotion,
+        // minus Titan Grip (no 1.12 API). Claims the off-hand slot for this
+        // run so a later candidate cannot overwrite it on a stale usage.
+        if (displacedMH && bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND) != displacedMH)
+        {
+            ItemPrototype const* displacedProto = displacedMH->GetProto();
+            bool fitsOffHand = displacedProto->InventoryType == INVTYPE_WEAPON ||
+                displacedProto->InventoryType == INVTYPE_WEAPONOFFHAND;
+            if (fitsOffHand)
+            {
+                // Explicit keep orders win over automation: a displaced hand
+                // pinned to the bags stays there, and a pinned off hand is
+                // never bounced for it (normal path refuses both).
+                bool displacedKeepInBag = AI_VALUE2_EXISTS(ForceItemUsage, "force item usage", displacedProto->ItemId, ForceItemUsage::FORCE_USAGE_NONE) == ForceItemUsage::FORCE_USAGE_BAG;
+                Item* curOH = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                bool curOHForced = curOH && AI_VALUE2_EXISTS(ForceItemUsage, "force item usage", curOH->GetProto()->ItemId, ForceItemUsage::FORCE_USAGE_NONE) == ForceItemUsage::FORCE_USAGE_EQUIP;
+                // Broken-over-working never auto-equips elsewhere either: a
+                // broken displaced hand only fills an empty off hand.
+                bool displacedBroken = displacedMH->GetUInt32Value(ITEM_FIELD_DURABILITY) == 0 && displacedMH->GetUInt32Value(ITEM_FIELD_MAXDURABILITY) > 0;
+                bool curOHBroken = curOH && curOH->GetUInt32Value(ITEM_FIELD_DURABILITY) == 0 && curOH->GetUInt32Value(ITEM_FIELD_MAXDURABILITY) > 0;
+                if (displacedKeepInBag || curOHForced || (curOH && displacedBroken && !curOHBroken))
+                    continue;
+
+                uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
+                uint16 ohDest;
+                if (ai::DualWieldCascade(true,
+                    sRandomItemMgr.ShouldEquipWeaponForSlot(bot->GetClass(), specId, displacedProto, EQUIPMENT_SLOT_OFFHAND, true),
+                    curOH == nullptr,
+                    sRandomItemMgr.ItemStatWeight(bot, displacedMH),
+                    curOH ? sRandomItemMgr.ItemStatWeight(bot, curOH) : 0) &&
+                    bot->CanEquipItem(EQUIPMENT_SLOT_OFFHAND, ohDest, displacedMH, true) == EQUIP_ERR_OK && (ohDest & 0xFF) == EQUIPMENT_SLOT_OFFHAND)
+                {
+                    EquipItemToSlot(GetMaster(), displacedMH, EQUIPMENT_SLOT_OFFHAND);
+                    filledSlots.insert(EQUIPMENT_SLOT_OFFHAND);
+                    sLog.outDetail("Bot #%d <%s> cascades old main hand %d to offhand", bot->GetGUIDLow(), bot->GetName(), displacedProto->ItemId);
+                }
+            }
         }
     }
 

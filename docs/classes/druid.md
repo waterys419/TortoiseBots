@@ -1,94 +1,130 @@
 ---
-id: class-druid
-title: Druid Bot AI & Specs
+id: classes-druid
+title: Druid Bot Guide
 category: classes
-summary: Deep dive into Druid shapeshifting mechanics, Bear tanking, Cat melee DPS, Balance caster, and Restoration healing.
-tags: [class, druid, tank, healer, dps, hybrid]
+summary: Complete guide to Druid bot AI, shapeshifting forms, tanking, healing, DPS rotations, and Turtle WoW custom abilities.
+tags: [classes, druid, tank, healer, dps, hybrid]
 relates_to:
-  - class-overview
-  - guide-player-controls
+  - classes-overview
 ---
 
-# Druid Bot AI & Specs
+# Druid Bot Guide
 
-Druids are the ultimate hybrid class, able to fulfill Tank, Healer, Melee DPS, or Ranged Caster roles through flexible shapeshifting forms.
+Druids fulfill Tank, Healer, Melee DPS, or Ranged Caster roles using flexible shapeshifting forms and hybrid spell kits.
 
-## Supported Specs & Roles
+## Specs & roles
 
-- **Feral (Bear Tank):** Dire Bear Form tank specializing in *Growl*, *Maul*, *Swipe*, and *Demoralizing Roar*, with *Frenzied Regeneration*, *Challenging Roar*, *Mangle (Bear)*, *Faerie Fire (Feral)*, and *Enrage* also wired.
-- **Feral (Cat Melee DPS):** Cat Form stealth and energy specialist utilizing *Claw*, *Rake*, *Shred* (with *Mangle (Cat)* as fallback), *Rip*, and *Ferocious Bite*, with *Pounce*, *Ravage*, and *Tiger's Fury* also wired.
-- **Restoration (Healer):** HoT-focused healing with *Rejuvenation*, *Regrowth*, *Healing Touch*, and *Swiftmend*, with *Nature's Swiftness* and *Tranquility* also wired.
-- **Balance (Ranged DPS):** Moonkin caster driving Nature and Arcane damage via *Moonfire*, *Wrath*, *Starfire*, and *Insect Swarm*.
-- **Below level 10 (`leveling` kit):** Neither the Feral nor the Balance kit is affordable yet, so the bot runs the dedicated leveling set: it fights in melee (auto-attack is its default action), keeps *Moonfire* applied, and heals itself with *Healing Touch*/*Rejuvenation*. It closes distance like every other melee kit — an out-of-melee enemy is walked into contact, and *Wrath* lands whenever the bot cannot move (rooted, stunned, or a target it gave up reaching).
-
----
-
-## Shapeshifting & Form Maintenance
-
-The bot's shapeshifting engine maintains the appropriate form based on assigned party role:
-- If designated as **Tank**, the bot stays in **Bear Form / Dire Bear Form**.
-- If designated as **Melee DPS**, the bot stays in **Cat Form**.
-- If designated as **Ranged DPS**, the bot stays in **Moonkin Form** (if talented) or Humanoid form.
-- If designated as **Healer**, the bot stays in **Humanoid Form** or **Tree of Life Form**.
-- **Caster Shifting:** The bot automatically shifts out of feral forms when out of combat to cast party buffs (*Mark of the Wild*, *Thorns*), dispel poisons (*Abolish Poison*, with *Cure Poison* as the fallback), or consume water.
+| Spec | Role | Primary Focus |
+| :--- | :--- | :--- |
+| **Feral (Bear)** | Tank | Dire Bear Form threat generation, mitigation, and taunts. |
+| **Feral (Cat)** | Melee DPS | Cat Form stealth openers, combo point builders, and bleed finishers. |
+| **Restoration** | Healer | Heal-over-time maintenance, direct burst heals, and emergency saves. |
+| **Balance** | Ranged DPS | Nature and Arcane ranged nukes with Moonkin Form aura support. |
 
 ---
 
-## Turtle WoW 1.18.1 Custom Content
+## What the bot does in combat
 
-- **Tree of Life Form (Spell ID 45705, per game data):**
-  - Custom Turtle WoW Restoration talent form.
-  - Grants a spirit-scaling healing modifier with a party aura and polymorph immunity at the cost of movement speed, per game data.
-- **Berserk (Spell ID 45708, per game data):**
-  - Custom Feral talent. Per game data it branches Bear/Dire Bear into 45709 (+20% max health) and Cat into 45710; the bot fires it as a combat boost trigger.
-- **Swiftmend HoT-Gating (Spell ID 18562):**
-  - Consumes the shortest remaining active *Rejuvenation* or *Regrowth* HoT on an ally to deliver instantaneous burst healing.
-  - The bot verifies that an active HoT exists on the target before attempting cast, preventing wasted cooldown triggers.
+### Feral (Bear Tank)
+- Fights in Dire Bear Form throughout combat, generating threat using *Swipe* and *Demoralizing Roar*.
+- Taunts loose mobs using *Growl* and *Challenging Roar*.
+- Keeps *Maul* queued every swing from 15 rage instead of waiting for 40, and spends excess rage (or a free *Clearcasting* proc) on *Savage Bite* from level 58 (rotation reference: stevemcqueenz/turtle-knowledge-base-, Turtle WoW class guides).
+- Uses *Faerie Fire (Feral)* and *Enrage* on cooldown.
+- Saves *Challenging Roar* (10-min cooldown) for real emergencies: 3 or more loose mobs on non-tanks, not for a pack it already holds (rotation reference: stevemcqueenz/turtle-knowledge-base-, Turtle WoW class guides).
+- Activates *Frenzied Regeneration* when health drops low.
+
+### Feral (Cat Melee DPS)
+- Enters Cat Form and opens from stealth using *Pounce* or *Ravage*.
+- Builds combo points using *Claw*, *Rake*, and *Shred*, spending points on *Rip* and *Ferocious Bite*; fires *Tiger's Fury* as a damage buff.
+- Drops threat with *Cower* at medium threat in party and raid encounters.
+- Fires *Ferocious Bite* early on targets below 25% health with 1 or more combo points (against targets under 4000 health; bosses keep Rip), avoiding clipping active *Rip* bleeds.
+- Out of combat or in battlegrounds, prowling cats maintain normal objective movement and routines.
+- A prowling druid still ends a pull's join window on time.
+
+### Restoration (Healer)
+- Maintains *Rejuvenation* and *Regrowth* HoTs (Heal-over-Time spells) on injured allies.
+- Between 20% and 70% health, casts *Regrowth* first and falls through to *Healing Touch* while Regrowth's heal-over-time is still running on the target, or when the druid has not learned Regrowth yet (below level 12).
+- Casts direct heals (*Healing Touch*) downranked to match target wounds per [shared downranking rules](overview.md#spell-downranking).
+- Chains *Nature's Swiftness* into an instant *Healing Touch* when allies suffer critical damage (held for that emergency, never popped on a quiet tick). Rotation reference: stevemcqueenz/turtle-knowledge-base- (Turtle WoW class guides).
+- Channels *Tranquility* only when the group is hurt together (never on two scratches). Rotation reference: stevemcqueenz/turtle-knowledge-base- (Turtle WoW class guides).
+- Spends *Omen of Clarity* procs on free *Rejuvenation* casts.
+- Supports party damage via the `+offdps` strategy per [healer off-DPS rules](overview.md#healer-off-dps-offdps), shifting out of Tree of Life Form to cast *Moonfire* and *Wrath*.
+
+### Balance (Ranged DPS)
+- Maintains *Moonkin Form* and attacks from range with *Moonfire*, *Wrath*, *Starfire*, and *Insect Swarm*.
+- Casts *Hurricane* against packs of 3 or more clustered enemies.
+- Honors [party threat back-off](overview.md#party-threat-back-off), pausing AoE spells if holding 50% or more of tank threat.
+
+### Leveling (Below Level 10)
+- Fights in melee using auto-attacks, keeping *Moonfire* applied and healing self with *Healing Touch* and *Rejuvenation*.
+- Closes distance to enemies, using *Wrath* when immobilized.
+
+<details>
+<summary>Shapeshifting and form maintenance details</summary>
+
+The bot maintains form based on assigned role:
+- **Tank:** Stays in Bear Form or Dire Bear Form.
+- **Melee DPS:** Stays in Cat Form.
+- **Ranged DPS:** Stays in Moonkin Form (if talented) or Humanoid form.
+- **Healer:** Stays in Humanoid Form or Tree of Life Form.
+
+Movement impairs like daze or chill do not break form. Physical roots break form only when the combat target is out of melee reach or line of sight, allowing tanks to hold aggro without wasting mana.
+
+</details>
 
 ---
 
-## Utility & Crowd Control
+## Turtle WoW custom spells
 
-- **Crowd Control:**
-  - Casts *Entangling Roots* outdoors to root melee mobs away from party casters.
-  - Casts *Hibernate* when assigned CC (the bot applies no creature-type filter itself; it relies on core validation).
-- **Interrupts & Stuns:**
-  - Casts *Feral Charge* (Bear) as a gap-closer on any out-of-melee enemy.
-  - Casts *Bash* (Bear) as an interrupt (also wired against enemy healers).
-- **Combat Resurrection:**
-  - Uses *Rebirth* (Battle Rez) on the first dead party member mid-fight (no tank/healer priority).
-- **Innervate:**
-  - Casts *Innervate* on the lowest-mana party healer below the `AiPlayerbot.LowMana` threshold (default 15%), falling back to self when solo or healers are healthy. Manual `.bot boost` assignments win over automation. Shifts to caster form first (required by Turtle 1.18.1 shapeshift rules).
-- **Barkskin:**
-  - Balance/Restoration cast *Barkskin* on own-health triggers (medium-health band in the Balance/Restoration combat sets, almost-full-health band in the generic set); never wired for Feral (Cat/Bear lose form bonuses under Turtle 1.18.1 attack-speed and shapeshift penalties).
-- **Party Buffs:**
-  - Maintains *Mark of the Wild* (armor, stats, resistances) and *Thorns* (reflective nature damage) on party members, upgrading *Mark of the Wild* to *Gift of the Wild* once known, trained and stocked (the group version outbids the single-target cast once at least three same-map members lack both auras, and only targets a member that lacks both). Buffs expiring within 15 s count as missing, so they are refreshed before they drop (issue #468). With several druids in one party, a short shared *buff claim* keeps them from duplicating each other: while one druid's cast is in flight the others stand down and wait for the aura instead of casting the same buff on the same member (issue #378).
+- **Tree of Life Form (Spell ID 45705):** Restoration form providing spirit-scaling healing power and polymorph immunity at reduced movement speed.
+- **Berserk (Spell ID 45708):** Feral boost cooldown granting +20% maximum health in Bear Form.
+- **Swiftmend HoT-Gating (Spell ID 18562):** Consumes an active *Rejuvenation* or *Regrowth* HoT for instantaneous healing, verifying HoT existence before casting.
 
 ---
 
-## Premade Talent Specs & Progression (1.18.1)
+## Utility & interrupts
 
-TortoiseBots configures validated 5-level talent checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
+- **Crowd Control:** Casts *Entangling Roots* outdoors to peel melee attackers. Casts *Hibernate* when assigned CC marks (no creature-type filter in the bot; the game validates the target).
+- **Interrupts & Stuns:** Casts *Bash* in Bear Form to interrupt spells and stun dangerous casters. Uses *Feral Charge* to gap-close on distant targets.
+- **Combat Resurrection:** Casts *Rebirth* on dead party members during combat.
+- **Out-of-Combat Resurrection:** Uses *Rebirth* out of combat only when no priest, paladin, or shaman is available to cast a standard resurrection.
+- **Innervate:** Casts *Innervate* on the lowest-mana party healer below the low-mana line (or assigned boost target), shifting to caster form first. Feral cats will shift out to feed an empty healer.
+- **Barkskin:** Casts *Barkskin* during heavy incoming damage in Balance and Restoration specs; Feral cats and bears skip it to keep their form bonuses.
+- **Party Buffs:** Maintains *Mark of the Wild* (and *Gift of the Wild*) and *Thorns* on allies, prioritizing tanks for *Thorns*. Multiple druids coordinate buff claims to prevent duplicate casts.
+- **Solo Survival:** Solo druids level 10+ with mana at or above the low-mana line stand their ground and self-heal rather than fleeing when outnumbered.
+
+---
+
+## Talent builds
+
+TortoiseBots provides pre-configured talent progressions at 5-level checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
 
 | Spec Name | Config ID | Role | 60 Allocation | Key Signatures & Synergies |
 | :--- | :--- | :--- | :--- | :--- |
-| **Balance** | `11.0` | Ranged DPS | `38 / 0 / 13` | Moonkin Form (35), Eclipse (45), Balance of All Things, Omen of Clarity, Subtlety -20% threat dip. |
-| **Feral** | `11.1` | Tank / Melee DPS | `11 / 40 / 0` | Shared Bear/Cat build: Leader of the Pack (50), Berserk (40), Carnage, Heart of the Wild, Thick Hide, Omen of Clarity. |
-| **Restoration** | `11.2` | Healer | `10 / 0 / 41` | Swiftmend (20), Nature's Swiftness (35), Tree of Life Form (50), Gift of Nature, Preservation, Balance dip. |
+| **Balance** | `11.0` | Ranged DPS | `38 / 0 / 13` | Moonkin Form, Eclipse, Balance of All Things, Omen of Clarity, Subtlety -20% threat dip. |
+| **Feral** | `11.1` | Tank / Melee DPS | `11 / 40 / 0` | Shared Bear/Cat build: Leader of the Pack, Berserk, Carnage, Heart of the Wild, Thick Hide. |
+| **Restoration** | `11.2` | Healer | `10 / 0 / 41` | Swiftmend, Nature's Swiftness, Tree of Life Form, Gift of Nature, Preservation. |
 
-### Leveling Milestones & Progression Rationale
+<details>
+<summary>Leveling milestones and progression rationale</summary>
 
 - **Balance (`11.0`):**
-  - *Levels 10–35:* Arcane/Nature scaling: *Improved Wrath* (5/5), *Improved Moonfire* (2/2), *Natural Weapons* (3/3), *Moonfury* (3/3), *Omen of Clarity* (1/1 Clearcasting), *Vengeance* (5/5 crit damage), and *Moonkin Form* (35 signature armor & crit aura).
-  - *Levels 35–45:* *Moonglow* (3/3 mana efficiency), *Owlkin Frenzy* (3/3), *Balance of All Things* (3/3), and *Eclipse* (45 custom Wrath/Starfire alternation engine).
-  - *Levels 45–60:* Restoration threat dip into *Improved Mark of the Wild* (5/5) and *Subtlety* (5/5 for -20% threat reduction on balance nukes).
-- **Feral (`11.1` - Shared Bear Tank & Cat DPS):**
-  - *Rationale:* A single, robust Feral talent tree covers both Bear Tanking and Cat DPS without compromise. In combat, the bot's runtime stance engine switches between forms based on role (Tank -> Bear, DPS -> Cat).
-  - *Levels 10–35:* Feral core: *Ferocity* (5/5 cost reduction), *Feral Instinct* (3/3 threat/stealth), *Thick Hide* (3/3 armor), *Feral Charge* (20 Bear interrupt/gap closer), *Sharpened Claws* (3/3 crit), *Primal Fury* (2/2 rage/combo on crit), and *Predatory Strikes* (3/3 AP scaling).
-  - *Levels 35–50:* *Berserk* (40 custom burst), *Heart of the Wild* (5/5 +20% Stamina in Bear, +20% Strength in Cat), *Carnage* (2/2 bleed damage), and *Leader of the Pack* (50 party crit aura).
-  - *Levels 50–60:* Balance dip into *Natural Weapons* (3/3 physical damage), *Natural Shapeshifter* (2/3), and *Omen of Clarity* (60 Clearcasting on melee attacks).
+  - *Levels 10–35:* Takes *Improved Wrath* (5/5), *Improved Moonfire* (2/2), *Natural Weapons* (3/3), *Moonfury* (3/3), *Omen of Clarity* (1/1), *Vengeance* (5/5), and *Moonkin Form* (35).
+  - *Levels 35–45:* Takes *Moonglow* (3/3), *Owlkin Frenzy* (3/3), *Balance of All Things* (3/3), and *Eclipse* (45).
+  - *Levels 45–60:* Dips into Restoration for *Improved Mark of the Wild* (5/5) and *Subtlety* (5/5) for -20% threat reduction.
+- **Feral (`11.1` - Shared Bear & Cat):**
+  - *Levels 10–35:* Takes *Ferocity* (5/5), *Feral Instinct* (3/3), *Thick Hide* (3/3), *Feral Charge* (20), *Sharpened Claws* (3/3), *Primal Fury* (2/2), and *Predatory Strikes* (3/3).
+  - *Levels 35–50:* Takes *Berserk* (40), *Heart of the Wild* (5/5), *Carnage* (2/2), and *Leader of the Pack* (50).
+  - *Levels 50–60:* Dips into Balance for *Natural Weapons* (3/3), *Natural Shapeshifter* (2/3), and *Omen of Clarity* (60).
 - **Restoration (`11.2`):**
-  - *Levels 10–35:* HoT efficiency: *Improved Mark of the Wild* (5/5), *Improved Healing Touch* (5/5), *Swiftmend* (20 burst HoT consumption), *Gift of Nature* (5/5 healing throughput), and *Nature's Swiftness* (35 emergency instant heal).
-  - *Levels 35–50:* *Tranquil Spirit* (5/5 cost reduction), *Preservation* (3/3), *Improved Regrowth* (5/5 crit), and *Tree of Life Form* (50 spirit aura & HoT efficiency form).
-  - *Levels 50–60:* Balance dip into *Improved Wrath* (5/5) and *Sylvan Blessing* (2/2) for solo/dungeon questing support.
+  - *Levels 10–35:* Takes *Improved Mark of the Wild* (5/5), *Improved Healing Touch* (5/5), *Swiftmend* (20), *Gift of Nature* (5/5), and *Nature's Swiftness* (35).
+  - *Levels 35–50:* Takes *Tranquil Spirit* (5/5), *Preservation* (3/3), *Improved Regrowth* (5/5), and *Tree of Life Form* (50).
+  - *Levels 50–60:* Dips into Balance for *Improved Wrath* (5/5) and *Sylvan Blessing* (2/2).
 
+</details>
+
+---
+
+## Class settings
+
+There are no class-specific configuration flags for Druids. General combat, healing, and resting thresholds are configured in [Combat settings](../server/settings/combat.md).

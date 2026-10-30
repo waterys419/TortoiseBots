@@ -109,6 +109,21 @@ bool PossibleAttackTargetsValue::HasIgnoreCCRti(Unit* target, Player* player)
     return group && (group->GetTargetIcon(7) == target->getObjectGuid());
 }
 
+bool PossibleAttackTargetsValue::HoldsBreakableCc(PlayerbotAI* ai, Unit* unit, Player* bot)
+{
+    if (!unit || HasIgnoreCCRti(unit, bot))
+        return false;
+
+    static char const* const breakableCc[] = { "sap", "gouge", "shackle undead", "hibernate",
+        "freezing trap effect", "seduction", "repentance", "wyvern sting" };
+    if (unit->IsPolymorphed())
+        return true;
+    for (char const* spell : breakableCc)
+        if (ai->HasAura(spell, unit))
+            return true;
+    return false;
+}
+
 bool PossibleAttackTargetsValue::HasBreakableCC(Unit* target, Player* player)
 {
     if (target->IsPolymorphed())
@@ -135,6 +150,15 @@ bool PossibleAttackTargetsValue::HasBreakableCC(Unit* target, Player* player)
         }
 
         if (ai->HasAura("shackle undead", target))
+        {
+            return true;
+        }
+
+        // Succubus Seduction is a breakable charm: DPS filtering, pet
+        // attacks and the CC-over-CC guard all consult this list, so a
+        // seduced mark must read as held here (not just in the AoE
+        // interlock) or our own side breaks it.
+        if (ai->HasAura("seduction", target))
         {
             return true;
         }
@@ -268,6 +292,13 @@ bool PossibleAttackTargetsValue::IsValid(Unit* target, Player* player, float ran
     // attack target" acceptances below must not vouch for one. Held as "attack target" it
     // would otherwise stay a possible target for as long as the creature is away from home.
     if (target && target->IsCreature() && static_cast<Creature*>(target)->IsInEvadeMode())
+        return false;
+
+    // Chases stop at ledges (owner decision 2026-10-23): a bot of an active
+    // dungeon run lets a runner below a cliff (or with no complete way to it)
+    // go, whatever picked it (the tank's victim, a raid mark, the current
+    // target); never an explicit attack order (RunnerLetGoAtLedge decides).
+    if (AttackersValue::RunnerLetGoAtLedge(target, player))
         return false;
 
     // Check for the valid attackers value

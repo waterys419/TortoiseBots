@@ -50,8 +50,8 @@ void ElementalShamanStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigge
         NextAction::array(0, new NextAction("flame shock", ACTION_NORMAL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
-        "shock",
-        NextAction::array(0, new NextAction("earth shock", ACTION_NORMAL), NULL)));
+        "earth shock execute",
+        NextAction::array(0, new NextAction("earth shock", ACTION_NORMAL + 2), NULL)));
 }
 
 void ElementalShamanStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -304,12 +304,50 @@ void ElementalShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>& 
     ShamanTotemsStrategy::InitCombatTriggers(triggers);
 
     triggers.push_back(new TriggerNode(
+        "grounding totem reactive",
+        NextAction::array(0, new NextAction("grounding totem", ACTION_HIGH + 2), NULL)));
+
+    // Air/water by subgroup (same census rows as restoration): melee gets
+    // windfury, caster subgroups get tranquil/grace air and mana spring.
+    triggers.push_back(new TriggerNode(
         "air totem",
         NextAction::array(0, new NextAction("windfury totem", ACTION_HIGH + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("tranquil air totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("grace of air totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "water totem",
         NextAction::array(0, new NextAction("mana spring totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "water totem",
+        NextAction::array(0, new NextAction("healing stream totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "stoneclaw panic",
+        NextAction::array(0, new NextAction("stoneclaw totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "poison cleansing totem reactive",
+        NextAction::array(0, new NextAction("poison cleansing totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "disease cleansing totem reactive",
+        NextAction::array(0, new NextAction("disease cleansing totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "tremor totem reactive",
+        NextAction::array(0, new NextAction("tremor totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "earthbind totem reactive",
+        NextAction::array(0, new NextAction("earthbind totem", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "earth totem",
@@ -324,6 +362,34 @@ void ElementalShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>& 
 void ElementalShamanTotemsStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ShamanTotemsStrategy::InitNonCombatTriggers(triggers);
+
+    // Pre-pull placement (owner request): same subgroup-picked totems as
+    // combat, above follow so the walk-in drops them (live raid 2026-10-14:
+    // follow held every tick at ACTION_NORMAL and totems lost). Triggers
+    // quiet once the slot holds a totem, so no OOC re-cast spam.
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("windfury totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("tranquil air totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("grace of air totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "water totem",
+        NextAction::array(0, new NextAction("mana spring totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "water totem",
+        NextAction::array(0, new NextAction("healing stream totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "earth totem",
+        NextAction::array(0, new NextAction("strength of earth totem", ACTION_HIGH - 1), NULL)));
 }
 
 void ElementalShamanTotemsPveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -365,6 +431,18 @@ void ElementalShamanTotemsRaidStrategy::InitNonCombatTriggers(std::list<TriggerN
 void ElementalShamanBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ShamanBuffStrategy::InitCombatTriggers(triggers);
+
+    triggers.push_back(new TriggerNode(
+        "water shield",
+        NextAction::array(0, new NextAction("water shield", ACTION_NORMAL), NULL)));
+
+    // Pre-water fallback: Water Shield R1 trains at 26, Lightning Shield at 8.
+    // The water trigger stays quiet until trained, and the fallback gates
+    // itself off once water is known, so the rows never recast over each
+    // other post-water (the two shields are mutually exclusive).
+    triggers.push_back(new TriggerNode(
+        "lightning shield fallback",
+        NextAction::array(0, new NextAction("lightning shield", ACTION_NORMAL - 1), NULL)));
 }
 
 void ElementalShamanBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -372,8 +450,13 @@ void ElementalShamanBuffStrategy::InitNonCombatTriggers(std::list<TriggerNode*>&
     ShamanBuffStrategy::InitNonCombatTriggers(triggers);
 
     triggers.push_back(new TriggerNode(
-        "lightning shield",
-        NextAction::array(0, new NextAction("lightning shield", ACTION_NORMAL), NULL)));
+        "water shield",
+        NextAction::array(0, new NextAction("water shield", ACTION_NORMAL), NULL)));
+
+    // Pre-water fallback, same as combat.
+    triggers.push_back(new TriggerNode(
+        "lightning shield fallback",
+        NextAction::array(0, new NextAction("lightning shield", ACTION_NORMAL - 1), NULL)));
 }
 
 void ElementalShamanBuffPveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

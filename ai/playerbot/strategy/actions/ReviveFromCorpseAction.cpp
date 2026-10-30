@@ -10,8 +10,9 @@
 #include "Database/DBCStructure.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "runtime/BotManager.h"
-#include "playerbot/GhostStallPolicy.h"
-#include "playerbot/GraveyardTeleportPolicy.h"
+#include "playerbot/policy/dungeon/GhostStallPolicy.h"
+#include "playerbot/policy/travel/GraveyardTeleportPolicy.h"
+#include "playerbot/CorpseEntrancePolicy.h"
 
 using namespace ai;
 // Ghost stall (m-stuck §5.2): the corpse-run spline is re-dispatched from IDLE
@@ -74,12 +75,21 @@ static constexpr uint32 kSpiritHealerStallSec = 60;
 static constexpr float kSpiritHealerStallProgressYd = 5.0f;
 
 
-static bool FindInstanceEntranceTrigger(uint32 corpseMapId, uint32 botMapId, WorldPosition const& botPos,
-                                         AreaTriggerEntry const*& outAtEntry, AreaTriggerTeleport const*& outAt)
+// The door into the corpse's map whose destination lies nearest the corpse
+// (CorpseEntrancePolicy.h): a map with several doors (Scarlet Monastery's four
+// wings) is entered where the body lies, not by the door nearest the ghost.
+// Only external entrances count: a trigger on an open-world map that leads onto
+// another map (never an intra-instance teleport, never a door inside another
+// instance). `rules` say which of those may be taken. None: false, the caller
+// keeps its fallback.
+static bool FindEntranceTriggerByRules(uint32 corpseMapId, WorldPosition const& botPos,
+                                        WorldPosition const& corpsePos, CorpseEntranceRules const& rules,
+                                        AreaTriggerEntry const*& outAtEntry, AreaTriggerTeleport const*& outAt)
 {
     outAtEntry = nullptr;
     outAt = nullptr;
-    float bestDist = FLT_MAX;
+    std::vector<CorpseEntranceCandidate> candidates;
+    std::vector<std::pair<AreaTriggerEntry const*, AreaTriggerTeleport const*>> doors;
 
     for (uint32 i = 0; i < sAreaTriggerStore.GetNumRows(); ++i)
     {
@@ -94,20 +104,64 @@ static bool FindInstanceEntranceTrigger(uint32 corpseMapId, uint32 botMapId, Wor
         if (at->destination.mapId != corpseMapId)
             continue;
 
-        if (atEntry->mapid != botMapId)
-            continue;
-
-        WorldPosition triggerPos(atEntry->mapid, atEntry->x, atEntry->y, atEntry->z);
-        float dist = botPos.sqDistance2d(triggerPos);
-        if (dist < bestDist)
-        {
-            bestDist = dist;
-            outAtEntry = atEntry;
-            outAt = at;
-        }
+        MapEntry const* sourceMap = sMapStorage.LookupEntry<MapEntry>(atEntry->mapid);
+        bool const onGhostMap = atEntry->mapid == rules.ghostMap;
+        CorpseEntranceCandidate c;
+        c.triggerId = i;
+        c.sourceMap = atEntry->mapid;
+        c.sourceInstanceable = !sourceMap || sourceMap->Instanceable(); // unknown map: never a door
+        c.destX = at->destination.x;
+        c.destY = at->destination.y;
+        c.destZ = at->destination.z;
+        c.ghostSqYd = onGhostMap ? botPos.sqDistance2d(WorldPosition(atEntry->mapid, atEntry->x, atEntry->y, atEntry->z)) : -1.0f;
+        candidates.push_back(c);
+        doors.emplace_back(atEntry, at);
     }
 
-    return outAtEntry != nullptr && outAt != nullptr;
+    int const pick = PickCorpseEntrance(candidates, corpsePos.getX(), corpsePos.getY(), corpsePos.getZ(), rules);
+    if (pick < 0)
+        return false;
+    outAtEntry = doors[static_cast<size_t>(pick)].first;
+    outAt = doors[static_cast<size_t>(pick)].second;
+    return true;
+}
+
+// The corpse run: the walk takes the doors on the ghost's own map; the 300 s
+// timeout (it teleports) those on the ghost's map or on the map the instance
+// is entered from (MapEntry::ghostEntranceMap).
+static bool FindInstanceEntranceTrigger(uint32 corpseMapId, uint32 botMapId, WorldPosition const& botPos,
+                                         WorldPosition const& corpsePos, bool timeout,
+                                         AreaTriggerEntry const*& outAtEntry, AreaTriggerTeleport const*& outAt)
+{
+    CorpseEntranceRules rules;
+    rules.destMap = corpseMapId;
+    rules.ghostMap = botMapId;
+    rules.timeout = timeout;
+    if (MapEntry const* corpseMap = sMapStorage.LookupEntry<MapEntry>(corpseMapId))
+        rules.entranceMap = corpseMap->ghostEntranceMap;
+    return FindEntranceTriggerByRules(corpseMapId, botPos, corpsePos, rules, outAtEntry, outAt);
+}
+
+// The core's managed-bot repop hook (BotPlayerAdapter::GetBotRepopEntrance):
+// a bot released inside dungeon `dungeonMapId` revives at the door nearest
+// its corpse (RepopEntranceRules), on validated maps only. 0: no answer, the
+// core keeps GetMapEntranceTrigger. The core re-checks the id it gets back.
+uint32 ai::PickRepopEntrance(Player* bot, uint32 dungeonMapId, float corpseX, float corpseY, float corpseZ)
+{
+    if (!bot || !RepopDoorMapValidated(dungeonMapId))
+        return 0;
+    MapEntry const* dungeonMap = sMapStorage.LookupEntry<MapEntry>(dungeonMapId);
+    if (!dungeonMap)
+        return 0;
+    AreaTriggerEntry const* atEntry = nullptr;
+    AreaTriggerTeleport const* at = nullptr;
+    WorldPosition const corpsePos(dungeonMapId, corpseX, corpseY, corpseZ);
+    if (!FindEntranceTriggerByRules(dungeonMapId, WorldPosition(bot), corpsePos,
+            RepopEntranceRules(dungeonMapId, dungeonMap->ghostEntranceMap), atEntry, at))
+        return 0;
+    sLog.outBasic("[BOT REPOP] %s: released in map %u at %.1f %.1f %.1f, revives at entrance trigger %u",
+        bot->GetName(), dungeonMapId, corpseX, corpseY, corpseZ, atEntry->id);
+    return atEntry->id;
 }
 
 bool ReviveFromCorpseAction::Execute(Event& event)
@@ -273,11 +327,17 @@ bool FindCorpseAction::Execute(Event& event)
 
     if (corpseInDungeon && deadTime >= 5 * MINUTE)
     {
-        AreaTriggerTeleport const* entranceTeleport = sObjectMgr.GetMapEntranceTrigger(dungeonMapId);
+        // The external door nearest the corpse on the ghost's map or the map the
+        // instance is entered from (CorpseEntrancePolicy.h); with none, the
+        // core's GetMapEntranceTrigger as before.
+        AreaTriggerEntry const* entranceTrigger = nullptr;
+        AreaTriggerTeleport const* entranceTeleport = nullptr;
+        if (!FindInstanceEntranceTrigger(dungeonMapId, botPos.GetMapId(), botPos, corpsePos, true, entranceTrigger, entranceTeleport))
+            entranceTeleport = sObjectMgr.GetMapEntranceTrigger(dungeonMapId);
         if (entranceTeleport)
         {
-            sLog.outBasic("[BOT CORPSE] %s: instance corpse run timeout (%llds >= 300s), appearing revived at dungeon entrance (map %u)",
-                bot->GetName(), (long long)deadTime, dungeonMapId);
+            sLog.outBasic("[BOT CORPSE] %s: instance corpse run timeout (%llds >= 300s), appearing revived at dungeon entrance (map %u, trigger %u)",
+                bot->GetName(), (long long)deadTime, dungeonMapId, entranceTrigger ? entranceTrigger->id : 0u);
             bot->GetMotionMaster()->Clear();
             // Resurrect BEFORE the teleport. TeleportTo onto another map is async:
             // the player is pulled off its map and m_currMap is null until the
@@ -302,7 +362,7 @@ bool FindCorpseAction::Execute(Event& event)
     {
         AreaTriggerEntry const* entranceTrigger = nullptr;
         AreaTriggerTeleport const* entranceTeleport = nullptr;
-        if (FindInstanceEntranceTrigger(corpsePos.GetMapId(), botPos.GetMapId(), botPos, entranceTrigger, entranceTeleport))
+        if (FindInstanceEntranceTrigger(corpsePos.GetMapId(), botPos.GetMapId(), botPos, corpsePos, false, entranceTrigger, entranceTeleport))
         {
 
             // 2. Near entrance portal: step into instance
@@ -311,8 +371,8 @@ bool FindCorpseAction::Execute(Event& event)
             float distToPortal = botPos.fDist(portalPos);
             if (distToPortal <= triggerRadius + 2.0f)
             {
-                sLog.outBasic("[BOT CORPSE] %s: reached instance entrance portal (dist=%.1f <= %.1f), entering instance %u",
-                    bot->GetName(), distToPortal, triggerRadius + 2.0f, corpsePos.GetMapId());
+                sLog.outBasic("[BOT CORPSE] %s: reached instance entrance portal %u (dist=%.1f <= %.1f), entering instance %u",
+                    bot->GetName(), entranceTrigger->id, distToPortal, triggerRadius + 2.0f, corpsePos.GetMapId());
                 bot->GetMotionMaster()->Clear();
                 bot->TeleportTo(entranceTeleport->destination.mapId, entranceTeleport->destination.x, entranceTeleport->destination.y, entranceTeleport->destination.z, entranceTeleport->destination.o);
                 return true;
@@ -654,6 +714,18 @@ bool FindCorpseAction::isUseful()
     return bot->GetCorpse();
 }
 
+// Resurrection sickness only for bots a real player answers for. A pool bot
+// revived at -75% stats walked straight back into fights: 55% of level 20+
+// spirit-healer revives died again within 10 min (Oct 2026 pool). The donor
+// never pays it either (mod-playerbots revives random bots in place at full
+// health). The repair cheat keeps skipping it as before.
+bool SpiritHealerAction::ShouldApplyResurrectionSickness()
+{
+    if (ai->HasCheat(BotCheatMask::repair))
+        return false;
+    return !(sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster());
+}
+
 bool SpiritHealerAction::Execute(Event& event)
 {
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
@@ -667,7 +739,7 @@ bool SpiritHealerAction::Execute(Event& event)
         {
             sLog.outDetail("Bot #%d <%s> is a ghost without a corpse, reviving at the nearest graveyard", bot->GetGUIDLow(), bot->GetName());
             bot->RepopAtGraveyard();
-            bot->ResurrectPlayer(0.5f, !ai->HasCheat(BotCheatMask::repair));
+            bot->ResurrectPlayer(0.5f, ShouldApplyResurrectionSickness());
             bot->DurabilityLossAll(0.25f, true);
             bot->SaveToDB();
             SET_AI_VALUE(bool, "corpse run", false);
@@ -759,7 +831,7 @@ bool SpiritHealerAction::Execute(Event& event)
 
         sLog.outDetail("Bot #%d %s:%d <%s> revives at spirit healer", bot->GetGUIDLow(), bot->GetTeam() == ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName());
         PlayerbotChatHandler ch(bot);
-        bot->ResurrectPlayer(0.5f, !ai->HasCheat(BotCheatMask::repair));
+        bot->ResurrectPlayer(0.5f, ShouldApplyResurrectionSickness());
         bot->DurabilityLossAll(0.25f, true);
 
         bot->SpawnCorpseBones();

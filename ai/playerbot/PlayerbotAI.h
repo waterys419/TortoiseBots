@@ -12,7 +12,11 @@
 #include "strategy/IterateItemsMask.h"
 #include "BotDiagnostics.h"
 #include "playerbot/DeathClusterPolicy.h"
+#include "playerbot/CastKeepsRunningPolicy.h"
+#include "playerbot/GatherSpotPolicy.h"
+#include "playerbot/PullJoinWindowPolicy.h"
 #include "playerbot/SurvivePolicy.h"
+#include "playerbot/BotAreaTriggerPolicy.h"
 #include "../../runtime/BotManager.h"
 
 class Player;
@@ -348,6 +352,8 @@ public:
     virtual void UpdateAI(uint32 elapsed, bool minimal = false);
 
     void HandleCommands();
+    // Chat commands waiting for the next reaction pass (HandleCommands drains them).
+    size_t QueuedChatCommandCount() const { return chatCommands.size(); }
 private:
     void UpdateAIInternal(uint32 elapsed, bool minimal = false) override;
 public:
@@ -360,6 +366,58 @@ public:
     // the bot's default movement. A no-op when no hold is placed, and never
     // touches a stay the player asked for (that drops the hold marker first).
     void ReleasePullHold();
+    // The join window an ordered pull places on a held DPS bot
+    // (PullJoinWindowPolicy.h). In memory only, never stored with the bot.
+    // StartPullWindow writes the pull's delay into "wait for attack time" and
+    // adds "wait for attack" to the engines that lack it; the window owns only
+    // those copies and puts the old delay back when it ends.
+    void StartPullWindow(uint8 windowSeconds, bool leadKeyed = false, uint8 minSeconds = 0, bool fightStart = false);
+    // A fight no pull window covers (a walk-in, a pick-up): hold a bot-only
+    // running-run DPS for up to kFightStartHoldSeconds, lead-keyed like a
+    // run-leader pull. Opens in SetCombatStateAction::Execute, never in
+    // OnCombatStarted (a bot's own attack is never held afterwards).
+    void StartFightStartHold();
+    bool PullWindowFightStart() const { return pullWindow_.fightStart; }
+    void SetPullReleaseReason(const char* reason) { pullReleaseReason_ = reason ? reason : ""; }
+    std::string const& PullReleaseReason() const { return pullReleaseReason_; }
+    void RestampPullWindow(bool landedNow) { pullWindow_.Restamp(time(0), landedNow); }
+    bool HasPullWindow() const { return pullWindow_.Running(); }
+    // The run leader (.bot run) keeps a healer to heals while a run is going:
+    // its off-spec damage rows (healer should attack / healer should wand) and
+    // the wand stay off, and a pull's join window never gates its heals. Memory
+    // only, set and cleared by the run leader's sync (commands/BotCommands.cpp).
+    bool RunHealOnly() const { return runHealOnly_; }
+    void SetRunHealOnly(bool on) { runHealOnly_ = on; }
+    bool PullWindowExpired(uint8 seconds) const { return pullWindow_.Expired(time(0), seconds); }
+    bool PullWindowAdded(BotState type) const { return pullWindow_.Added(static_cast<unsigned>(type)); }
+    uint8 PullWindowSavedSeconds() const { return static_cast<uint8>(pullWindow_.savedWaitSeconds); }
+    bool PullWindowLeadKeyed() const { return pullWindow_.leadKeyed; }
+    bool PullWindowLanded() const { return pullWindow_.landed; }
+    uint8 PullWindowMinSeconds() const { return static_cast<uint8>(pullWindow_.minSeconds); }
+    uint32 PullWindowElapsed() const { return pullWindow_.start ? uint32(time(0) - pullWindow_.start) : 0; }
+    // The player's own "wait for attack time": set now, or kept for the end
+    // of a running pull window, which puts it in place then.
+    void SetPlayerWaitForAttackTime(uint8 seconds);
+    // End the window: remove the pull's own copies of "wait for attack", put
+    // the player's "wait for attack time" back and release the anchor hold.
+    // A "wait for attack" the player set stays. Also the end of any pull on a
+    // reload of stored strategies (relog, reset, preset), and the release of
+    // the puller's own anchor, which never had a window. Logs the release
+    // exactly once (nothing when no window runs) and clears the stored
+    // reason; every caller passes its explicit reason.
+    void EndPullWindow(const char* reason);
+    // An order that sends the bot at a target ends a stay and a flee's
+    // passive hold: drop "passive" and "stay", then, when that leaves no
+    // movement mode, put the default (follow for a player's bot) back so it
+    // rejoins after the fight. Used by the .bot tactical orders and the
+    // whispered attack.
+    void EndStayForOrder();
+    // An explicit `.bot` movement order supersedes the movement orders still
+    // waiting from chat ("stay", "follow", ...): drops them from the queued
+    // chat commands and clears their triggers, so an older `/p stay` cannot
+    // run after a newer `.bot action follow` (runtime/QueuedOrderPolicy.h).
+    // World thread. Returns how many queued commands were dropped.
+    size_t DropQueuedMovementOrders();
 	std::string HandleRemoteCommand(std::string command);
     void HandleCommand(uint32 type, const std::string& text, Player& fromPlayer, const uint32 lang = LANG_UNIVERSAL);
     void QueueChatResponse(uint32 msgType, ObjectGuid guid1, ObjectGuid guid2, std::string message, std::string chanName, std::string name, bool noDelay = false);
@@ -368,6 +426,11 @@ public:
     void DropQueuedOutgoingOpcode(uint16 opcode) { botOutgoingPacketHandlers.DropQueuedOpcode(opcode); }
     void HandleMasterIncomingPacket(const WorldPacket& packet);
     void HandleMasterOutgoingPacket(const WorldPacket& packet);
+    // Any thread, no AI needed (issue #844): whether an opcode reaches one of
+    // the Handle*Packet paths above, so packet hooks copy only those packets.
+    static bool HandlesBotOutgoingOpcode(uint16 opcode);
+    static bool HandlesMasterIncomingOpcode(uint16 opcode);
+    static bool HandlesMasterOutgoingOpcode(uint16 opcode);
 	void HandleTeleportAck();
     void ChangeEngine(BotState type);
     // Run one engine decision. Module-owned human commands can force this
@@ -426,6 +489,33 @@ public:
     bool Yell(std::string msg, bool likePlayer = false);
     bool Say(std::string msg, bool likePlayer = false);
     bool Whisper(std::string msg, std::string receiverName, bool likePlayer = false);
+    // Issue #1108: chat that answers a player who commanded the bot (".bot
+    // speak", a reply to the bot's own master) is functional, not a
+    // broadcast, so it must survive AiPlayerbot.EnableBroadcasts = 0. The
+    // scope marks every chat line produced inside it as commanded; an
+    // unarmed scope changes nothing.
+    class CommandedChatScope
+    {
+    public:
+        CommandedChatScope(PlayerbotAI* ai, bool armed) : ai_(ai), armed_(armed)
+        {
+            if (armed_ && ai_)
+                ai_->commandedChatDepth++;
+        }
+        ~CommandedChatScope()
+        {
+            if (armed_ && ai_)
+                ai_->commandedChatDepth--;
+        }
+    private:
+        PlayerbotAI* ai_;
+        bool armed_;
+    };
+    // True while a commanded chat scope is active.
+    bool IsCommandedChat() const { return commandedChatDepth > 0; }
+    // True when a chat line may be sent: broadcasts are configurable, but a
+    // commanded answer always goes out.
+    bool IsChatAllowed() const;
     bool TellPlayer(Player* player, std::ostringstream &stream, PlayerbotSecurityLevel securityLevel = PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, bool isPrivate = true, bool ignoreSilent = false) { return TellPlayer(player, stream.str(), securityLevel, isPrivate, ignoreSilent); }
     bool TellPlayer(Player* player, std::string text, PlayerbotSecurityLevel securityLevel = PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, bool isPrivate = true, bool ignoreSilent = false);
     bool TellPlayerNoFacing(Player* player, std::ostringstream& stream, PlayerbotSecurityLevel securityLevel = PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, bool isPrivate = true, bool noRepeat = true, bool ignoreSilent = false) { return TellPlayerNoFacing(player, stream.str(), securityLevel, isPrivate, noRepeat, ignoreSilent); }
@@ -434,6 +524,10 @@ public:
     bool TellError(Player* player, std::string text, PlayerbotSecurityLevel securityLevel = PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, bool ignoreSilent = false);
     void SpellInterrupted(uint32 spellid);
     int32 CalculateGlobalCooldown(uint32 spellid);
+    // What is left of the global cooldown of the bot's last own cast
+    // (StartRecoveryCategory 133); the core keeps the real one private.
+    // Set right after a successful prepare, a few ms after the core's own.
+    uint32 SpellGlobalCooldownRemainingMs() const;
     void InterruptSpell(bool withMeleeAndAuto = true);
     bool RemoveAura(const std::string& name);
     void RemoveShapeshift();
@@ -469,6 +563,7 @@ public:
     virtual bool IsInterruptableSpellCasting(Unit* player, std::string spell, uint8 effectMask);
     virtual bool HasAuraToDispel(Unit* player, uint32 dispelType);
     bool canDispel(const SpellEntry* entry, uint32 dispelType);
+    static bool IsNeverDispelSpell(uint32 spellId);
     static bool IsHealSpell(const SpellEntry* entry);
 
     static bool IsMiningNode(const GameObject* go);
@@ -488,6 +583,8 @@ public:
 
     virtual bool CanCastSpell(std::string name, Unit* target, uint8 effectMask = 0, Item* itemTarget = nullptr, bool ignoreRange = false, bool ignoreInCombat = false, bool ignoreMount = false, SpellCastResult* checkResult = nullptr);
     bool CanCastSpell(uint32 spellid, Unit* target, uint8 effectMask = 0, bool checkHasSpell = true, Item* itemTarget = nullptr, bool ignoreRange = false, bool ignoreInCombat = false, bool ignoreMount = false, SpellCastResult* checkResult = nullptr);
+    // The check itself; CanCastSpell(uint32, Unit*, ...) wraps it to note a failed check's reason.
+    bool CheckCanCastSpell(uint32 spellid, Unit* target, uint8 effectMask, bool checkHasSpell, Item* itemTarget, bool ignoreRange, bool ignoreInCombat, bool ignoreMount, SpellCastResult* checkResult);
     bool CanCastSpell(uint32 spellid, GameObject* goTarget, uint8 effectMask, bool checkHasSpell = true, bool ignoreRange = false, bool ignoreInCombat = false, bool ignoreMount = false, SpellCastResult* checkResult = nullptr);
     bool CanCastSpell(uint32 spellid, float x, float y, float z, uint8 effectMask, bool checkHasSpell = true, Item* itemTarget = nullptr, bool ignoreRange = false, bool ignoreInCombat = false, bool ignoreMount = false, SpellCastResult* checkResult = nullptr);
 
@@ -568,6 +665,9 @@ public:
     // cpp can build heartbeat / debug payloads without being
     // a friend class. Read-only.
     Engine* GetCurrentEngine() { return currentEngine; }
+    // The engine registered for a state (combat, non-combat, dead, reaction), or
+    // null. Read-only access for the run trace (runtime/RunTrace.cpp).
+    Engine* GetEngineByState(BotState state) { return static_cast<uint8>(state) < static_cast<uint8>(BotState::BOT_STATE_ALL) ? engines[static_cast<uint8>(state)] : nullptr; }
 
     // Registers an engine in the per-state array. The factory that builds an
     // engine calls this before it attaches that engine's default strategies:
@@ -608,6 +708,21 @@ public:
     // strategies applied". A non-zero value that doesn't match the current
     // target's creature_id triggers a strategy reset for the new target.
     uint32 scboteLastEncounterCreatureId = 0;
+
+    // Issue #218: the open-world non-combat strategies the instance guard is
+    // holding back from this pool bot, one bit per AiFactory instance-guard
+    // strategy (grind, travel, tfish, rpg, rpg craft, wander). Set to what a
+    // build on a dungeon/raid map skipped, or to what was actually removed on
+    // zoning in. AiFactory::ApplyInstanceGuardOnMapChange gives back only
+    // these when the bot leaves for the open world, so a strategy the player
+    // turned off stays off. 0 = nothing held.
+    uint8 instanceGuardWithheld = 0;
+
+    // Issue #1043: raw guid of the last pet BotManager::CheckNewPetSpawn
+    // checked (0 = none). Each summon makes a new pet object with a new guid,
+    // so a pet is checked once. World thread and map-thread player hook only,
+    // which never run at the same time for one bot.
+    uint64 lastSpawnCheckedPetGuid = 0;
 
     // BotActionLog: track last combat state so we only log STATE snapshots
     // on actual combat-state transitions (combat-enter / combat-exit).
@@ -666,7 +781,6 @@ public:
 
     bool HasPlayerNearby(WorldPosition pos, float range);
     bool HasPlayerNearby(float range = sPlayerbotAIConfig.reactDistance);
-    bool HasManyPlayersNearby(uint32 trigerrValue = 20, float range = sPlayerbotAIConfig.sightDistance);
     bool ChannelHasRealPlayer(std::string channelName);
 
 
@@ -678,6 +792,10 @@ public:
     bool HasCheat(BotCheatMask mask) const;
     BotCheatMask GetCheat() { return cheatMask; }
     void SetCheat(BotCheatMask mask) { cheatMask = mask; }
+
+    // A live group member near this bot is fighting something. Member flags
+    // only, no grid scan, so it is cheap enough for the per-tick resting wake.
+    bool IsGroupMemberNearInCombat();
 
     // Cache master's GUID alongside the raw pointer so we can revalidate
     // the pointer each tick against ObjectAccessor — if the master Player
@@ -713,6 +831,11 @@ public:
     void SetJumpTime(uint32 time) { jumpTime = time; }
     bool CanMove();
     void StopMoving();
+    // Before a cast on a game object (Opening, Mining, Herb Gathering): a bot
+    // still moving - by its movement flags or by a server spline its flags do
+    // not show - is stopped and true comes back; the caller casts on a later
+    // tick, once it stands still (the cast breaks on the first step).
+    bool StopForObjectCast();
     bool IsInRealGuild();
     void SetPlayerFriend(bool isFriend) {isPlayerFriend = isFriend;}
     bool IsPlayerFriend() { return isPlayerFriend; }
@@ -730,6 +853,8 @@ public:
     // 57 of 257 within 60 s), so the first minute after any revive runs the
     // full-rate scan and lets the bot feel the same pack coming back.
     static constexpr uint32 kReviveGraceMs = 60000;
+    // Inside the minute after a revive (corpse, spirit healer or sweep).
+    bool InReviveGrace() const { return m_reviveGraceUntilMs && int32(m_reviveGraceUntilMs - WorldTimer::getMSTime()) > 0; }
     bool IsSpatialScanIdle() const;
     bool ShouldReuseSpatialScan();
     void NoteSpatialScan() { m_lastSpatialScanMs = WorldTimer::getMSTime(); }
@@ -749,6 +874,7 @@ public:
         bool isEnvironment = false;
         uint32 time = 0;
         uint32 entry = 0;       // creature entry, 0 for players and the environment
+        float healthPct = 100.0f; // killer's health at the killing blow (deaths.csv fight-back proxy)
     };
     // Live attacker snapshot for the deaths.csv 'adds' column: sampled from
     // bot->GetAttackers() while fighting (NoteFightAttackers, throttled),
@@ -761,8 +887,19 @@ public:
     // Per-tick top-up of the level-tier food/drink stack (owner addendum):
     // the cheat-block sibling of the ammo refill, pool-only.
     void RefillPoolRations();
+    // Owner rule (auto-tools kit): cheat-gated item/skill ensure. Mint one
+    // stack of the behaviour item the bot needs right now (rogue tools,
+    // Hourglass Sand on Bronze, Quintessence in MC); lockpicking rides at
+    // max-for-level. All branches no-op without the item cheat.
+    bool EnsureCheatItem(uint32 itemId, uint32 count);
+    void EnsureAutoToolsKit();
     std::vector<ai::DeathAttackerEntry> deathAttackers_;
     uint32 deathAttackersMs_ = 0; // WorldTimer ms of the last sample, 0 = none
+    // Last own cast that started the global cooldown (see
+    // SpellGlobalCooldownRemainingMs); duration 0 = none yet.
+    uint32 spellGcdStartMs_ = 0;
+    uint32 spellGcdDurationMs_ = 0;
+    void NoteSpellGlobalCooldown(SpellEntry const* spellInfo);
     uint32 prevKillerEntry_ = 0; // the kind that killed the bot before (lethal-kind rule in OnDeath)
     uint32 prevKillerMs_ = 0;
     // Death-cluster escape (see OnDeath): deaths inside one small area within a
@@ -786,6 +923,48 @@ public:
     // A death-spot query needs only plain data (map + coordinates), so the
     // travel layer can ask without pulling in the policy header.
     bool IsDeathSpotAvoided(uint32 mapId, float x, float y, uint32 nowMs) const;
+    // Hostile-town death loop (see OnDeath): deaths within 120 yd of the guards
+    // of a town hostile to the bot, the last one less than half an hour ago.
+    // The post-rez rescue (BotManager::RelocateHopelessBot) moves the bot away
+    // at kHostileTownLoopDeaths; a relocation clears the count.
+    static constexpr uint32 kHostileTownLoopDeaths = 2;
+    static constexpr uint32 kHostileTownDeathWindowMs = 30 * 60 * 1000;
+    uint32 GetRecentHostileTownDeaths() const
+    {
+        if (!hostileTownDeathCount_ || WorldTimer::getMSTime() - hostileTownDeathMs_ > kHostileTownDeathWindowMs)
+            return 0;
+        return hostileTownDeathCount_;
+    }
+    void ClearHostileTownDeaths() { hostileTownDeathCount_ = 0; }
+    uint32 hostileTownDeathCount_ = 0;
+    uint32 hostileTownDeathMs_ = 0;
+    // Gather spawn points this bot reached and saw empty (GatherSpotPolicy.h),
+    // kept for about a respawn so the next mining/herbalism pick walks to
+    // another spawn instead of back to this one. Pool bots only fill it (the
+    // TravelTarget gather expiry); plain data, no world lookup.
+    ai::DeathAvoidSpot emptyGatherSpots_[ai::kEmptyGatherSpots] = {};
+    void MarkEmptyGatherSpot(uint32 mapId, float x, float y, uint32 nowMs)
+    {
+        ai::AddDeathAvoidSpot(emptyGatherSpots_, ai::kEmptyGatherSpots, mapId, x, y, nowMs,
+            ai::kEmptyGatherSpotMs, ai::kEmptyGatherSpotRadiusYd);
+    }
+    bool IsEmptyGatherSpot(uint32 mapId, float x, float y, uint32 nowMs) const
+    {
+        return ai::IsDeathPositionAvoided(mapId, x, y, nowMs, emptyGatherSpots_, ai::kEmptyGatherSpots);
+    }
+    // Errand death park (see OnDeath): the non-grind destination (purpose +
+    // entry) the bot last died pursuing, how often in a row, and the
+    // destinations parked after two such deaths. Pool bots without a real
+    // player master only; in memory, never saved.
+    uint32 errandDeathPurpose_ = 0;
+    int32 errandDeathEntry_ = 0;
+    uint32 errandDeathCount_ = 0;
+    uint32 errandDeathMs_ = 0;
+    ai::ErrandPark errandParks_[ai::kErrandParkSlots] = {};
+    bool IsErrandParked(uint32 purposeId, int32 entry, uint32 nowMs) const
+    {
+        return ai::IsErrandParked(purposeId, entry, nowMs, errandParks_, ai::kErrandParkSlots);
+    }
     // A player (usually another random bot) that killed this bot recently: name +
     // expiry. While set, the victim does not proactively engage that killer
     // (EnemyPlayersValue::IsValid refuses it) so a same-spot trade-kill loop
@@ -795,11 +974,44 @@ public:
     uint32 avoidPlayerKillerMs_ = 0;
     void SetLastKiller(Unit* killer);
     const LastKillerInfo& GetLastKiller() const { return lastKiller_; }
-    void ClearLastKiller() { lastKiller_ = LastKillerInfo(); }
+    void ClearLastKiller() { lastKiller_ = LastKillerInfo(); lastDamager_ = LastKillerInfo(); }
+    // Last non-self damager, fed by the UNITHOOK_ON_DAMAGE hook: the death
+    // hook alone cannot name the killer when the core self-kills (Spirit of
+    // Redemption expiry, spell 27965). Read only when the death hook reports
+    // no killer or the bot itself; cleared on resurrect with the killer.
+    void NoteDamager(Unit* damager);
     // 10-minute avoidance window after a player kill (matches the lethal-kind
     // 15-min/30-min shape, shorter because the killer is one named player).
     void SetAvoidPlayerKiller(std::string const& name) { avoidPlayerKiller_ = name; avoidPlayerKillerMs_ = WorldTimer::getMSTime(); }
     bool ShouldAvoidPlayerKiller(std::string const& name) const;
+    // Open-world PvP kill/death notes from the unit-death hook: the killer
+    // camps the victim's corpse for WorldPvpCampSeconds, then ignores the
+    // victim for WorldPvpCampIgnoreSeconds. Deaths feed the PvP death counter.
+    void NotePvpKill(Player* victim);
+    void NotePvpDeath(Player* killer);
+    // Open-world PvP seek: the level-gap decision per (bot, target) pair stays
+    // stable for about two minutes (WorldPvpPolicy.h), keyed on the target's
+    // low guid. Small bounded table: the proximity list it filters is bounded
+    // too, and stale entries are dropped when a new one arrives.
+    struct WorldPvpGapDecision { uint32 targetGuidLow = 0; uint32 decidedAtSec = 0; bool accept = false; };
+    static constexpr uint32 kWorldPvpGapDecisions = 16;
+    WorldPvpGapDecision worldPvpGapDecisions_[kWorldPvpGapDecisions] = {};
+    bool WorldPvpGapAccepted(uint32 targetGuidLow, uint32 nowSec, bool& known) const;
+    void WorldPvpNoteGapDecision(uint32 targetGuidLow, uint32 nowSec, bool accept);
+    // Pursuit of a fleeing target: when it started (0 = none) and who. Given
+    // up after WorldPvpPursuitSeconds or when the target leaves sight range.
+    uint32 worldPvpPursuitGuidLow_ = 0;
+    uint32 worldPvpPursuitStartMs_ = 0;
+    // Camp after a kill: who was killed and when; after WorldPvpCampSeconds
+    // the victim is ignored for WorldPvpCampIgnoreSeconds (0 = none).
+    uint32 worldPvpCampGuidLow_ = 0;
+    uint32 worldPvpCampStartMs_ = 0;
+    uint32 worldPvpIgnoreGuidLow_ = 0;
+    uint32 worldPvpIgnoreStartMs_ = 0;
+    // Last seek-role roll (world-thread ms, 0 = never) and its next deadline
+    // with jitter applied by RandomBotService.
+    uint32 worldPvpSeekRollMs_ = 0;
+    uint32 worldPvpSeekNextMs_ = 0;
 
     void SetActionDuration(const Action* action);
     void SetActionDuration(uint32 duration);
@@ -811,6 +1023,8 @@ public:
     void ClearActionClock() { ResetAIInternalUpdateDelay(); }
 
     const Action* GetLastExecutedAction(BotState state) const;
+    // Trigger source of that engine's last successful action; pairs with GetLastExecutedAction (dashboard).
+    std::string const& GetLastExecutedTrigger(BotState state) const;
 
     bool IsImmuneToSpell(uint32 spellId) const;
 
@@ -833,6 +1047,10 @@ public:
         // when the bot joins the player's group.
         void SetForcedRole(uint8 role) { m_forcedRole = role; }
         uint8 GetForcedRole() const { return m_forcedRole; }
+        // PET-3: set when the player orders `pet autocast` on a pet taunt
+        // (Growl/Torment); the autocast sweep then leaves taunts to them.
+        void SetPetTauntAutocastOrdered() { m_petTauntAutocastOrdered = true; }
+        bool IsPetTauntAutocastOrdered() const { return m_petTauntAutocastOrdered; }
     void UpdateTalentSpec(PlayerTalentSpec spec = PlayerTalentSpec::TALENT_SPEC_INVALID);
 
     bool CanEnterArea(const AreaTrigger* area);
@@ -843,6 +1061,11 @@ public:
     float GetLevelFloat() const;
 
     void SetLastEvent(ai::Event& event) { lastEvent = event; }
+    // The newest failed cast check made by CanCastSpell(uint32, Unit*, ...) when the caller asked for no result;
+    // the engine clears it before judging an action and reads it for the remote commander's failure reason.
+    SpellCastResult GetLastCastCheckFail() const { return lastCastCheckFail; }
+    void ClearLastCastCheckFail() { lastCastCheckFail = SPELL_CAST_OK; }
+    void NoteCastCheckFail(SpellCastResult result) { lastCastCheckFail = result; }
     ai::Event& GetLastEvent() { return lastEvent; }
 
 #ifdef BUILD_ELUNA
@@ -858,6 +1081,8 @@ protected:
 	Player* bot;
 	Player* master;
 	uint8 m_forcedRole = 0;
+	bool m_petTauntAutocastOrdered = false;
+	time_t m_dungeonCatchUpAt = 0;
 	// GUID-shadow of `master` so we can verify the pointer is still
 	// alive each tick without dereferencing it. Set in SetMaster().
 	// Used by RevalidateMasterPointer() at the top of UpdateAI.
@@ -878,6 +1103,10 @@ protected:
     CompositeChatFilter chatFilter;
     PlayerbotSecurity security;
     std::map<std::string, time_t> whispers;
+    // Issue #1108: depth of the active CommandedChatScope. While it is above
+    // zero the chat is an answer to a player who commanded the bot and is
+    // sent even with AiPlayerbot.EnableBroadcasts = 0.
+    uint32 commandedChatDepth = 0;
     std::pair<ChatMsg, time_t> currentChat;
     static std::set<std::string> unsecuredCommands;
     bool allowActive[MAX_ACTIVITY_TYPE];
@@ -890,6 +1119,9 @@ protected:
     WorldPosition jumpDestination;
     uint32 jumpTime;
     bool fallAfterJump;
+    // Scripted area triggers the bot stands in (issue #984, BotAreaTriggers.h).
+    ai::BotAreaTriggerState areaTriggerState;
+    uint32 areaTriggerCheckDelay = 0;
     // Issue #84 (P2): bumped by HandleTeleportAck, consumed by engines.
     uint64_t transitionGeneration = 0;
     uint32 faceTargetUpdateDelay = 0;
@@ -903,6 +1135,8 @@ protected:
     // Last ms clock the pool ration top-up ran; it walks the bags, so once per
     // 30 s per bot is plenty for a stack that is never eaten down.
     uint32 m_lastRationRefillMs = 0;
+    // Last ms clock the auto-tools kit ensure ran; same bag-walking reason.
+    uint32 m_lastAutoToolsKitMs = 0;
     // First tick (ms clock) the core reported alive while the engine was still DEAD;
     // 0 = not currently mismatched. Backs the 5 s alive-but-DEAD self-heal window.
     uint32 m_aliveWhileDeadSinceMs = 0;
@@ -912,10 +1146,41 @@ protected:
     bool shouldLogOut = false;
     bool m_recordMessages = false;
     bool m_recordIncommingMessages = false;
+    // Issue #846: the chat gate last published to PlayerbotAIStorage.
+    bool m_chatGatePublished = false;
+    bool m_chatGateIgnoreAll = false;
+    bool m_chatGateIgnoreTrade = false;
+    time_t m_chatGatePublishedAt = 0;
+    void PublishChatGate();
     std::vector<std::string> m_recordedMessages;
     ai::Event lastEvent;
+    SpellCastResult lastCastCheckFail = SPELL_CAST_OK;
     LastKillerInfo lastKiller_;
+    LastKillerInfo lastDamager_; // last non-self damager (UNITHOOK_ON_DAMAGE); SoR fallback for SetLastKiller
     bool deathHandled_ = false; // this death was logged and counted; cleared when the bot is seen alive again
+    ai::PullJoinWindow pullWindow_; // see StartPullWindow
+    bool runHealOnly_ = false;      // see RunHealOnly
+    std::string pullReleaseReason_; // PullHoldExpiredTrigger's reason, logged by EndPullWindow
+    // Pet stance the pull hold parked passive (PausePartyPullHold): the
+    // stance from before the hold, restored by EndPullWindow on this same
+    // bot - so a member that leaves the group, logs out or dies mid-hold
+    // still gets its own pet back (the tank's pull-end loop only reaches
+    // current members). kNoSavedStance = nothing saved. Saved only from a
+    // non-passive stance, so a re-hold while passive keeps the original.
+    static constexpr int kNoSavedStance = -1;
+    int pullHoldPetStance_ = kNoSavedStance;
+    // After a change to "wait for attack" in the engines of `type` by anyone
+    // but the window itself: those copies are no longer the pull's, and the
+    // hold is over once the combat engine has none left.
+    void SyncPullWindow(BotState type);
+public:
+    // Park this bot's own pet passive for a pull hold, remembering the stance
+    // to put back; restore it when the window ends. Member-owned: runs on the
+    // member's own AI, so group-leave, logout and death paths (which all end
+    // the window) restore the pet even when the tank's loop can't reach it.
+    void ParkPetForPullHold();
+    void RestorePullHoldPet();
+protected:
 
     // Evade probe (diagnostics only): samples the health and evade state of the creature
     // this bot is fighting, and logs the cases where the mob evades or regenerates faster

@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include "Action.h"
 #include "Event.h"
 #include "playerbot/PlayerbotAIAware.h"
@@ -8,6 +9,7 @@
 #include "playerbot/GuidPosition.h"
 #include "NamedObjectContext.h"
 #include "ValueMacros.h"
+#include "ValueRefreshPolicy.h"
 
 namespace ai
 {
@@ -38,7 +40,12 @@ namespace ai
     class Value
     {
     public:
+        virtual ~Value() {}
+
+    public:
+        using RefType = std::add_lvalue_reference_t<std::remove_reference_t<T> const>;
         virtual T Get() = 0;
+        virtual RefType GetRef() = 0;
         virtual T LazyGet() = 0;
         virtual void Reset() {}
         virtual void Set(T value) = 0;
@@ -57,16 +64,23 @@ namespace ai
         virtual ~CalculatedValue() {}
 
     public:
-        virtual T Get() override
+        virtual void Refresh()
         {
             time_t now = time(0);
-            if (!lastCheckTime || (checkInterval < 2 && (now - lastCheckTime > 0.1)) || now - lastCheckTime >= checkInterval / 2)
+            if (ValueNeedsRefresh(now, lastCheckTime, checkInterval, ValueRefreshAtIntervalEnabled(), keepLegacyRefresh))
             {
                 lastCheckTime = now;
-
-                // auto pmo = sPerformanceMonitor.start
                 value = Calculate();
             }
+        }
+        virtual T Get() override
+        {
+            Refresh();
+            return value;
+        }
+        virtual typename Value<T>::RefType GetRef() override
+        {
+            Refresh();
             return value;
         }
         virtual T LazyGet() override
@@ -78,15 +92,26 @@ namespace ai
         virtual void Set(T value) override { this->value = value; }
         virtual void Update() { }
         virtual void Reset() override { lastCheckTime = 0; }
-        virtual bool Expired() override { return Expired(checkInterval / 2); }
+        // True once calculated and not reset since, so LazyGet() returns the
+        // cached value without calculating. For readers that must never cause
+        // a calculation (the remote commander's view feed, issue #884).
+        bool HasCachedValue() const { return lastCheckTime != 0; }
+        virtual bool Expired() override { return Expired(ValueRefreshSeconds(checkInterval, ValueRefreshAtIntervalEnabled(), keepLegacyRefresh)); }
         virtual bool Expired(uint32 interval) override { return time(0) - lastCheckTime >= interval; }
     protected:
         virtual T Calculate() = 0;
+
+        // Constructor seed for lastCheckTime: one refresh period back, so the
+        // first read calculates at once under either refresh rule.
+        time_t PrimedCheckTime() const { return time(0) - ValueRefreshSeconds(checkInterval, ValueRefreshAtIntervalEnabled(), false); }
 
     protected:
         int checkInterval;
         time_t lastCheckTime;
         T value;
+        // Keep the half-interval refresh even with ValueRefreshAtInterval on
+        // (fight-sensing values; see ValueRefreshPolicy.h).
+        bool keepLegacyRefresh = false;
     };
 
     template <class T> class SingleCalculatedValue : public CalculatedValue<T>
@@ -94,16 +119,23 @@ namespace ai
     public:
         SingleCalculatedValue(PlayerbotAI* ai, std::string name = "value") : CalculatedValue<T>(ai, name) { this->Reset(); }
 
-        virtual T Get() override
+        virtual void Refresh() override
         {
             time_t now = time(0);
             if (!this->lastCheckTime)
             {
                 this->lastCheckTime = now;
-
-                // auto pmo = sPerformanceMonitor.start
                 this->value = this->Calculate();
             }
+        }
+        virtual T Get() override
+        {
+            Refresh();
+            return this->value;
+        }
+        virtual typename Value<T>::RefType GetRef() override
+        {
+            Refresh();
             return this->value;
         }
     };
@@ -117,7 +149,8 @@ namespace ai
         virtual bool UpdateChange() { if (!CanCheckChange()) return false; lastChangeTime = time(0); lastValue = this->value; return true; }
 
         virtual void Set(T value) override { CalculatedValue<T>::Set(value); UpdateChange(); }
-        virtual T Get() override { this->value = CalculatedValue<T>::Get(); UpdateChange(); return this->value; }
+        virtual T Get() override { CalculatedValue<T>::Refresh(); UpdateChange(); return this->value; }
+        virtual typename Value<T>::RefType GetRef() override { CalculatedValue<T>::Refresh(); UpdateChange(); return this->value; }
 
         time_t LastChangeOn() { Get(); return lastChangeTime; }
         uint32 LastChangeDelay() override { return time(0) - LastChangeOn(); }
@@ -138,7 +171,7 @@ namespace ai
     {
     public:
         LogCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) : MemoryCalculatedValue<T>(ai, name, checkInterval) {};
-        virtual bool UpdateChange() override { if (MemoryCalculatedValue<T>::UpdateChange()) return false; valueLog.push_back(std::make_pair(this->value, time(0))); if (valueLog.size() > logLength) valueLog.pop_front(); return true; }
+        virtual bool UpdateChange() override { if (!MemoryCalculatedValue<T>::UpdateChange() && !valueLog.empty()) return false; valueLog.push_back(std::make_pair(this->value, time(0))); if (valueLog.size() > logLength) valueLog.pop_front(); return true; }
 
         virtual T Get() override { return MemoryCalculatedValue<T>::Get(); }
 
@@ -148,7 +181,7 @@ namespace ai
         T GetValueOn(time_t t) { return GetLogOn(t)->first; }
         T GetTimeOn(time_t t) { return GetTimeOn(t)->second; }
 
-        virtual T GetDelta(uint32 window) { std::pair<T, time_t> log = GetLogOn(time(0) - window); if (log.second == time(0)) return Get() - Get(); return (Get() - log.first) / float(time(0) - log.second); }
+        virtual T GetDelta(uint32 window) { if (valueLog.empty()) return T{}; std::pair<T, time_t> log = GetLogOn(time(0) - window); if (log.second == time(0)) return Get() - Get(); return (Get() - log.first) / float(time(0) - log.second); }
 
         virtual void Reset() override { MemoryCalculatedValue<T>::Reset(); valueLog.clear(); }
     protected:
@@ -223,9 +256,11 @@ namespace ai
     {
     public:
         UnitCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<Unit*>(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<Unit*>(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
-        // The base class caches its result for up to checkInterval/2 seconds.
+        // The base class caches its result for up to one refresh period
+        // (checkInterval/2 seconds, or checkInterval with
+        // AiPlayerbot.ValueRefreshAtInterval; see ValueRefreshPolicy.h).
         // Here that result is a raw Unit* which can outlive its object: if the
         // creature dies inside that window, the next read follows a freed
         // pointer. Crashed exactly that way on 2026-08-06, in
@@ -236,8 +271,8 @@ namespace ai
         // result is nullptr, which every caller already handles - they all
         // null-check. The calculation itself stays on its interval.
         //
-        // The interval condition is copied from CalculatedValue::Get; if it
-        // changes there it has to be carried over here.
+        // The interval condition is the same ValueNeedsRefresh call as
+        // CalculatedValue::Refresh; keep the two in step.
         //
         // Defined in Value.cpp: PlayerbotAI is only forward declared here.
         Unit* Get() override;
@@ -263,7 +298,7 @@ namespace ai
     {
     public:
         CDPairCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<CreatureDataPair const*>(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<CreatureDataPair const*>(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override
         {
@@ -280,7 +315,7 @@ namespace ai
     {
     public:
         CDPairListCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<std::list<CreatureDataPair const*>>(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<std::list<CreatureDataPair const*>>(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override
         {
@@ -300,7 +335,7 @@ namespace ai
     {
     public:
         ObjectGuidCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<ObjectGuid>(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<ObjectGuid>(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override;
     };
@@ -309,7 +344,7 @@ namespace ai
     {
     public:
         ObjectGuidListCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<std::list<ObjectGuid> >(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<std::list<ObjectGuid> >(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override;
     };
@@ -318,7 +353,7 @@ namespace ai
     {
     public:
         GuidPositionCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<GuidPosition>(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<GuidPosition>(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override;
     };
@@ -327,7 +362,7 @@ namespace ai
     {
     public:
         GuidPositionListCalculatedValue(PlayerbotAI* ai, std::string name = "value", int checkInterval = 1) :
-            CalculatedValue<std::list<GuidPosition> >(ai, name, checkInterval) { this->lastCheckTime = time(0) - checkInterval / 2; }
+            CalculatedValue<std::list<GuidPosition> >(ai, name, checkInterval) { this->lastCheckTime = this->PrimedCheckTime(); }
 
         virtual std::string Format() override;
     };
@@ -342,6 +377,7 @@ namespace ai
 
     public:
         virtual T Get() override { return value; }
+        virtual typename Value<T>::RefType GetRef() override { return value; }
         virtual T LazyGet() override { return value; }
         virtual void Set(T value) override { this->value = value; }
         virtual void Update() { }

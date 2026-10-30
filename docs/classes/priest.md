@@ -1,99 +1,112 @@
 ---
-id: class-priest
-title: Priest Bot AI & Specs
+id: classes-priest
+title: Priest Bot Guide
 category: classes
-summary: Deep dive into Priest healing ladder, PW:Shield refusal rules, Shadow DPS, and custom Chastise/Ascendance abilities.
-tags: [class, priest, healer, dps, ranged]
+summary: Complete guide to Priest bot AI, healing ladders, Power Word Shield rules, threat drops, Shadow DPS, and Turtle WoW custom spells.
+tags: [classes, priest, healer, dps, ranged]
 relates_to:
-  - class-overview
-  - guide-player-controls
+  - classes-overview
 ---
 
-# Priest Bot AI & Specs
+# Priest Bot Guide
 
-Priests are the quintessential healers of Vanilla WoW, boasting an extensive healing ladder, damage shields, group dispels, and viable ranged Shadow DPS.
+Priests provide comprehensive healing coverage through layered spell ladders, damage absorption shields, party dispels, and viable ranged Shadow DPS.
 
-## Supported Specs & Roles
+## Specs & roles
 
-- **Holy (Healer):** Pure throughput healing with *Prayer of Healing*, *Heal*, *Greater Heal*, and *Renew*.
-- **Discipline (Healer / Support):** Damage absorption via *Power Word: Shield*, *Inner Focus*, mana conservation, and support damage.
-- **Shadow (Ranged DPS):** Shadowform damage dealer relying on *Shadow Word: Pain*, *Mind Flay*, *Mind Blast*, and *Vampiric Embrace*.
+| Spec | Role | Primary Focus |
+| :--- | :--- | :--- |
+| **Holy** | Healer | Maximum throughput healing, group AoE heals, and spirit scaling. |
+| **Discipline** | Healer / Support | Damage absorption shielding, mana efficiency, and support damage. |
+| **Shadow** | Ranged DPS | Periodic Shadow damage, Mind Flay channels, and Vampiric Embrace party healing. |
 
 ---
 
-## The Priest Healing Ladder
+## What the bot does in combat
 
-The bot selects healing spells from static health bands (defaults: Critical 20 / Low 50 / Medium 70 / Almost-Full 90):
+### The Priest Healing Ladder
+Priests select healing spells based on defined health bands (bands follow [Combat settings](../server/settings/combat.md)):
+- **Critical (<20%):** *Power Word: Shield* + *Flash Heal* (missing *Flash Heal* rows fall through to *Greater Heal* / *Heal* / *Renew*).
+- **Low (20%–50%):** *Power Word: Shield* + *Greater Heal* (+ *Heal* / *Lesser Heal* fallbacks at low level). The same heavy-damage and low-mana pace rule as the medium band applies here, so the pick never downgrades from fast *Flash Heal* to a slow cast as the bar crosses the band line; loose mobs on non-tanks keep *Flash Heal* ahead.
+- **Medium (50%–70%):** *Power Word: Shield* + *Greater Heal* / *Heal* / *Lesser Heal* by deficit, *Renew* for light wounds. Heavy incoming damage (the bar would leave the band before a slow cast lands) switches the pick to fast *Flash Heal* while the healer's mana is comfortable; a low-mana healer keeps the efficient heals unless the member is about to fall into the critical band.
+- **Almost-Full (70%–90%):** *Renew* (Discipline shields first).
+- **Multiple Injured:** *Prayer of Healing* when 3 or more members of the priest's own party within 30 yards are hurt (the spell only reaches the priest's party, so hurt raid members in other parties do not trigger it). Rotation reference: stevemcqueenz/turtle-knowledge-base- (Turtle WoW class guides).
 
-```text
-Ally Health < 20% (critical) ──► PW:Shield + Flash Heal (Holy)
-Ally Health 20%-50% (low)    ──► PW:Shield + Heal / Lesser Heal (Holy; Greater Heal in Discipline/off-spec ladders)
-Ally Health 50%-70% (medium) ──► Heal / Lesser Heal
-Ally Health 70%-90% (almost) ──► Renew
-Multiple Injured              ──► Prayer of Healing (Party AoE heal)
-```
-*Desperate Prayer* is a self-only emergency heal and never lands on allies.
-
-### Healer Off-Spec Damage & Wand
-A grouped Holy priest only damages while **nobody in the party is below 90% health** and its mana is comfortable (85% reserve on easy pulls, 65% on normal ones, the medium-mana line on hard ones). Then it uses *Shadow Word: Pain*, *Holy Fire*, *Smite*, *Starshards* or *Mind Blast* at the lowest priority, so every heal outbids it, and *Holy Nova* when a pack stands in melee range. When the party is healthy but mana is not, it wands the target instead. A solo priest damages freely.
+Direct heals are downranked to match target wounds per [shared downranking rules](overview.md#spell-downranking), using the lowest rank covering missing health. Full ranks are enforced whenever the target falls at or below 20% health — or when heavy incoming damage would push the target below it before the cast lands. *Desperate Prayer* serves as a self-only emergency heal.
 
 ### Power Word: Shield & Weakened Soul Refusal
-The bot checks for the *Weakened Soul* debuff (6788) before attempting *Power Word: Shield*. If the target already has Weakened Soul, the shield is skipped in favor of a direct heal, preventing wasted cast attempts.
+The bot verifies that the target does not have the *Weakened Soul* debuff before casting *Power Word: Shield*. If present, the shield is skipped in favor of direct heals. Above 20 % health the shield is also held off a warrior or bear tank that is fighting, since absorbed hits give no rage and starve the tank's threat; the shield still lands as the save at or below 20 %. Rotation reference: stevemcqueenz/turtle-knowledge-base- (Turtle WoW class guides).
 
----
+### Threat Drops & Loose Adds
+- **Fade:** Casts *Fade* at high priority when climbing toward the tank's threat on a mob the tank holds, or immediately when attacked by a mob in a group.
 
-## Shadow DPS Rotation
+- **Loose Add Priority:** If loose mobs attack non-tanks, Holy and Discipline priests prioritize fast *Flash Heal* casts over slow *Greater Heal* casts to prevent drawing further aggro.
 
-1. Activates and maintains *Shadowform*.
-2. Casts *Vampiric Embrace* to siphon damage into party healing.
-3. Applies and maintains *Shadow Word: Pain*.
+### Shadow DPS Rotation
+1. Maintains *Shadowform*.
+2. Keeps *Vampiric Embrace* active on primary targets to return party healing.
+3. Applies and maintains *Shadow Word: Pain* (undead priests also keep *Devouring Plague*).
 4. Casts *Mind Blast* on cooldown.
-5. Channels *Mind Flay* as the primary filler.
-6. Casts *Silence* to interrupt dangerous enemy casters.
+5. Channels *Mind Flay* as primary filler, stacking *Shadow Weaving* where talented.
+6. Casts *Silence* to interrupt dangerous enemy spellcasters and healers.
+
+<details>
+<summary>Healer off-spec damage and wand stops</summary>
+
+- **Off-spec DPS:** Enabled by default via the `offdps` strategy per [healer off-DPS rules](overview.md#healer-off-dps-offdps), casting *Shadow Word: Pain*, *Holy Fire*, *Smite*, *Starshards*, or *Mind Blast* (*Holy Nova* into packed melee) against engaged mobs.
+- **Wand Stops:** Because wand shots incur global cooldown on Turtle WoW, the `wand blocks cast` trigger stops active wanding as soon as a party member requires healing or crowd control.
+
+</details>
 
 ---
 
-## Turtle WoW 1.18.1 Custom Content
+## Turtle WoW custom spells
 
-- **Chastise (Spell ID 51478, per game data):**
-  - Custom Turtle WoW talent. Hostile Chastise is integrated as a ranged CC disorient at `INTERRUPT` priority, stopping enemy spellcasters in their tracks.
-- **Ascendance (Spell ID 52962, per game data):**
-  - Holy capstone talent providing an emergency CC purge and massive healing throughput boost during intense raid/dungeon phases, per game data.
+- **Chastise (Spell ID 51478):** Custom talent providing a ranged disorient interrupt, locking enemy casters at high priority.
+- **Ascendance (Spell ID 52962):** Holy capstone talent providing an emergency crowd control purge and massive healing throughput boost during intense phases. The bot holds the 5-minute cooldown until someone actually needs healing (a party member low or the group hurt), instead of firing it on a quiet tick. Rotation reference: stevemcqueenz/turtle-knowledge-base- (Turtle WoW class guides).
 
 ---
 
-## Buffs & Crowd Control
+## Utility & interrupts
 
-- **Party Buffs:** Maintains *Power Word: Fortitude* (Stamina), *Divine Spirit* (Spirit), and *Shadow Protection*. Once known, the group versions (*Prayer of Fortitude*, *Prayer of Spirit*, *Prayer of Shadow Protection*) replace the per-member single-target casts once known, trained and stocked and at least three same-map members lack both auras, and the bot picks a member that still lacks both. Buffs expiring within 15 s count as missing, so they are refreshed before they drop (issue #468). Single-target *Power Word: Fortitude* is also allowed in combat at the lowest priority, so a priest following a master who chain-pulls still buffs the party in the quiet moments of a fight. Out of combat the bot also casts *Resurrection* (removing *Shadowform* first) and uses *Fade* for threat management (raid medium-threat and after *Psychic Scream*). *Prayer of Fortitude* has no trainer on this realm: a hired priest learns rank 1 at level 48 and rank 2 at 60, and the reagent seeding follows those rank levels (Holy Candle 17028 at levels 48–59, Sacred Candle 17029 from 60 — a level-60 priest always casts the highest known rank, so it never spends a Holy Candle). With several priests in one party, a short shared *buff claim* keeps them from duplicating each other: while one priest's cast is in flight the others stand down and wait for the aura instead of casting the same buff on the same member (issue #378).
-- **Dispels:** Proactively uses *Dispel Magic* on self and allies (to clear magic debuffs), and *Cure Disease* on diseased allies. The enemy-target dispel action is registered but has no trigger, so the bot never offensively dispels.
-- **Crowd Control:**
-  - Casts *Shackle Undead* when assigned CC on Undead targets.
-  - *Psychic Scream* (AoE fear) is PvP-only: it is never cast in PvE groups, and never inside a dungeon or raid (a feared mob pulls neighbouring packs). Outdoors with no master to disrupt, a surrounded bot may still scream to make space, then follows up with *Fade* (not fleeing).
+- **Party Buffs:** Maintains *Power Word: Fortitude*, *Divine Spirit*, and *Shadow Protection*. Replaces single-target casts with group prayers (*Prayer of Fortitude*, etc.) when trained and reagents are stocked.
+- **Fear Ward:** Casts *Fear Ward* on the party tank first to prevent fear-based wipes, re-applying once the cooldown clears.
+- **Dispels:** Uses *Dispel Magic* to clear magic debuffs on allies, and *Cure Disease* on infected party members.
+- **Crowd Control:** Casts *Shackle Undead* on assigned undead CC marks. *Psychic Scream* is restricted to PvP or solo open-world emergencies; it is never used in dungeons or raids to avoid pulling neighbouring packs.
+- **Resurrection:** Revives fallen allies out of combat with *Resurrection* (dropping *Shadowform* first).
 
 ---
 
-## Premade Talent Specs & Progression (1.18.1)
+## Talent builds
 
-TortoiseBots configures validated 5-level talent checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
+TortoiseBots provides pre-configured talent progressions at 5-level checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
 
 | Spec Name | Config ID | Role | 60 Allocation | Key Signatures & Synergies |
 | :--- | :--- | :--- | :--- | :--- |
-| **Holy** | `5.0` | Healer | `14 / 37 / 0` | Spirit of Redemption (35), Ascendance (45), Spiritual Guidance, Inspiration, Inner Focus dip. |
-| **Shadow** | `5.1` | Ranged DPS | `20 / 0 / 31` | Mind Flay (20), Shadowform (40), Vampiric Touch (preset talent, never cast by the bot) + Vampiric Embrace, Meditation in-combat mana regen. |
-| **Discipline** | `5.2` | Healer / Support | `40 / 11 / 0` | Resurgent Shield, Enlighten (preset talent, no bot wiring), Chastise (50), Force of Will, Inner Focus, Meditation, Holy dip. |
+| **Holy** | `5.0` | Healer | `14 / 37 / 0` | Spirit of Redemption, Ascendance, Spiritual Guidance, Inspiration, Inner Focus dip. |
+| **Shadow** | `5.1` | Ranged DPS | `20 / 0 / 31` | Mind Flay, Shadowform, Vampiric Touch preset (never cast by the bot), Vampiric Embrace, Meditation dip. |
+| **Discipline** | `5.2` | Healer / Support | `40 / 11 / 0` | Resurgent Shield, Enlighten, Chastise, Force of Will, Inner Focus, Holy dip. |
 
-### Leveling Milestones & Progression Rationale
+<details>
+<summary>Leveling milestones and progression rationale</summary>
 
 - **Holy (`5.0`):**
-  - *Levels 10–35:* Throughput foundation: *Improved Renew* (3/3), *Holy Focus* (2/2), *Divine Fury* (5/5 cast time reduction), *Inspiration* (3/3 physical armor on crit heal), *Improved Healing* (3/3), and *Spirit of Redemption* (35).
-  - *Levels 35–45:* *Spiritual Guidance* (5/5 Spirit-to-spellpower scaling), *Spiritual Healing* (5/5), and *Ascendance* (45 throughput capstone).
-  - *Levels 45–60:* Transitions into Discipline for *Wand Specialization* (2/2), *Mental Agility* (5/5 instant spell cost reduction), *Improved Power Word: Fortitude* (2/2), and *Inner Focus* (60 free crit cooldown).
+  - *Levels 10–35:* Takes *Improved Renew* (3/3), *Holy Focus* (2/2), *Divine Fury* (5/5), *Inspiration* (3/3), *Improved Healing* (3/3), and *Spirit of Redemption* (35).
+  - *Levels 35–45:* Takes *Spiritual Guidance* (5/5), *Spiritual Healing* (5/5), and *Ascendance* (45).
+  - *Levels 45–60:* Dips into Discipline for *Mental Agility* (5/5), *Improved Power Word: Fortitude* (2/2), and *Inner Focus* (60).
 - **Shadow (`5.1`):**
-  - *Levels 10–40:* Shadow ramping: *Improved Mind Blast* (5/5), *Shadow Focus* (5/5 hit cap), *Mind Flay* (20 signature channel), *Shadow Reach* (2/2), *Shadow Weaving* (5/5 Shadow vulnerability), *Vampiric Embrace* (30), and *Shadowform* (40).
-  - *Levels 40–50:* *Vampiric Touch* (2/2 mana battery in the preset, but no bot action/trigger ever casts it), *Darkness* (5/5 shadow damage), per game data.
-  - *Levels 50–60:* Discipline mana sustainability dip (*Mental Agility* 5/5 + *Inner Focus* + *Improved Power Word: Shield* 3/3 + *Meditation* 3/3 for 15% in-combat mana regeneration), per game data.
+  - *Levels 10–40:* Takes *Improved Mind Blast* (5/5), *Shadow Focus* (5/5), *Mind Flay* (20), *Shadow Reach* (2/2), *Shadow Weaving* (5/5), *Vampiric Embrace* (30), and *Shadowform* (40).
+  - *Levels 40–50:* Takes *Vampiric Touch* (2/2) and *Darkness* (5/5).
+  - *Levels 50–60:* Dips into Discipline for *Mental Agility* (5/5), *Inner Focus*, *Improved Power Word: Shield* (3/3), and *Meditation* (3/3).
 - **Discipline (`5.2`):**
-  - *Levels 10–35:* Mitigation and shielding core: *Silent Resolve* (5/5 threat reduction), *Unbreakable Will* (5/5 stun/fear resistance), *Inner Focus* (1/1), *Improved Power Word: Shield* (3/3), *Meditation* (3/3), and *Searing Light* (3/3 Smite damage).
-  - *Levels 35–50:* *Mental Strength* (3/3 max mana), *Enlighten* (45), *Resurgent Shield* (1/1 mana return on shield absorb), and *Chastise* (50 disorient CC).
-  - *Levels 50–60:* *Force of Will* (5/5 crit/damage) and 11 Holy points into *Improved Renew* (3/3), *Holy Focus* (2/2), and *Divinity* (5/5) to operate as a capable party healer.
+  - *Levels 10–35:* Takes *Silent Resolve* (5/5), *Unbreakable Will* (5/5), *Inner Focus* (1/1), *Improved Power Word: Shield* (3/3), *Meditation* (3/3), and *Searing Light* (3/3).
+  - *Levels 35–50:* Takes *Mental Strength* (3/3), *Enlighten* (45), *Resurgent Shield* (1/1), and *Chastise* (50).
+  - *Levels 50–60:* Takes *Force of Will* (5/5) and 11 points in Holy (*Improved Renew* 3/3 + *Holy Focus* 2/2 + *Divinity* 5/5).
 
+</details>
+
+---
+
+## Class settings
+
+There are no class-specific configuration flags for Priests. General healing thresholds, mana reserves, and reaction times are configured in [Combat settings](../server/settings/combat.md).

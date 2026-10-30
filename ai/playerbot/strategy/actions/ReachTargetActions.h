@@ -10,8 +10,11 @@
 #include "playerbot/strategy/NamedObjectContext.h"
 #include "playerbot/strategy/values/MoveStyleValue.h"
 #include "GenericSpellActions.h"
+#include "playerbot/strategy/values/HealerCoverage.h"
 #include "playerbot/PlayerbotFactory.h"
-#include "playerbot/PullFiringPolicy.h"
+#include "playerbot/policy/pull/PullFiringPolicy.h"
+#include "playerbot/policy/combat/RangedApproachPolicy.h"
+#include "playerbot/strategy/values/PossibleTargetsValue.h"
 #include "AI/CreatureAI.h"
 #include <ctime>
 
@@ -204,15 +207,29 @@ namespace ai
                     // not a stuck spot: the bot keeps after it instead of abandoning a nearly dead
                     // mob and blacklisting its kind.
                     bool const runner = target->HasUnitState(UNIT_STAT_FLEEING | UNIT_STAT_CONFUSED);
+                    // A creature in sight that is hitting one of us - the bot, its master, a group
+                    // member or one of their pets - is a live fight, not a stuck spot, the same as
+                    // one hitting the bot. In a party it often turns to the mage or healer, and the
+                    // clock above was last anchored when the bot first closed in, so the first
+                    // "reach melee" after the turn gave up on it at once: the rogue and the tank
+                    // dropped a 30000-HP wolf mid-fight, and the five-minute "unreachable entries"
+                    // mark then kept the tank off the next two wolves of that kind.
+                    Unit* const victim = target->GetVictim();
+                    Player* const victimPlayer = victim ? victim->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+                    bool const hitsOurSide = victim == bot || (target->IsCreature() && victimPlayer &&
+                        (bot->IsInSameRaidWith(victimPlayer) || victimPlayer == GetMaster()));
                     bool const noHeadway = !runner && nowMs - noLosSinceMs >= kNoHeadwayMs &&
-                        (target->GetVictim() != bot || !inLos || cannotBeReached);
+                        (!hitsOurSide || !inLos || cannotBeReached);
                     bool const outOfReach = range > 0.0f
                         ? distanceToTarget > range * 1.4f
                         : !bot->CanReachWithMeleeAutoAttack(target);
                     bool const fighting = !cannotBeReached && (bot->IsInCombat() || target->GetVictim() == bot);
                     bool const stoodStill = !runner && outOfReach && !fighting && nowMs - stoodSinceMs >= kNoMoveMs;
 
-                    if (noHeadway || stoodStill)
+                    // Group instance targets remain the party's fight even when reach
+                    // stalls. Do not blacklist the boss or discard the attack order.
+                    bool const groupInstanceFight = bot->GetGroup() && bot->GetMap() && bot->GetMap()->IsDungeon();
+                    if (!groupInstanceFight && (noHeadway || stoodStill))
                     {
                         // The attacker exception only holds in sight: a mob that "attacks" the bot
                         // from out of sight for 15 s without closing in is stuck as well (a Wendigo in
@@ -317,6 +334,14 @@ namespace ai
                     ai->TellPlayerNoFacing(GetMaster(), out);
                 }
 
+                // Inside a dungeon a bot on a navmesh island (a raised dais the
+                // mesh does not link to the floor) has only a partial path that
+                // ends at its feet: the chase stands still and the walk below
+                // shuffles a yard. It steps down off the edge instead, for every
+                // reach (melee, spell, heal, pull); see StepDownOffLedge.
+                if (StepDownOffLedge(target))
+                    return true;
+
                 if (inLos && isFriend && (range <= ai->GetRange("follow")))
                 {
                     return MoveNear(target, chaseDist);
@@ -330,18 +355,110 @@ namespace ai
             return false;
         }
 
-        // How a reach action closes the distance to a hostile target. The
-        // default is the mature core chase; an explicit ranged pull overrides
-        // it with a point move to a firing position (see ReachPullAction and
-        // issue #389).
+        // How a reach action closes the distance to its target. The default is
+        // the mature core chase, except for a ranged reach in sight inside a
+        // dungeon, which walks the navmesh path instead (MoveIntoRangeAlongPath);
+        // an explicit ranged pull overrides it with a point move to
+        // a firing position (see ReachPullAction and issue #389).
         virtual bool MoveIntoRange(Unit* target, float distance)
         {
+            if (MoveIntoRangeAlongPath(target, distance))
+                return true;
+
             return ChaseTo(target, distance, bot->GetAngle(target));
+        }
+
+        // Inside a dungeon the core's chase generator refuses a destination
+        // that is not melee-reachable from the target and stands still while
+        // the target is in sight (TargetedMovementGenerator), so a healer or
+        // caster out of range but in sight of its target never closed the gap:
+        // in Uldaman (2026-10-12) a mage stood 20 s at 35 yd on "reach spell",
+        // and a priest stayed at the entrance 38 yd from the fight on "reach
+        // party member to heal" (the same core rule as the pull in #389). Port of mod-playerbots ReachCombatTo: take the navmesh
+        // path to the target (complete or partial), walk it back from the
+        // target end to the first point within `distance` that still sees the
+        // target (a partial path never parks the bot out of sight), and
+        // point-move there. False leaves the move to the chase:
+        // outside dungeons, out of sight, within melee distance, no usable path
+        // or point, a hazard at the point, or a move that does not start.
+        bool MoveIntoRangeAlongPath(Unit* target, float distance)
+        {
+            Map* map = bot->GetMap();
+            if (!map || !target || bot->GetTransport())
+                return false;
+
+            // Cheap gates first: the open world never pays the sight ray below,
+            // and a bot already walking its approach never pays a second path
+            // search. MoveTo relaunches the spline every call, so without this
+            // the reach re-pathed and restarted the walk on every tick.
+            if (!UseRangedApproach(map->IsDungeon(), distance, ATTACK_DISTANCE))
+                return false;
+
+            if (!bot->IsStopped() && !bot->movespline->Finalized())
+                return true;
+
+            if (!bot->IsWithinLOSInMap(target, true))
+                return false;
+
+            if (!ai->CanMove() || !ai->IsSafe(target))
+                return false;
+
+            WorldPosition const botPosition(bot);
+            WorldPosition const targetPosition(target);
+
+            // getPathStepFrom keeps PATHFIND_NORMAL and PATHFIND_INCOMPLETE, and
+            // the core's straight swim line only when all of it lies in water
+            // (SwimPathPolicy.h); it drops shortcut / no-path results, so the
+            // point is on the navmesh the bot can walk or in the water it swims.
+            std::vector<WorldPosition> const path = targetPosition.getPathStepFrom(botPosition, bot);
+            if (path.size() < 2)
+                return false;
+
+            std::vector<ApproachPoint> points;
+            points.reserve(path.size() + 1);
+            ApproachPoint front;
+            front.x = botPosition.getX();
+            front.y = botPosition.getY();
+            front.z = botPosition.getZ();
+            points.push_back(front);
+            for (WorldPosition const& step : path)
+            {
+                ApproachPoint point;
+                point.x = step.getX();
+                point.y = step.getY();
+                point.z = step.getZ();
+                points.push_back(point);
+            }
+
+            ApproachPoint goal;
+            goal.x = targetPosition.getX();
+            goal.y = targetPosition.getY();
+            goal.z = targetPosition.getZ();
+
+            // The same heights as the core's IsWithinLOSInMap: each side at its
+            // own collision height (Unit::GetLosCheckPosition).
+            float const botHeight = bot->GetCollisionHeight();
+            float const targetHeight = target->GetCollisionHeight();
+            auto const seesTarget = [map, &goal, botHeight, targetHeight](ApproachPoint const& point)
+            {
+                return map->isInLineOfSight(point.x, point.y, point.z + botHeight,
+                    goal.x, goal.y, goal.z + targetHeight, true);
+            };
+
+            RangedApproachChoice const choice = SelectRangedApproachPoint(points, goal, distance, seesTarget);
+            if (!choice.valid)
+                return false;
+
+            WorldPosition const destination(bot->GetMapId(), choice.point.x, choice.point.y, choice.point.z);
+            if (IsHazardNearPosition(destination))
+                return false;
+
+            return MoveTo(destination.getMapId(), destination.getX(), destination.getY(), destination.getZ());
         }
 
         // True for reach actions whose target is always meant to be attacked
         // (melee, pull) - false for "reach spell", which is also used to close
-        // distance on friendly targets (e.g. Blessing of Protection/Freedom).
+        // distance on friendly targets (e.g. Hand of Protection/Freedom).
         virtual bool RequiresAttackableTarget() const { return false; }
 
         virtual bool isUseful() override
@@ -362,8 +479,14 @@ namespace ai
                         return false;
                     }
 
-                    // Do not move while casting
-                    if (!bot->IsNonMeleeSpellCasted(true, false, true))
+                    // Do not move while casting (#903: a "reach spell"
+                    // re-issued mid-cast cancels the bar on its first step,
+                    // so casters never finish; the spell's own range check
+                    // runs the reach again on the next tick once the cast
+                    // is done).
+                    if (ai::MoveBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true), false))
+                        return false;
+
                     {
                         // Check if the spell for which the reach action is used for can be casted
                         if (!spellName.empty() && !ai->CanCastSpell(spellName, target, true, nullptr, true, true, true))
@@ -425,10 +548,24 @@ namespace ai
             if (ai->HasStrategy("stay", ai->GetState()))
                 return false;
 
-			return sServerFacade.IsDistanceGreaterThan(AI_VALUE2(float, "distance", "current target"), (distance + sPlayerbotAIConfig.contactDistance));
+			if (!sServerFacade.IsDistanceGreaterThan(AI_VALUE2(float, "distance", "current target"), (distance + sPlayerbotAIConfig.contactDistance)))
+                return false;
+
+            return !(sPlayerbotAIConfig.avoidCreatureAuras && GapCloserIntoKeepout());
 		}
 
     protected:
+        // AiPlayerbot.AvoidCreatureAuras: Charge, Intercept and Feral Charge
+        // jump the bot past every keep-out hold (they never go through the
+        // chase). The engine asks isUseful() every tick the trigger fires, so
+        // the veto first checks the cast could fire this tick (cooldown,
+        // rage, Charge out of combat, min/max range) and only then looks at
+        // the landing.
+        bool GapCloserIntoKeepout()
+        {
+            return PossibleTriggersValue::GapCloserIntoKeepout(ai, GetSpellName(), AI_VALUE(Unit*, "current target"));
+        }
+
         float distance;
     };
 
@@ -437,12 +574,49 @@ namespace ai
     public:
         ReachMeleeAction(PlayerbotAI* ai) : ReachTargetAction(ai, "reach melee") {}
         bool RequiresAttackableTarget() const override { return true; }
+
+        // Nothing to walk for while the target is in melee reach. A melee
+        // strike (CastMeleeSpellAction, range ATTACK_DISTANCE) is castable
+        // exactly when the bot can reach the target with melee auto-attack, and
+        // "enemy out of melee" fires on the same test. The base check compares
+        // the strike's DBC range (combat range -> the bot's own combat reach,
+        // ~1.5 yd) with an edge distance, so from ~2 yd to the end of melee
+        // reach the "reach melee::<strike>" prerequisite ran instead of the
+        // strike, every tick while the target kept moving or turning: white
+        // hits landing, energy/rage pooled, last action "reach melee". Donor
+        // mod-playerbots: reach melee is useful only outside combat range.
+        bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            if (target && bot->CanReachWithMeleeAutoAttack(target) && bot->IsWithinLOSInMap(target, true))
+                return false;
+
+            return ReachTargetAction::isUseful();
+        }
     };
 
     class ReachSpellAction : public ReachTargetAction
 	{
     public:
         ReachSpellAction(PlayerbotAI* ai) : ReachTargetAction(ai, "reach spell", ai->GetRange("spell")) {}
+    };
+
+    // Reach for a crowd-control cast: the spell's range minus
+    // CcCastRangeMargin (CcMarkHoldPolicy.h), the distance at which
+    // CastCrowdControlSpellAction starts its cast.
+    class ReachCcAction : public ReachTargetAction
+    {
+    public:
+        ReachCcAction(PlayerbotAI* ai) : ReachTargetAction(ai, "reach cc", ai->GetRange("spell")) {}
+
+        void Qualify(const std::string& qualifier) override
+        {
+            // Start from the base range on every qualify, so the margin is
+            // applied once.
+            range = ai->GetRange("spell");
+            ReachTargetAction::Qualify(qualifier);
+            range = CcCastReach(range);
+        }
     };
 
     class ReachPullAction : public ReachTargetAction
@@ -468,6 +642,20 @@ namespace ai
 
         std::string GetTargetName() override { return "pull target"; }
         bool RequiresAttackableTarget() const override { return true; }
+
+        bool Execute(Event& event) override
+        {
+            // The queued pull path runs this action as the "pull action"
+            // prerequisite without touching PullAction, so sample the
+            // approach headway here too: a progressing walk keeps the pull's
+            // target past the flat pull window (issue #910).
+            if (Unit* target = GetTarget())
+            {
+                if (PullStrategy* strategy = PullStrategy::Get(ai))
+                    strategy->NotePullApproach(target->GetDistance(bot), sServerFacade.isMoving(bot));
+            }
+            return ReachTargetAction::Execute(event);
+        }
 
         // How far the firing position's ground may sit above or below the
         // puller before the point is another floor (a ledge, a chasm, a
@@ -548,6 +736,22 @@ namespace ai
     public:
         ReachPartyMemberToHealAction(PlayerbotAI* ai) : ReachTargetAction(ai, "reach party member to heal", ai->GetRange("heal")) {}
         virtual std::string GetTargetName() override { return "party member to heal"; }
+
+        // Every heal on "party member to heal" queues this action as its walk-up
+        // prerequisite, so the trigger alone does not stop the walk. In combat
+        // the walk is dropped for an ally another healer already covers
+        // (issue #904, HealReachPolicy.h); with no covering healer it stays.
+        virtual bool isUseful() override
+        {
+            if (!ReachTargetAction::isUseful())
+                return false;
+
+            if (!ai->IsStateActive(BotState::BOT_STATE_COMBAT))
+                return true;
+
+            Unit* target = GetTarget();
+            return !target || !AnotherHealerCoversAlly(ai, target, HealReachLimit(ai));
+        }
     };
 
     class ReachPartyMemberToResurrectAction : public ReachTargetAction
@@ -568,6 +772,28 @@ namespace ai
         {
             ReachTargetAction::Qualify(qualifier);
             range = 20.0f;
+        }
+
+        bool isUseful() override
+        {
+            if (bot->IsInCombat() && (ai->IsTank(bot) || ai->HasStrategy("tank shaman", BotState::BOT_STATE_COMBAT)))
+                return false;
+
+            // No walk without a drop: the aura scan reads "windfury totem"
+            // while the raid buff is "Windfury Totem Effect", so after a
+            // re-cast loop starts every member reads as missing the aura
+            // and this prereq walks the healer to the tanks every tick
+            // (live raid 2026-10-14: resto 4-7 yd from the boss). The
+            // totem-object scan ("has totem") sees the live totem even
+            // when the aura name does not match, so gate the walk on it:
+            // no live totem of this spell -> walk; totem already down ->
+            // stay at range and let the cast go USELESS quietly.
+            std::string totemSpell = spellName;
+            if (totemSpell.empty() && !qualifier.empty())
+                totemSpell = Qualified::getMultiQualifierStr(qualifier, 0, "::");
+            if (!totemSpell.empty() && AI_VALUE2(bool, "has totem", totemSpell.c_str()))
+                return false;
+            return ReachTargetAction::isUseful();
         }
 
         Unit* GetTarget() override
@@ -594,11 +820,34 @@ namespace ai
                 if (!bot->IsWithinDistInMap(member, 100.0f, false))
                     continue;
 
-                if (!ai->HasAura(totemSpell, member, false, true))
+                // Same effect-name rule as the totem action: match the
+                // totem aura by id, not by cast-spell name.
+                if (!HasTotemAura(totemSpell, member))
                     return member;
             }
 
             return nullptr;
+        }
+
+        bool HasTotemAura(std::string const& totemSpell, Player* member)
+        {
+            if (!member)
+                return false;
+            std::uint32_t spellId = AI_VALUE2(std::uint32_t, "spell id", totemSpell);
+            if (!spellId)
+                return false;
+            SpellEntry const* info = sServerFacade.LookupSpellInfo(spellId);
+            if (!info)
+                return false;
+            for (std::uint32_t effect = 0; effect < (std::uint32_t)MAX_EFFECT_INDEX; ++effect)
+            {
+                std::uint32_t auraId = info->EffectTriggerSpell[effect];
+                if (!auraId)
+                    continue;
+                if (ai->HasAura(auraId, member))
+                    return true;
+            }
+            return ai->HasAura(spellId, member);
         }
     };
 }

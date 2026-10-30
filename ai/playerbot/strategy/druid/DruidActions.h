@@ -1,5 +1,6 @@
 #pragma once
 #include "playerbot/GroupMembers.h"
+#include "playerbot/policy/class/BearRagePolicy.h"
 #include "playerbot/strategy/actions/GenericActions.h"
 
 namespace ai
@@ -34,22 +35,22 @@ namespace ai
         CastHealingTouchAction(PlayerbotAI* ai) : CastHealingSpellAction(ai, "healing touch") {}
     };
 
-    class CastRejuvenationOnPartyAction : public HealPartyMemberAction
+    class CastRejuvenationOnPartyAction : public HealHotPartyMemberAction
     {
     public:
-        CastRejuvenationOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "rejuvenation") {}
+        CastRejuvenationOnPartyAction(PlayerbotAI* ai) : HealHotPartyMemberAction(ai, "rejuvenation", 15, HealManaEfficiency::VERY_HIGH) {}
     };
 
-    class CastRegrowthOnPartyAction : public HealPartyMemberAction
+    class CastRegrowthOnPartyAction : public HealHotPartyMemberAction
     {
     public:
-        CastRegrowthOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "regrowth") {}
+        CastRegrowthOnPartyAction(PlayerbotAI* ai) : HealHotPartyMemberAction(ai, "regrowth", 35, HealManaEfficiency::HIGH) {}
     };
 
     class CastHealingTouchOnPartyAction : public HealPartyMemberAction
     {
     public:
-        CastHealingTouchOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "healing touch") {}
+        CastHealingTouchOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "healing touch", 50, HealManaEfficiency::MEDIUM) {}
     };
 
     class CastSwiftmendAction : public CastHealingSpellAction
@@ -116,6 +117,30 @@ namespace ai
         CastThornsOnPartyAction(PlayerbotAI* ai) : BuffOnPartyAction(ai, "thorns") {}
     };
 
+    // HEAL-3/LD-8: thorns cast on the designated main tank (donor
+    // BuffOnMainTankAction). The trigger gates auras/claims; the action only
+    // retargets from self to the MT value.
+    class CastThornsOnMainTankAction : public CastThornsAction
+    {
+    public:
+        CastThornsOnMainTankAction(PlayerbotAI* ai) : CastThornsAction(ai) {}
+
+        virtual std::string getName() { return "thorns on main tank"; }
+
+    protected:
+        std::string GetTargetName() override { return "main tank"; }
+    };
+
+    // Explicit getName: the BuffOnTankAction base reports spell+" on party"
+    // via PartyMemberActionNameSupport, which would collide with the party
+    // blanket in queue dedup and failure backoff (both key on getName).
+    class CastThornsOnTankAction : public BuffOnTankAction
+    {
+    public:
+        CastThornsOnTankAction(PlayerbotAI* ai) : BuffOnTankAction(ai, "thorns") {}
+        std::string getName() override { return "thorns on tank"; }
+    };
+
 	class CastOmenOfClarityAction : public CastBuffSpellAction
 	{
 	public:
@@ -133,6 +158,9 @@ namespace ai
 	{
 	public:
 	    CastHurricaneAction(PlayerbotAI* ai) : CastSpellAction(ai, "hurricane") {}
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
 	};
 
 	class CastMoonfireAction : public CastRangedDebuffSpellAction
@@ -224,7 +252,7 @@ namespace ai
             // speed by 20%: never worth it for Cat/Bear, which lose their
             // form bonuses while it is up. Balance/Resto stay humanoid.
             if (ai->HasAura("cat form", bot) || ai->HasAura("bear form", bot) ||
-                ai->HasAura("dire bear form", bot) || ai->HasAura("tree of life", bot))
+                ai->HasAura("dire bear form", bot) || ai->HasAura("tree of life form", bot))
                 return false;
             return CastBuffSpellAction::isUseful();
         }
@@ -249,30 +277,11 @@ namespace ai
             }
             // Turtle 29166 is a single-target healer battery: prefer the
             // lowest-mana party healer under LowMana, fall back to self.
-            Group* group = bot->GetGroup();
-            if (group)
-            {
-                Unit* lowestHealer = nullptr;
-                float lowestPct = static_cast<float>(sPlayerbotAIConfig.lowMana);
-                for (Player* member : LiveGroupMembers(group))
-                {
-                    if (!member || member == bot || !ai->IsSafe(member) || !ai->IsHeal(member))
-                        continue;
-                    if (member->GetMapId() != bot->GetMapId() || !sServerFacade.IsAlive(member))
-                        continue;
-                    uint32 maxMana = member->GetMaxPower(POWER_MANA);
-                    if (!maxMana)
-                        continue;
-                    float pct = (static_cast<float>(member->GetPower(POWER_MANA)) / maxMana) * 100.0f;
-                    if (pct < lowestPct)
-                    {
-                        lowestPct = pct;
-                        lowestHealer = member;
-                    }
-                }
-                if (lowestHealer && IsTargetValid(lowestHealer))
-                    return lowestHealer;
-            }
+            // Routed through the shared "healer low mana" value so trigger
+            // and action agree on the target (PR #650 unification with #615).
+            Unit* lowestHealer = AI_VALUE(Unit*, "healer low mana");
+            if (lowestHealer && IsTargetValid(lowestHealer))
+                return lowestHealer;
             Unit* fallback = CastSpellAction::GetTarget();
             return (fallback && IsTargetValid(fallback)) ? fallback : nullptr;
         }
@@ -285,12 +294,46 @@ namespace ai
                 return false;
             return ai->GetManaPercent(*target) < sPlayerbotAIConfig.lowMana;
         }
+
+        bool isPossible() override
+        {
+            // Innervate unknown: stay quiet so the row never queues a cast
+            // that fails after the caster-form shift (from #615's trigger).
+            return ai->HasSpell("innervate") && CastSpellAction::isPossible();
+        }
+
+        bool isUseful() override
+        {
+            // Innervate on cooldown or target out of range / already buffed:
+            // the engine checks these before queueing (from #615's trigger).
+            // isUseful runs after GetTarget, so reuse the resolved target.
+            Unit* target = GetTarget();
+            if (!target)
+                return false;
+            uint32 innervateId = AI_VALUE2(uint32, "spell id", "innervate");
+            if (!innervateId || !sServerFacade.IsSpellReady(bot, innervateId))
+                return false;
+            if (ai->HasAura("innervate", target))
+                return false;
+            float maxRange = 0.0f;
+            if (!ai->GetSpellRange("innervate", &maxRange))
+                return false;
+            if (sServerFacade.getDistance2d(bot, target) > maxRange)
+                return false;
+            return CastSpellAction::isUseful();
+        }
     };
 
     class CastTranquilityAction : public CastAoeHealSpellAction
     {
     public:
         CastTranquilityAction(PlayerbotAI* ai) : CastAoeHealSpellAction(ai, "tranquility") {}
+        // Tranquility is centred on the caster (self range, the channel heals
+        // the party around the druid), so it must not walk to a hurt member:
+        // with "party member to heal" the reach prerequisite closed to ~0 yd
+        // of the target, i.e. under the boss next to the tank (live Alliance
+        // raid: resto druids shuttled in up to 32 times a fight).
+        virtual std::string GetTargetName() override { return "self target"; }
     };
 
     class CastNaturesSwiftnessAction : public CastBuffSpellAction
@@ -335,7 +378,7 @@ namespace ai
 	class CastTreeFormAction : public CastBuffSpellAction
 	{
 	public:
-		CastTreeFormAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "tree of life") {}
+		CastTreeFormAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "tree of life form") {}
 	};
 
 	class CastMoonkinFormAction : public CastBuffSpellAction
@@ -373,7 +416,7 @@ namespace ai
 
 		virtual bool isUseful()
 		{
-			return ai->HasAnyAuraOf(GetTarget(), "dire bear form", "bear form", "cat form", "travel form", "aquatic form", "moonkin form", "tree of life", NULL);
+			return ai->HasAnyAuraOf(GetTarget(), "dire bear form", "bear form", "cat form", "travel form", "aquatic form", "moonkin form", "tree of life form", NULL);
 		}
 
 		virtual bool isPossible() { return true; }
@@ -409,18 +452,6 @@ namespace ai
     {
     public:
         CastClawAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "claw") {}
-    };
-
-    class CastMangleCatAction : public CastMeleeSpellAction
-    {
-    public:
-        CastMangleCatAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "mangle (cat)") {}
-    };
-
-    class CastSwipeCatAction : public CastMeleeSpellAction
-    {
-    public:
-        CastSwipeCatAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "swipe (cat)") {}
     };
 
     class CastFerociousBiteAction : public CastMeleeSpellAction
@@ -463,8 +494,9 @@ namespace ai
         {
             if (ai->CastSpell("prowl", bot))
             {
+                // Combat engine only: out of combat a prowling druid keeps its
+                // normal non-combat actions (see DpsFeralDruidStealthedStrategy).
                 ai->ChangeStrategy("+stealthed", BotState::BOT_STATE_COMBAT);
-                ai->ChangeStrategy("+stealthed", BotState::BOT_STATE_NON_COMBAT);
                 bot->InterruptSpell(CURRENT_MELEE_SPELL);
             }
 
@@ -504,7 +536,6 @@ namespace ai
             if (isStealthed && !hasStealthStrategy)
             {
                 ai->ChangeStrategy("+stealthed", BotState::BOT_STATE_COMBAT);
-                ai->ChangeStrategy("+stealthed", BotState::BOT_STATE_NON_COMBAT);
                 return true;
             }
             else if (!isStealthed && hasStealthStrategy)
@@ -556,17 +587,36 @@ namespace ai
         CastGrowlAction(PlayerbotAI* ai) : CastSpellAction(ai, "growl") {}
     };
 
+    // Taunt the mob picked by "attacker of non-tank target"; the cast reads
+    // its real range from the spell and the reach prerequisite walks the
+    // bear in.
+    class CastGrowlOnAttackerAction : public CastGrowlAction
+    {
+    public:
+        CastGrowlOnAttackerAction(PlayerbotAI* ai) : CastGrowlAction(ai) {}
+
+    protected:
+        virtual std::string GetTargetName() override { return "attacker of non-tank target"; }
+        virtual std::string getName() override { return "growl on attacker"; }
+    };
+
     class CastMaulAction : public CastMeleeSpellAction
     {
     public:
         CastMaulAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "maul") {}
-        virtual bool isUseful() override { return CastMeleeSpellAction::isUseful() && AI_VALUE2(uint8, "rage", "self target") >= 45; }
+        virtual bool isUseful() override { return CastMeleeSpellAction::isUseful() && ShouldQueueMaul(AI_VALUE2(uint8, "rage", "self target")); }
     };
 
-    class CastBashAction : public CastMeleeSpellAction
+    class CastSavageBiteAction : public CastMeleeSpellAction
     {
     public:
-        CastBashAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "bash") {}
+        CastSavageBiteAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "savage bite") {}
+    };
+
+    class CastBashAction : public CastMeleeInterruptSpellAction
+    {
+    public:
+        CastBashAction(PlayerbotAI* ai) : CastMeleeInterruptSpellAction(ai, "bash") {}
     };
 
     class CastSwipeAction : public CastMeleeSpellAction
@@ -636,9 +686,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc tank feral pve", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc tank feral pve", strategiesRequired);
 
-            strategiesRequired = { "tank feral/bear/tank", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth tank feral pve", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth tank feral pve", strategiesRequired);
 
             strategiesRequired = { "tank feral/bear/tank", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure tank feral pve", strategiesRequired);
@@ -696,9 +743,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc restoration pve", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc restoration pve", strategiesRequired);
 
-            strategiesRequired = { "restoration/heal", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth restoration pve", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth restoration pve", strategiesRequired);
 
             strategiesRequired = { "restoration/heal", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure restoration pve", strategiesRequired);
@@ -732,9 +776,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc balance pve", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc balance pve", strategiesRequired);
 
-            strategiesRequired = { "balance", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth balance pve", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth balance pve", strategiesRequired);
 
             strategiesRequired = { "balance", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure balance pve", strategiesRequired);
@@ -751,6 +792,10 @@ namespace ai
             strategiesRequired = { "offheal" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offheal pve", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offheal pve", strategiesRequired);
+
+            strategiesRequired = { "offdps" };
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offdps pve", strategiesRequired);
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offdps pve", strategiesRequired);
         }
     };
 
@@ -773,9 +818,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc tank feral pvp", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc tank feral pvp", strategiesRequired);
 
-            strategiesRequired = { "tank feral/bear/tank", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth tank feral pvp", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth tank feral pvp", strategiesRequired);
 
             strategiesRequired = { "tank feral/bear/tank", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure tank feral pvp", strategiesRequired);
@@ -833,9 +875,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc restoration pvp", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc restoration pvp", strategiesRequired);
 
-            strategiesRequired = { "restoration/heal", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth restoration pvp", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth restoration pvp", strategiesRequired);
 
             strategiesRequired = { "restoration/heal", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure restoration pvp", strategiesRequired);
@@ -869,9 +908,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc balance pvp", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc balance pvp", strategiesRequired);
 
-            strategiesRequired = { "balance", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth balance pvp", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth balance pvp", strategiesRequired);
 
             strategiesRequired = { "balance", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure balance pvp", strategiesRequired);
@@ -888,6 +924,10 @@ namespace ai
             strategiesRequired = { "offheal" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offheal pvp", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offheal pvp", strategiesRequired);
+
+            strategiesRequired = { "offdps" };
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offdps pvp", strategiesRequired);
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offdps pvp", strategiesRequired);
         }
     };
 
@@ -910,9 +950,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc tank feral raid", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc tank feral raid", strategiesRequired);
 
-            strategiesRequired = { "tank feral/bear/tank", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth tank feral raid", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth tank feral raid", strategiesRequired);
 
             strategiesRequired = { "tank feral/bear/tank", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure tank feral raid", strategiesRequired);
@@ -970,9 +1007,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc restoration raid", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc restoration raid", strategiesRequired);
 
-            strategiesRequired = { "restoration/heal", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth restoration raid", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth restoration raid", strategiesRequired);
 
             strategiesRequired = { "restoration/heal", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure restoration raid", strategiesRequired);
@@ -1006,9 +1040,6 @@ namespace ai
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cc balance raid", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "cc balance raid", strategiesRequired);
 
-            strategiesRequired = { "balance", "stealth" };
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "stealth balance raid", strategiesRequired);
-            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "stealth balance raid", strategiesRequired);
 
             strategiesRequired = { "balance", "cure" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "cure balance raid", strategiesRequired);
@@ -1025,6 +1056,10 @@ namespace ai
             strategiesRequired = { "offheal" };
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offheal raid", strategiesRequired);
             strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offheal raid", strategiesRequired);
+
+            strategiesRequired = { "offdps" };
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_COMBAT, "offdps raid", strategiesRequired);
+            strategiesToUpdate.emplace_back(BotState::BOT_STATE_NON_COMBAT, "offdps raid", strategiesRequired);
         }
     };
 }

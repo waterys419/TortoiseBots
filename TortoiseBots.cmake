@@ -91,33 +91,51 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "DISCOVERY")
   # string cannot go stale.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${TORTOISEBOTS_ROOT}/VERSION")
 
-  # PlayerbotAIConfig reads its mature configuration beside mangosd.conf.
-  set(TORTOISEBOTS_AI_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/aiplayerbot.conf")
+  # Configuration ships as templates. The core installs conf/*.conf.dist into
+  # the modules config folder and loads the matching .conf; PlayerbotAIConfig
+  # reads aiplayerbot.conf beside mangosd.conf. Each live .conf is created from
+  # its template on the first install only - a reinstall must never overwrite
+  # settings the admin edited. Keys a template gains later fall back to the
+  # code defaults, which equal the template values.
+  set(TORTOISEBOTS_AI_CONFIG_DIST "${CMAKE_CURRENT_BINARY_DIR}/aiplayerbot.conf.dist")
   configure_file(
     "${TORTOISEBOTS_ROOT}/ai/playerbot/aiplayerbot.conf.dist.in"
-    "${TORTOISEBOTS_AI_CONFIG}"
+    "${TORTOISEBOTS_AI_CONFIG_DIST}"
     COPYONLY)
-  install(FILES "${TORTOISEBOTS_AI_CONFIG}" DESTINATION "${CONF_DIR}")
+  install(FILES "${TORTOISEBOTS_AI_CONFIG_DIST}" DESTINATION "${CONF_DIR}")
 
-  configure_file(
-    "${TORTOISEBOTS_ROOT}/conf/tortoise_bots.conf.dist"
-    "${CMAKE_CURRENT_BINARY_DIR}/tortoise_bots.conf"
-    COPYONLY)
-  CopyModuleConfig("${CMAKE_CURRENT_BINARY_DIR}/tortoise_bots.conf")
+  if(WIN32)
+    set(TORTOISEBOTS_MODULE_CONF_DIR "${CMAKE_INSTALL_PREFIX}/modules")
+  else()
+    set(TORTOISEBOTS_MODULE_CONF_DIR "${CONF_DIR}/modules")
+  endif()
+  foreach(TORTOISEBOTS_LIVE_CONFIG
+      "${CONF_DIR}/aiplayerbot.conf|${TORTOISEBOTS_AI_CONFIG_DIST}"
+      "${TORTOISEBOTS_MODULE_CONF_DIR}/tortoise_bots.conf|${TORTOISEBOTS_ROOT}/conf/tortoise_bots.conf.dist")
+    string(REPLACE "|" ";" TORTOISEBOTS_LIVE_CONFIG "${TORTOISEBOTS_LIVE_CONFIG}")
+    list(GET TORTOISEBOTS_LIVE_CONFIG 0 TORTOISEBOTS_LIVE_CONFIG_DEST)
+    list(GET TORTOISEBOTS_LIVE_CONFIG 1 TORTOISEBOTS_LIVE_CONFIG_SRC)
+    install(CODE "
+      set(_dest \"\$ENV{DESTDIR}${TORTOISEBOTS_LIVE_CONFIG_DEST}\")
+      if(NOT EXISTS \"\${_dest}\")
+        message(STATUS \"Creating: \${_dest}\")
+        configure_file(\"${TORTOISEBOTS_LIVE_CONFIG_SRC}\" \"\${_dest}\" COPYONLY)
+      else()
+        message(STATUS \"Keeping: \${_dest}\")
+      endif()")
+  endforeach()
 
-  # Optional module migrations are installed only with the module. The core
-  # AutoUpdater applies them on startup without making bots a core dependency.
-  # AutoUpdater's module contract is case-sensitive on Linux. Penqle's
-  # effective mangosd.conf.dist names these configured folders `world` and
-  # `character`; the uppercase names in AutoUpdater.cpp are only fallback
-  # defaults when those settings are absent. Keep the module aligned with the
-  # shipped core configuration so a fresh install cannot silently skip SQL.
+  # Optional module migrations are applied by the core AutoUpdater, which reads
+  # <modules>/TortoiseBots/data/sql/<Database.AutoUpdate.*UpdateName> from the
+  # source tree (TW_SOURCE_MODULES_DIR); the shipped mangosd.conf.dist names
+  # these `world` and `character`, so the source folders carry exactly those
+  # names. The copies below serve installs that run without the source tree.
   if(EXISTS "${TORTOISEBOTS_ROOT}/data/sql/world")
     install(DIRECTORY "${TORTOISEBOTS_ROOT}/data/sql/world/"
       DESTINATION "${CMAKE_INSTALL_PREFIX}/modules/TortoiseBots/data/sql/world")
   endif()
-  if(EXISTS "${TORTOISEBOTS_ROOT}/data/sql/char")
-    install(DIRECTORY "${TORTOISEBOTS_ROOT}/data/sql/char/"
+  if(EXISTS "${TORTOISEBOTS_ROOT}/data/sql/character")
+    install(DIRECTORY "${TORTOISEBOTS_ROOT}/data/sql/character/"
       DESTINATION "${CMAKE_INSTALL_PREFIX}/modules/TortoiseBots/data/sql/character")
   endif()
 
@@ -129,25 +147,38 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "DISCOVERY")
     "${TORTOISEBOTS_ROOT}/host/BotChatAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/BotAddonAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/BotPacketAdapter.cpp"
+    "${TORTOISEBOTS_ROOT}/host/RaidBossDiagnostics.cpp"
     "${TORTOISEBOTS_ROOT}/host/BotPlayerAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/LftFillAdapter.cpp"
+    "${TORTOISEBOTS_ROOT}/host/BotLfgAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/HireRecruiterScript.cpp"
     "${TORTOISEBOTS_ROOT}/host/HireRecruiterAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/HireGroupAdapter.cpp"
+    "${TORTOISEBOTS_ROOT}/host/ClaimGuildAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/WorldBuffKillAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/WorldBuffAuraAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/WorldBuffPvpAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/host/WorldBuffRaidAdapter.cpp"
+    "${TORTOISEBOTS_ROOT}/host/HireUnlockKillAdapter.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/BotManager.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/RunTrace.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/RunTraceWriter.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/BotActivityLease.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/BotNameService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/CharacterCleanup.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/RandomBotAccountRegistry.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/RandomBotPoolReset.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/RandomBotService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/HireCost.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/HireProvisionService.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/HireGearCache.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/HireLifecycle.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/HireUnlockKillStore.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/ClaimLifecycle.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/AltBotService.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/DowntimeService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/LftBotFillService.cpp"
+    "${TORTOISEBOTS_ROOT}/runtime/BotLfgService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/AhMarketService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/BattlegroundQueueService.cpp"
     "${TORTOISEBOTS_ROOT}/runtime/PlayerbotAIStorage.cpp"
@@ -157,6 +188,17 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "DISCOVERY")
     "${TORTOISEBOTS_ROOT}/behavior/Movement.cpp"
     "${TORTOISEBOTS_ROOT}/behavior/PlayerConvenience.cpp"
     "${TORTOISEBOTS_ROOT}/commands/BotCommands.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/CommandShared.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Info.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Hire.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Upkeep.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Inventory.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Party.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Totem.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Action.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Commander.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Pool.cpp"
+    "${TORTOISEBOTS_ROOT}/commands/Ah.cpp"
     "${TORTOISEBOTS_ROOT}/commands/BotCommandContext.cpp")
 
   # These are the module-owned runtime and mature AI foundations. The donor
@@ -165,6 +207,12 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "DISCOVERY")
   set(TORTOISEBOTS_AI_SRC
     "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIBase.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAI.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIActivity.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIChat.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIItems.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIPackets.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIQuests.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAISpells.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/PlayerbotAIConfig.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/AiFactory.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/ServerFacade.cpp"
@@ -172,7 +220,10 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "DISCOVERY")
     "${TORTOISEBOTS_ROOT}/ai/playerbot/BotLog.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/BotActionLog.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/BotDiagnostics.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/BossTacticsMgr.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/BotAreaTriggers.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/BroadcastHelper.cpp"
+    "${TORTOISEBOTS_ROOT}/ai/playerbot/DungeonPlanMgr.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/ChatFilter.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/FleeManager.cpp"
     "${TORTOISEBOTS_ROOT}/ai/playerbot/Helpers.cpp"
@@ -297,6 +348,14 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "POST_TARGETS")
     target_compile_definitions("${TORTOISEBOTS_TARGET}" PRIVATE
       "TORTOISEBOTS_CORE_REVISION=\"${TORTOISEBOTS_CORE_REVISION}\""
       "TORTOISEBOTS_CORE_DATE=\"${TORTOISEBOTS_CORE_DATE}\"")
+    # The dungeon repop door hook is in some core forks only; without it the
+    # core keeps its own door and the module still builds.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/src/game/ScriptObjects.h")
+      file(STRINGS "${CMAKE_SOURCE_DIR}/src/game/ScriptObjects.h" TORTOISEBOTS_REPOP_HOOK REGEX "GetBotRepopEntrance")
+      if(TORTOISEBOTS_REPOP_HOOK)
+        target_compile_definitions("${TORTOISEBOTS_TARGET}" PRIVATE TORTOISEBOTS_CORE_HAS_BOT_REPOP=1)
+      endif()
+    endif()
     target_include_directories("${TORTOISEBOTS_TARGET}" PRIVATE
       "${TORTOISEBOTS_ROOT}"
       "${TORTOISEBOTS_ROOT}/ai"
@@ -315,7 +374,22 @@ if(TORTOISE_MODULE_CMAKE_PHASE STREQUAL "POST_TARGETS")
       "${CMAKE_SOURCE_DIR}/src/game/Movement"
       "${CMAKE_SOURCE_DIR}/src/game/Movement/spline"
       "${CMAKE_SOURCE_DIR}/src/game/Transports"
-      "${CMAKE_SOURCE_DIR}/src/game/vmap")
+      "${CMAKE_SOURCE_DIR}/src/game/vmap"
+      "${ZLIB_INCLUDE_DIRS}")
+    # zlib (bot log packing) is linked into the module itself. Windows: the zlib
+    # target, as a dynamic module DLL needs it (unchanged). Elsewhere: the core's
+    # ZLIB::ZLIB (top-level find_package under if(UNIX)). The core lists its libz
+    # before libmodules.a, so with --as-needed a static module's gzwrite stays
+    # unresolved unless the module adds libz after its own archive.
+    if(WIN32 AND TARGET zlib)
+      target_link_libraries("${TORTOISEBOTS_TARGET}" PRIVATE zlib)
+    elseif(NOT WIN32)
+      if(TARGET ZLIB::ZLIB)
+        target_link_libraries("${TORTOISEBOTS_TARGET}" PRIVATE ZLIB::ZLIB)
+      elseif(ZLIB_LIBRARIES)
+        target_link_libraries("${TORTOISEBOTS_TARGET}" PRIVATE ${ZLIB_LIBRARIES})
+      endif()
+    endif()
     # TortoiseBots headers assume the compatibility precompiled header
     # (ai/botpch.h) is in scope. Honor the core's PCH option: use it when
     # precompiled headers are enabled, and force-include the same header when

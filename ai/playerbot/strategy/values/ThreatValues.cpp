@@ -12,10 +12,11 @@ float MyThreatValue::Calculate()
 {
     Unit* target = AI_VALUE(Unit*, qualifier);
 
-    if (target->getObjectGuid() != lastTarget) //Reset history if we switched target.
+    ObjectGuid targetGuid = target ? target->getObjectGuid() : ObjectGuid();
+    if (targetGuid != lastTarget) //Reset history if we switched target.
         LogCalculatedValue::Reset();
 
-    lastTarget = target->getObjectGuid();
+    lastTarget = targetGuid;
 
     return ThreatValue::GetThreat(bot, target);
 }
@@ -66,7 +67,7 @@ float ThreatValue::GetThreat(Player* player, Unit* target)
     if (sServerFacade.IsFriendlyTo(target, player))
         target = target->GetVictim();
 
-    if (target->getObjectGuid().IsPlayer())
+    if (!target || target->getObjectGuid().IsPlayer())
         return 0;
 
     float botThreat = sServerFacade.GetThreatManager(target).getThreat(player);
@@ -82,7 +83,7 @@ float ThreatValue::GetTankThreat(PlayerbotAI* ai, Unit* target)
     if (sServerFacade.IsFriendlyTo(target, ai->GetBot()))
         target = target->GetVictim();
 
-    if (target->getObjectGuid().IsPlayer())
+    if (!target || target->getObjectGuid().IsPlayer())
         return 0;
 
     Group* group = ai->GetBot()->GetGroup();
@@ -141,8 +142,10 @@ uint8 ThreatValue::Calculate(Unit* target)
         return 0;
 
     // calculate normal threat for fleeing targets
-    bool fleeing = target->GetMotionMaster()->GetCurrentMovementGeneratorType() == FLEEING_MOTION_TYPE ||
-        target->GetMotionMaster()->GetCurrentMovementGeneratorType() == TIMED_FLEEING_MOTION_TYPE;
+    // (the flee-for-assistance walk and its pause count too: Creature::DoFleeToGetAssistance)
+    MovementGeneratorType const motion = target->GetMotionMaster()->GetCurrentMovementGeneratorType();
+    bool fleeing = motion == FLEEING_MOTION_TYPE || motion == TIMED_FLEEING_MOTION_TYPE ||
+        motion == ASSISTANCE_MOTION_TYPE || motion == ASSISTANCE_DISTRACT_MOTION_TYPE;
 
     // return high threat if tank has no threat
     if (target->IsInCombat() && maxThreat == 0 && !fleeing)

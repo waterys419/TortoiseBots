@@ -3,6 +3,12 @@
 #include "AttackersValue.h"
 #include "PossibleTargetsValue.h"
 #include "EnemyPlayerValue.h"
+#include "WorldPvpSeekChecks.h"
+#include "playerbot/policy/combat/AttackersAoeDensityPolicy.h"
+#include "Movement/spline/MoveSpline.h"
+#include "playerbot/policy/combat/RunnerFinishPolicy.h"
+#include "Maps/PathFinder.h"
+#include "runtime/RunReleaseHold.h"
 
 using namespace ai;
 using namespace MaNGOS;
@@ -30,7 +36,11 @@ std::list<ObjectGuid> AttackersValue::Calculate()
     {
         Unit* rtiTarget = AI_VALUE(Unit*, "rti target");
 
-        if (rtiTarget && rtiTarget->IsInWorld() && rtiTarget->GetMapId() == bot->GetMapId())
+        // A mark the aura keep-out set aside is no attacker here either:
+        // this list skips IgnoreTarget, so the tournament would hand the
+        // ringed mark straight back (hold, set aside, re-pick).
+        if (rtiTarget && rtiTarget->IsInWorld() && rtiTarget->GetMapId() == bot->GetMapId() &&
+            !IsKeepoutSetAside(rtiTarget, bot))
         {
             return { rtiTarget->getObjectGuid() };
         }
@@ -87,6 +97,12 @@ std::list<ObjectGuid> AttackersValue::Calculate()
             if (pAttackersValue->Expired())
                 continue;
 
+            // Never copy an empty list: the source simply had nothing at scan
+            // time, which says nothing about us (#549). Scanning fresh here is
+            // still cheaper than staying blind and re-resetting every 2 s.
+            if (PAI_VALUE(std::list<ObjectGuid>, valueName).empty())
+                continue;
+
             if (pAttackersValue->calculatePos.sqDistance2d(bot) > 100.0f)
                 continue;
 
@@ -100,13 +116,12 @@ std::list<ObjectGuid> AttackersValue::Calculate()
             std::vector<std::string> specificTargetNames = { "current target","old target","attack target","pull target" };
             Unit* target;
 
-            // Remove bot specific targets of the other bot.
-            for (auto& targetName : specificTargetNames)
-            {
-                target = (targetName == "attack target") ? ai->GetUnit(PAI_VALUE(ObjectGuid, targetName)) : PAI_VALUE(Unit*, targetName);
-                if (target)
-                    result.remove(target->getObjectGuid());
-            }
+            // The other bot's own targets stay in the copied list. Its current
+            // target is usually the mob the party is fighting; dropping it left
+            // a tank or healer standing next to the mage with no attackers, so
+            // they left combat and followed the master while the rogue fought
+            // on. The validation below already drops any of them that does not
+            // threaten us or a groupmate, which is what a fresh scan keeps.
 
             // Append bot specific targets of this bot in natural priority order.
             for (auto& targetName : specificTargetNames)
@@ -118,24 +133,17 @@ std::list<ObjectGuid> AttackersValue::Calculate()
 
             // Validate these targets and enforce the invariant of distinct hostile units,
             // preserving original sequence (first-seen stable deduplication).
-            std::list<ObjectGuid> distinctResult;
-            std::set<ObjectGuid> seen;
-
-            for (auto& guid : result)
-            {
-                if (!seen.insert(guid).second)
-                    continue;
-
-                target = ai->GetUnit(guid);
-                if (IsValid(target, bot, bot))
+            // A copied target counts when it threatens us or anyone we fight for
+            // (group, master) - the same rule a fresh scan applies. Validating
+            // against ourselves only dropped every threat aimed at a groupmate,
+            // so grouped bots never engaged (#549). The dedup/first-seen/getOne
+            // loop is the shared DistinctValidTargets policy rule.
+            return DistinctValidTargets(result,
+                [this](const ObjectGuid& guid)
                 {
-                    distinctResult.push_back(guid);
-                    if (getOne)
-                        break;
-                }
-            }
-
-            return distinctResult;
+                    return IsValidForGroup(ai->GetUnit(guid));
+                },
+                getOne);
         }
     }
 
@@ -199,6 +207,43 @@ void AttackersValue::AddTargetsOf(Group* group, std::set<Unit*>& targets, std::s
             }
         }
     }
+}
+
+bool AttackersValue::IsValidForGroup(Unit* target)
+{
+    if (IsValid(target, bot, bot))
+        return true;
+
+    // Same membership rule as the fresh scan in AddTargetsOf(Group*): only
+    // alive, nearby members on our map fight for each other.
+    Group* group = bot->GetGroup();
+    if (group && !bot->InBattleGround())
+    {
+        Group::MemberSlotList const& groupSlot = group->GetMemberSlots();
+        for (Group::member_citerator itr = groupSlot.begin(); itr != groupSlot.end(); itr++)
+        {
+            Player* member = sObjectMgr.GetPlayer(itr->guid);
+            if (member && (member != bot) &&
+               sServerFacade.IsAlive(member) &&
+               member->IsInWorld() &&
+               !member->IsBeingTeleported() &&
+               (member->GetMapId() == bot->GetMapId()) &&
+               (sServerFacade.getDistance2d(bot, member) <= GetRange()))
+            {
+                if (IsValid(target, member, bot))
+                    return true;
+            }
+        }
+    }
+
+    Player* master = GetMaster();
+    if (master && !bot->InBattleGround() && (!group || master->GetGroup() != group))
+    {
+        if (IsValid(target, master, bot))
+            return true;
+    }
+
+    return false;
 }
 
 void AttackersValue::AddTargetsOf(Player* player, std::set<Unit*>& targets, std::set<ObjectGuid>& invalidTargets, bool getOne)
@@ -346,6 +391,15 @@ bool AttackersValue::IsValid(Unit* target, Player* player, Player* owner, bool c
 {
     Player* playerToCheckAgainst = owner != nullptr ? owner : player;
 
+    // An explicit attack order is the player's pull: the target is valid before either
+    // side has threat, so it passes the combat-only gate below until the pull begins.
+    // Every other check (friendly, evade, range, CC, immunity) still applies.
+    bool explicitAttackTarget = false;
+    if (target)
+    {
+        if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst))
+            explicitAttackTarget = ai->GetAiObjectContext()->GetValue<ObjectGuid>("explicit attack target")->Get() == target->getObjectGuid();
+    }
     // Validate possible target
     if (validatePossibleTarget && !PossibleTargetsValue::IsValid(target, playerToCheckAgainst))
     {
@@ -359,10 +413,15 @@ bool AttackersValue::IsValid(Unit* target, Player* player, Player* owner, bool c
     Player* enemyPlayer = dynamic_cast<Player*>(target);
     if (enemyPlayer)
     {
-        // Don't consider enemy players if pvp strategy is not set
-        if (PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst) && !PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst)->HasStrategy("pvp", BotState::BOT_STATE_COMBAT))
+        // Don't consider enemy players if neither the battleground pvp
+        // strategy nor the open-world seek role is set.
+        if (PlayerbotAI* targetAi = PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst))
         {
-            return false;
+            if (!targetAi->HasStrategy("pvp", BotState::BOT_STATE_COMBAT) &&
+                !WorldPvpSeekChecks::IsSeeking(targetAi, playerToCheckAgainst))
+            {
+                return false;
+            }
         }
 
         // A masterless random bot that died to this named player recently does not
@@ -409,7 +468,7 @@ bool AttackersValue::IsValid(Unit* target, Player* player, Player* owner, bool c
         // (or was never fighting to begin with) stayed "valid" forever just by being nearby
         // and PvP-flagged, keeping "has attackers" true and the bot latched into combat
         // state with nothing to do (see AttackersValue::AddTargetsOf and InCombat()).
-        if (checkInCombat && !isDuelOpponent && !InCombat(target, player, (player == owner)))
+        if (checkInCombat && !explicitAttackTarget && !isDuelOpponent && !InCombat(target, player, (player == owner)))
         {
             bool isRtiTarget = false;
             if (PlayerbotAIStorage::Instance().GetAI(player) && !PlayerbotAIStorage::Instance().GetAI(player)->HasActivePlayerMaster())
@@ -438,7 +497,7 @@ bool AttackersValue::IsValid(Unit* target, Player* player, Player* owner, bool c
         }
 
         // If the target is not fighting the player (and if the owner bot is not pulling the target)
-        if (checkInCombat && !InCombat(target, player, (player == owner)))
+        if (checkInCombat && !explicitAttackTarget && !InCombat(target, player, (player == owner)))
         {
             bool isRtiTarget = false;
             if (PlayerbotAIStorage::Instance().GetAI(player) && !PlayerbotAIStorage::Instance().GetAI(player)->HasActivePlayerMaster())
@@ -475,6 +534,183 @@ bool AttackersValue::IsValid(Unit* target, Player* player, Player* owner, bool c
     return true;
 }
 
+bool AttackersValue::IsKeepoutSetAside(Unit* target, Player* bot)
+{
+    PlayerbotAI* ai = target && bot ? PlayerbotAIStorage::Instance().GetAI(bot) : nullptr;
+    if (!ai)
+        return false;
+    std::map<ObjectGuid, uint32>& setAside =
+        ai->GetAiObjectContext()->GetValue<std::map<ObjectGuid, uint32>&>("keepout set aside")->Get();
+    if (setAside.empty())
+        return false;
+    auto entry = setAside.find(target->getObjectGuid());
+    if (entry == setAside.end())
+        return false;
+    bool const isKeepoutCreature = PossibleTriggersValue::KeepoutFor(target) != nullptr;
+    bool const live = WorldTimer::getMSTime() < entry->second;
+    bool const isTank = PlayerbotAI::IsTank(bot);
+    // Line of sight and the ring test only for a mob that is no keep-out
+    // creature, and only while the entry could still hold (no world scan: the
+    // cached "possible triggers" list is the one the hold plans against).
+    bool hitsBotInSight = false;
+    bool stillRinged = false;
+    if (live && !isTank && !isKeepoutCreature)
+    {
+        hitsBotInSight = target->GetVictim() == bot && bot->IsWithinLOSInMap(target, true);
+        if (!hitsBotInSight)
+        {
+            // Ringed means: a listed creature of the cached list stands within
+            // its release ring of the mob. A mob with none counts as unringed
+            // at any distance from the bot (dragged out far, or run to a
+            // healer): a wrong lift costs one walk and one 3 s hold, and the
+            // set-aside then sticks again.
+            float const tx = target->GetPositionX(), ty = target->GetPositionY();
+            std::list<ObjectGuid> const& triggers =
+                ai->GetAiObjectContext()->GetValue<std::list<ObjectGuid>>("possible triggers")->Get();
+            for (ObjectGuid const& guid : triggers)
+            {
+                Unit* unit = ai->GetUnit(guid);
+                CreatureAuraKeepout const* row = PossibleTriggersValue::KeepoutFor(unit);
+                if (!row)
+                    continue;
+                float const dx = tx - unit->GetPositionX(), dy = ty - unit->GetPositionY();
+                if (CreatureAuraSetAsideRinged(*row, std::sqrt(dx * dx + dy * dy)))
+                {
+                    stillRinged = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (CreatureAuraSetAsideHolds(live, isKeepoutCreature, isTank, hitsBotInSight, stillRinged))
+        return true;
+    setAside.erase(entry);
+    return false;
+}
+
+bool AttackersValue::IsRunningMob(Unit* unit)
+{
+    if (!unit)
+        return false;
+    if (unit->HasUnitState(UNIT_STAT_FLEEING))
+        return true;
+    switch (unit->GetMotionMaster()->GetCurrentMovementGeneratorType())
+    {
+        case FLEEING_MOTION_TYPE:
+        case TIMED_FLEEING_MOTION_TYPE:
+        case ASSISTANCE_MOTION_TYPE:
+        case ASSISTANCE_DISTRACT_MOTION_TYPE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+float AttackersValue::RunnerDropYd(Unit* target, Player* bot)
+{
+    // An uninitialized spline answers (0,0,0): never read as the end of a run.
+    bool const runEndKnown = target->movespline->Initialized() && !target->movespline->Finalized();
+    float const runEndZ = runEndKnown ? target->movespline->FinalDestination().z : 0.0f;
+    return ai::RunnerDropYd(bot->GetPositionZ(), target->GetPositionZ(), runEndKnown, runEndZ);
+}
+
+// The way from `bot` to the lower of `target` and the end of its run: complete
+// (PATHFIND_NORMAL) or not, and a cliff on it (ai::PathHasCliff). One navmesh
+// path; the caller holds the verdict for kRunnerLedgeReadMs.
+static void ReadRunnerWay(Unit* target, Player* bot, bool& complete, bool& cliff)
+{
+    float tx = target->GetPositionX(), ty = target->GetPositionY(), tz = target->GetPositionZ();
+    if (target->movespline->Initialized() && !target->movespline->Finalized())
+    {
+        Vector3 const end = target->movespline->FinalDestination();
+        if (end.z < tz)
+        {
+            tx = end.x;
+            ty = end.y;
+            tz = end.z;
+        }
+    }
+    PathFinder path(bot);
+    path.calculate(tx, ty, tz, false);
+    complete = path.getPathType() == PATHFIND_NORMAL;
+    std::vector<ai::RunnerPathPoint> points;
+    ai::RunnerPathPoint front;
+    front.x = bot->GetPositionX();
+    front.y = bot->GetPositionY();
+    front.z = bot->GetPositionZ();
+    points.push_back(front);
+    for (Vector3 const& v : path.getPath())
+    {
+        ai::RunnerPathPoint point;
+        point.x = v.x;
+        point.y = v.y;
+        point.z = v.z;
+        points.push_back(point);
+    }
+    cliff = ai::PathHasCliff(points);
+}
+
+bool AttackersValue::RunnerLetGoAtLedge(Unit* target, Player* bot)
+{
+    PlayerbotAI* ai = bot ? PlayerbotAIStorage::Instance().GetAI(bot) : nullptr;
+    if (!ai)
+        return false;
+    AiObjectContext* context = ai->GetAiObjectContext();
+    std::map<ObjectGuid, ai::RunnerLedgeEntry>& book =
+        context->GetValue<std::map<ObjectGuid, ai::RunnerLedgeEntry>&>("runners let go")->Get();
+    uint32 const now = WorldTimer::getMSTime();
+    // Every access: what ran out goes, and the book never grows past its cap.
+    ai::PurgeRunnerBook(book, now);
+    if (!target || target->IsPlayer() || !target->IsInWorld() || !bot->IsInWorld() ||
+        target->GetMapId() != bot->GetMapId())
+        return false;
+    bool const running = IsRunningMob(target);
+    if (!running && book.empty())
+        return false; // the common case: nothing to read
+    ObjectGuid const guid = target->getObjectGuid();
+    // An explicit attack order (the player's or the commander's) is chased:
+    // it clears any let-go of that target too.
+    if (context->GetValue<ObjectGuid>("explicit attack target")->Get() == guid)
+    {
+        book.erase(guid);
+        return false;
+    }
+    ai::RunnerFacts facts;
+    facts.alive = target->IsAlive();
+    facts.running = running;
+    facts.dropYd = RunnerDropYd(target, bot);
+    auto entry = book.find(guid);
+    if (entry != book.end() && entry->second.letGoUntil > now)
+    {
+        if (facts.alive && ai::RunnerStaysLetGo(true, now, entry->second.letGoUntil, facts.dropYd))
+            return true;
+        entry->second.letGoUntil = 0; // back up on the bot's floor (or dead): a target again
+    }
+    // The cheap filters first: a ledge candidate of a bot bound to an active
+    // dungeon run (random bots and normal groups are never touched).
+    if (!ai::RunnerOverLedge(facts) || !TortoiseBots::RunReleaseHold::HeldByRun(bot))
+        return false;
+    bool complete = true, cliff = false;
+    if (entry != book.end() && entry->second.readUntil > now)
+    {
+        cliff = entry->second.cliff; // the verdict below: an incomplete way is stored as a cliff
+    }
+    else
+    {
+        ReadRunnerWay(target, bot, complete, cliff);
+        cliff = cliff || !complete;
+        ai::RunnerLedgeEntry& read = book[guid];
+        read.readUntil = now + ai::kRunnerLedgeReadMs;
+        read.cliff = cliff;
+        entry = book.find(guid);
+    }
+    if (!ai::LetRunnerGoAtLedge(true, false, facts, true, cliff))
+        return false;
+    entry->second.letGoUntil = now + ai::kRunnerLetGoMs;
+    ai::PurgeRunnerBook(book, now);
+    return true;
+}
+
 bool AttackersValue::IgnoreTarget(Unit* target, Player* playerToCheckAgainst)
 {
     if (!PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst))
@@ -482,6 +718,11 @@ bool AttackersValue::IgnoreTarget(Unit* target, Player* playerToCheckAgainst)
 
     PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(playerToCheckAgainst);
     AiObjectContext* context = ai->GetAiObjectContext();
+
+    // Chases stop at ledges: a runner more than 6 yd below the bot's floor
+    // (or running there) is let go, and stays let go while it is down there.
+    if (RunnerLetGoAtLedge(target, playerToCheckAgainst))
+        return true;
 
     // A target the bot gave up on (out of line of sight with no way to close the
     // distance, see ReachTargetAction) is left alone for a while - unless it comes
@@ -504,6 +745,11 @@ bool AttackersValue::IgnoreTarget(Unit* target, Player* playerToCheckAgainst)
             return true;
         unreachable.erase(givenUp);
     }
+
+    // A target the creature aura keep-out set aside (its own book, see
+    // IsKeepoutSetAside).
+    if (IsKeepoutSetAside(target, playerToCheckAgainst))
+        return true;
 
     // The same for the kind of creature: after a give-up the bot leaves that kind alone for
     // a while, so a spot full of them is not given up on one creature at a time.
@@ -542,10 +788,17 @@ bool AttackersValue::IgnoreTarget(Unit* target, Player* playerToCheckAgainst)
             return true;
     }
 
-    //Ignore Hard hostiles while not already fighting.
-    if (target->GetLevel() > (playerToCheckAgainst->GetLevel() + 5) && ai->GetState() == BotState::BOT_STATE_NON_COMBAT)
+    // Ignore hard hostiles while not already fighting - but never a mob that
+    // is already fighting this bot. The old shape refused a +6 attacker on a
+    // long trip outright, which kept it out of "attackers", "has attackers"
+    // and the grind pick alike: no combat state, no revenge order, the bot
+    // walked on while being hit. Answering pulls nothing new; flee and
+    // outnumbered still decide whether the fight is winnable.
+    bool const alreadyFightingBot = target->GetVictim() == playerToCheckAgainst ||
+        target->GetThreatManager().getThreat(playerToCheckAgainst) > 0.0f;
+    if (ai::ShouldIgnoreHardHostile((int)target->GetLevel(), (int)playerToCheckAgainst->GetLevel(), alreadyFightingBot) && ai->GetState() == BotState::BOT_STATE_NON_COMBAT)
     {
-        //When traveling a long distance.
+        // When traveling a long distance.
         if (AI_VALUE(bool, "travel target traveling") && AI_VALUE2(float, "distance", "travel target") > sPlayerbotAIConfig.reactDistance)
             return true;
 

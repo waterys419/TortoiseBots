@@ -58,8 +58,29 @@ bool InvalidTargetValue::Calculate()
     // explicit attack target pass the combat-only gate until the pull begins.
     const bool explicitAttackTarget = qualifier == "current target" &&
         AI_VALUE(ObjectGuid, "attack target") == target->getObjectGuid();
+
+    // A held CC mark (crowd-controlled, under a CC cast bar or in its hold
+    // window, while other enemies still fight the group) is nobody's
+    // current target: a bot that took it before the mark (or picked it up
+    // as a loose mob) otherwise keeps hitting, taunting and DoTing it and
+    // breaks every sheep (in-game retest: sheep broke 0.07-2.4 s after landing).
+    // A free mark (CC missed or broke) is a normal enemy and stays valid.
+    // Exempt: the player's own attack/pull order, and a bot casting crowd
+    // control at it (the cc order selects the mark; dropping it would
+    // interrupt that very Polymorph). "rti cc" defaults to Moon on every
+    // bot, so it cannot tell the CC owner apart.
+    if (qualifier == "current target" && !explicitAttackTarget &&
+        AI_VALUE(ObjectGuid, "explicit attack target") != target->getObjectGuid() &&
+        !FindNonCcTargetStrategy::IsCastingCcAt(bot, target))
+    {
+        CcGuard ccGuard(ai);
+        if (ccGuard.IsHeldCcMark(target))
+            return true;
+    }
+    // An explicit order carries the walk to the target: keep the same wider ceiling
+    // here or the order is accepted and then discarded as invalid on the next tick.
     const bool validTarget = PossibleAttackTargetsValue::IsValid(target, bot,
-        sPlayerbotAIConfig.sightDistance, false, !explicitAttackTarget);
+        explicitAttackTarget ? sPlayerbotAIConfig.reactDistance : sPlayerbotAIConfig.sightDistance, false, !explicitAttackTarget);
     if (!validTarget)
     {
         std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "possible attack targets");

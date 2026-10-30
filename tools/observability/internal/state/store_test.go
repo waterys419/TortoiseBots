@@ -31,9 +31,13 @@ func newTestStore(c *clock) *Store {
 }
 
 func heartbeat(seq uint64, bots uint32) *model.HeartbeatPayload {
+	return heartbeatHumans(seq, bots, 1)
+}
+
+func heartbeatHumans(seq uint64, bots, humans uint32) *model.HeartbeatPayload {
 	return &model.HeartbeatPayload{
 		V: model.ProtocolVersion, Seq: seq, Type: "HEARTBEAT",
-		BotsCount: bots, HumansCount: 1, TickDiffMs: 50,
+		BotsCount: bots, HumansCount: humans, TickDiffMs: 50,
 		States: model.StateRatios{Idle: 1},
 	}
 }
@@ -126,7 +130,7 @@ func TestEmptyRosterHeartbeatPublishes(t *testing.T) {
 	s.ApplyHeartbeat(heartbeat(1, 1))
 	s.ApplyBatch(batch(1, 0, 1, bot(1, "Alpha", 0)))
 
-	if published := s.ApplyHeartbeat(heartbeat(2, 0)); !published {
+	if published := s.ApplyHeartbeat(heartbeatHumans(2, 0, 0)); !published {
 		t.Fatal("empty roster heartbeat did not publish")
 	}
 
@@ -507,5 +511,209 @@ func TestServerInfoStoredAndSessionGated(t *testing.T) {
 	s.ApplyHeartbeat(hb2)
 	if s.ServerInfo() != nil {
 		t.Fatal("session change must clear server info")
+	}
+}
+
+func TestHistorySamplesHeartbeatSeries(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+	if got := len(s.History().Samples); got != 0 {
+		t.Fatalf("fresh store must have no history, got %d", got)
+	}
+
+	// Two heartbeats 2 s apart: two samples, oldest first, carrying
+	// the population and lag series the dashboard charts draw.
+	hb := heartbeat(1, 10)
+	hb.HumansCount = 3
+	hb.LagP50Ms, hb.LagP95Ms = 20, 90
+	s.ApplyHeartbeat(hb)
+	c.Advance(2 * time.Second)
+	hb2 := heartbeat(2, 11)
+	hb2.HumansCount = 4
+	hb2.LagP50Ms, hb2.LagP95Ms = 25, 95
+	s.ApplyHeartbeat(hb2)
+
+	h := s.History()
+	if len(h.Samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(h.Samples))
+	}
+	first, second := h.Samples[0], h.Samples[1]
+	if first.Bots != 10 || first.Humans != 3 || first.LagP50Ms != 20 || first.LagP95Ms != 90 {
+		t.Fatalf("first sample wrong: %+v", first)
+	}
+	if second.Bots != 11 || second.Humans != 4 || second.LagP50Ms != 25 || second.LagP95Ms != 95 {
+		t.Fatalf("second sample wrong: %+v", second)
+	}
+	if second.At-first.At != 2000 {
+		t.Fatalf("samples must be 2 s apart in unix-millis, got %d -> %d", first.At, second.At)
+	}
+}
+
+func TestHistoryBoundedAndSessionClipped(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	// Overfill: the oldest samples drop, the buffer never grows.
+	for i := uint64(1); i <= historyMaxSamples+50; i++ {
+		s.ApplyHeartbeat(heartbeat(i, uint32(i)))
+		c.Advance(2 * time.Second)
+	}
+	h := s.History()
+	if len(h.Samples) != historyMaxSamples {
+		t.Fatalf("history must cap at %d, got %d", historyMaxSamples, len(h.Samples))
+	}
+	if h.Samples[0].Bots != 51 {
+		t.Fatalf("oldest sample must be seq 51, got bots=%d", h.Samples[0].Bots)
+	}
+	if h.Samples[historyMaxSamples-1].Bots != historyMaxSamples+50 {
+		t.Fatalf("newest sample wrong: %+v", h.Samples[historyMaxSamples-1])
+	}
+
+	// A new game-server session clips the series: the restarted pool
+	// starts its charts empty, not with the previous pool's numbers.
+	hb := heartbeat(1, 7)
+	hb.Session = 99
+	s.ApplyHeartbeat(hb)
+	h = s.History()
+	if len(h.Samples) != 1 || h.Samples[0].Bots != 7 {
+		t.Fatalf("session change must clip history to the new sample: %+v", h.Samples)
+	}
+}
+
+func TestHistoryFallsBackToTickAverage(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	// Older modules send no lag percentiles: the seed must apply the
+	// same lag_p95||diff_avg||diff fallback the live chart uses, or a
+	// refresh draws a flat zero line where live draws the average.
+	hb := heartbeat(1, 5)
+	hb.TickDiffMs, hb.TickAvgMs = 40, 55
+	s.ApplyHeartbeat(hb)
+	h := s.History()
+	if len(h.Samples) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(h.Samples))
+	}
+	if h.Samples[0].LagP50Ms != 55 || h.Samples[0].LagP95Ms != 55 {
+		t.Fatalf("lag must fall back to the tick average: %+v", h.Samples[0])
+	}
+}
+
+func TestHistoryCarriesIssueCounts(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	// A stuck bot opens a STUCK episode; once it passes the 5 min
+	// surface gate, the next heartbeat sample carries the count.
+	stuck := bot(1, "Stuck", 0)
+	stuck.State = "moving"
+	seq := uint64(0)
+	publish := func() {
+		seq++
+		s.ApplyHeartbeat(heartbeat(seq, 1))
+		s.ApplyBatch(batch(seq, 0, 1, stuck))
+	}
+	publish()
+	c.Advance(61 * time.Second)
+	publish()
+	c.Advance(5 * time.Minute)
+	publish()
+	c.Advance(2 * time.Second)
+	s.ApplyHeartbeat(heartbeat(seq+1, 1))
+
+	h := s.History()
+	if len(h.Samples) != 4 {
+		t.Fatalf("expected 4 samples, got %d", len(h.Samples))
+	}
+	last := h.Samples[3]
+	if last.Issues["STUCK"] != 1 {
+		t.Fatalf("last sample must carry the open STUCK count: %+v", last.Issues)
+	}
+	if h.Samples[0].Issues["STUCK"] != 0 {
+		t.Fatalf("pre-episode sample must carry zero: %+v", h.Samples[0].Issues)
+	}
+}
+
+func TestPlayerRowsStayInRosterButOutOfPoolKpis(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	a := xbot(1, "Alpha", 10, 0, 1000)
+	a.State = "combat"
+	p := xbot(2, "Minertest", 20, 0, 1000)
+	p.Player = true
+	p.GroupID = 7
+	p.State = "idle"
+	s.ApplyHeartbeat(heartbeat(1, 2))
+	s.ApplyBatch(batch(1, 0, 1, a, p))
+
+	snap := s.Snapshot()
+	if len(snap.Bots) != 2 {
+		t.Fatalf("expected roster of 2 (bot + player), got %d", len(snap.Bots))
+	}
+	var got *model.BotSnapshot
+	for i := range snap.Bots {
+		if snap.Bots[i].GUID == 2 {
+			got = &snap.Bots[i]
+		}
+	}
+	if got == nil || !got.Player || got.GroupID != 7 {
+		t.Fatalf("player row lost its marker: %+v", snap.Bots)
+	}
+	if len(got.Trail) != 0 {
+		t.Fatalf("player rows must not carry trails")
+	}
+	g := snap.Grinding
+	if g.BotsTracked != 1 {
+		t.Fatalf("pool KPIs must exclude players, tracked=%d", g.BotsTracked)
+	}
+	if g.StateCounts["idle"] != 0 || g.StateCounts["combat"] != 1 {
+		t.Fatalf("state counts must exclude players: %+v", g.StateCounts)
+	}
+	if len(s.Issues().Active) != 0 {
+		t.Fatalf("players must never open issues")
+	}
+}
+
+func TestPlayersOnlyCycleDoesNotWipeRoster(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	p := xbot(2, "Minertest", 20, 0, 1000)
+	p.Player = true
+	p.State = "idle"
+	// BotsCount is 0 but a player batch is in flight: the heartbeat must
+	// not publish an empty roster over it.
+	if published := s.ApplyHeartbeat(heartbeatHumans(1, 0, 1)); published {
+		t.Fatal("heartbeat published empty roster while player batches were in flight")
+	}
+	if published := s.ApplyBatch(batch(1, 0, 1, p)); !published {
+		t.Fatal("players-only cycle did not publish")
+	}
+	snap := s.Snapshot()
+	if len(snap.Bots) != 1 || !snap.Bots[0].Player {
+		t.Fatalf("expected 1 player row, got %+v", snap.Bots)
+	}
+}
+
+// A bot that jumps farther than it can walk between two snapshots (a summon, a teleport) starts its breadcrumb trail over, so the map
+// never draws a straight line through the world to the new place.
+func TestTrailBreaksOnTeleport(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+	s.ApplyHeartbeat(heartbeat(1, 1))
+	s.ApplyBatch(batch(1, 0, 1, bot(1, "Alpha", 0)))
+	c.Advance(2 * time.Second)
+	s.ApplyHeartbeat(heartbeat(2, 1))
+	s.ApplyBatch(batch(2, 0, 1, bot(1, "Alpha", 40))) // 20 yd/s: a mount at full tilt
+	if got := len(s.Snapshot().Bots[0].Trail); got != 2 {
+		t.Fatalf("a fast ride keeps the trail: %d points", got)
+	}
+	c.Advance(2 * time.Second)
+	s.ApplyHeartbeat(heartbeat(3, 1))
+	s.ApplyBatch(batch(3, 0, 1, bot(1, "Alpha", 400))) // summoned
+	tr := s.Snapshot().Bots[0].Trail
+	if len(tr) != 1 || tr[0].X != 400 {
+		t.Fatalf("a teleport starts the trail over: %+v", tr)
 	}
 }

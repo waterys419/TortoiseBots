@@ -4,6 +4,14 @@
 #include "ChangeTalentsAction.h"
 #include "playerbot/AiFactory.h"
 #include "playerbot/PlayerbotFactory.h"
+#include "../../../../runtime/HireLifecycle.h"
+#include "../../../../runtime/policy/hire/HireGearPolicy.h"
+#include "../../../../runtime/policy/hire/HireRespecPolicy.h"
+#include "../../../../runtime/HireTierRequestPolicy.h"
+#include "../../../../runtime/HireProvisionService.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
+#include "../../../../runtime/policy/class/ShamanTankKitPolicy.h"
 
 using namespace ai;
 
@@ -98,7 +106,7 @@ bool ChangeTalentsAction::Execute(Event& event)
                         if (paths.size() > 1)
                             out << "Found " << paths.size() << " possible specs to choose from. ";
 
-                        TalentPath* path = PickPremadePath(paths, sRandomBotFacade.IsRandomBot(bot));
+                        TalentPath* path = PickPremadePath(bot->GetClass(), paths, sRandomBotFacade.IsRandomBot(bot));
                         TalentSpec newSpec = *GetBestPremadeSpec(bot, path->id);
                         std::string specLink = newSpec.GetTalentLink();
                         newSpec.CropTalents(bot);
@@ -161,18 +169,30 @@ bool ChangeTalentsAction::Execute(Event& event)
     // and the reset rebuilds defaults for the newly learned topology.
     if (TalentSpec(bot).GetTalentLink() != previousTalentLink)
     {
-        sPlayerbotDbStore.InvalidateStrategySnapshots(ai);
-        ai->UpdateTalentSpec();
-        ai->ResetStrategies();
+        uint8_t tier = TortoiseBots::HireLifecycle::Instance().GearTier(bot->GetObjectGuid());
         // Issue #189 Phase 3: explicit respec re-scores gear incrementally
         // for the new spec. Random-pool only; never wipes, level-up auto
-        // path passes through here too and stays incremental.
-        if (!param.empty() && sRandomBotFacade.IsRandomBot(bot))
+        // path passes through here too and stays incremental. A hire in a
+        // #490 tier kit refits below instead of re-rolling pool gear.
+        if (!param.empty() && sRandomBotFacade.IsRandomBot(bot) && tier == 0)
         {
             PlayerbotFactory gear(bot, bot->GetLevel());
+            // Owner rule: a pool bot's re-gear stays inside the pool
+            // generated-gear cap, same as its seed.
+            gear.UsePoolGearCap();
             gear.UpgradeGearBest();
             bot->SaveToDB();
         }
+        sPlayerbotDbStore.InvalidateStrategySnapshots(ai);
+        ai->UpdateTalentSpec();
+        ai->ResetStrategies();
+        // Issue #490 PR 3: a tier-kit hire keeps its tier but takes the new
+        // spec's kit (same tier, no new charge). The forced role follows the
+        // new build first (ret -> holy, warrior dps -> tank), so the refit
+        // and the rebuilt strategies agree; then the reset runs again under
+        // the new role. No set for the new spec keeps the current kit.
+        if (!param.empty() && tier > 0)
+            RespecHireGearKit(bot, out);
     }
 
     ai->TellPlayer(requester, out, PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
@@ -188,7 +208,11 @@ std::vector<TalentPath*> ChangeTalentsAction::getPremadePaths(uint8 cls, std::st
         if (!findName.empty() && path.name.find(findName) == std::string::npos)
             continue;
 
-        if (role != BotRoles::BOT_ROLE_NONE && (AiFactory::GetPlayerRoles(cls, path.talentSpec.back().highestTree()) & role) == 0)
+        // A named request pins the build, so no role filter: the 7.3 tank
+        // build's highest tree is 1 (Enhancement = DPS), and a TANK filter
+        // would drop it and silently fall back to a random spec (issue #1125).
+        if (findName.empty() && role != BotRoles::BOT_ROLE_NONE &&
+            (AiFactory::GetPlayerRoles(cls, path.talentSpec.back().highestTree()) & role) == 0)
             continue;
 
         ret.push_back(&path);
@@ -230,6 +254,56 @@ TalentPath* ChangeTalentsAction::getPremadePath(uint8 cls, int id)
     return &sPlayerbotAIConfig.classSpecs[cls].talentPath[0];
 }
 
+std::string ChangeTalentsAction::GetPremadePathName(uint8 cls, int id)
+{
+    for (auto& path : sPlayerbotAIConfig.classSpecs[cls].talentPath)
+    {
+        if (id == path.id)
+            return path.name;
+    }
+    return std::string();
+}
+
+void ChangeTalentsAction::RespecHireGearKit(Player* bot, std::ostringstream& out)
+{
+    if (!bot || !ai)
+        return;
+    uint8_t cls = bot->GetClass();
+    uint8_t tier = TortoiseBots::HireLifecycle::Instance().GearTier(bot->GetObjectGuid());
+    if (!TortoiseBots::HireGearTierEligible(bot->GetLevel(), sPlayerbotAIConfig.hireGearTiersEnabled, tier))
+        return;
+    // New build's role first: the premade filter in getPremadePaths and the
+    // strategy rebuild below must agree. Druid feral reports both roles, so
+    // keep the tank bit only when the hire already tanked. The shaman tank
+    // build (7.3) reads tab 1 = DPS, so keep the tank bit whenever the bot
+    // was already tanking (forced role TANK from factory/hire/role order).
+    ai::BotRoles buildRole = AiFactory::GetPlayerRoles(cls,
+        static_cast<uint8>(AiFactory::GetPlayerSpecTab(bot)));
+    uint8_t role = static_cast<uint8_t>(buildRole);
+    if (cls == CLASS_DRUID && (buildRole & (ai::BOT_ROLE_TANK | ai::BOT_ROLE_DPS)))
+        role = (ai->GetForcedRole() & ai::BOT_ROLE_TANK) ? ai::BOT_ROLE_TANK : ai::BOT_ROLE_DPS;
+    if (cls == CLASS_SHAMAN && (ai->GetForcedRole() & ai::BOT_ROLE_TANK))
+        role = ai::BOT_ROLE_TANK;
+    if (role != ai::BOT_ROLE_NONE && TortoiseBots::HireProvisionService::ClassCanRole(cls, role))
+        ai->SetForcedRole(role);
+    else
+        role = ai->GetForcedRole();
+    uint32 specNo = sRandomBotFacade.GetValue(bot->GetGUIDLow(), "specNo");
+    std::string pathName = specNo > 0 ? GetPremadePathName(cls, static_cast<int>(specNo - 1)) : std::string();
+    int specIndex = TortoiseBots::HireSpecIndexForPathName(cls, pathName.c_str(), role);
+    char const* specKey = TortoiseBots::ResolveHireGearSpecKey(cls, specIndex, role);
+    if (!specKey)
+        return;
+    if (TortoiseBots::HireProvisionService::EquipHireGearSet(bot, ai, cls, specKey, bot->GetRace(), tier))
+    {
+        bot->SaveToDB();
+        ai->UpdateTalentSpec();
+        ai->ResetStrategies();
+    }
+    else
+        out << " (no " << TortoiseBots::HireTierKitName(tier) << " set for the new spec; keeping current gear)";
+}
+
 void ChangeTalentsAction::listPremadePaths(uint8 cls, std::vector<TalentPath*> paths, std::ostringstream* out)
 {
     if (paths.size() == 0)
@@ -248,14 +322,24 @@ void ChangeTalentsAction::listPremadePaths(uint8 cls, std::vector<TalentPath*> p
     *out << ".";
 }
 
-TalentPath* ChangeTalentsAction::PickPremadePath(std::vector<TalentPath*> paths, bool useProbability)
+// Roll weight of one premade path in a PickPremadePath draw. Random pool bots
+// roll by configured probability; other bots roll evenly (weight 1). Either way
+// the 7.3 shaman tank weighs 0 while AiPlayerbot.ShamanTankEnabled is off
+// (issue #1125).
+static int PremadeRollWeightFor(uint8 cls, TalentPath* path, bool useProbability)
+{
+    int weight = useProbability ? path->probability : 1;
+    return static_cast<int>(TortoiseBots::PremadePathRollWeight(cls, path->id, weight, sPlayerbotAIConfig.shamanTankEnabled));
+}
+
+TalentPath* ChangeTalentsAction::PickPremadePath(uint8 cls, std::vector<TalentPath*> paths, bool useProbability)
 {
     if (paths.size() == 1)
         return paths[0];
 
     int totProbability = 0;
     for (auto path : paths)
-        totProbability += useProbability ? path->probability : 1;
+        totProbability += PremadeRollWeightFor(cls, path, useProbability);
 
     if (totProbability <= 0)
         return paths[0];
@@ -270,7 +354,7 @@ TalentPath* ChangeTalentsAction::PickPremadePath(std::vector<TalentPath*> paths,
     int curProbability = 0;
     for (auto path : paths)
     {
-        curProbability += (useProbability ? path->probability : 1);
+        curProbability += PremadeRollWeightFor(cls, path, useProbability);
         if (curProbability > roll)
         {
             chosen = path;
@@ -421,7 +505,7 @@ bool ChangeTalentsAction::AutoSelectTalents(Player* bot, std::ostringstream* out
     }
     else
     {
-        specId = PickPremadePath(paths, sRandomBotFacade.IsRandomBot(bot))->id;
+        specId = PickPremadePath(bot->GetClass(), paths, sRandomBotFacade.IsRandomBot(bot))->id;
         TalentSpec newSpec = *GetBestPremadeSpec(bot, specId);
         specLink = newSpec.GetTalentLink();
         newSpec.CropTalents(bot);
@@ -467,6 +551,10 @@ bool AutoSetTalentsAction::Execute(Event& event)
     // character has a human-configured build; only an explicit "talents ..."
     // command should be allowed to change it.
     if (ai->IsOwnedBot())
+        return false;
+    // Issue #872: autonomous alts never auto-spend talents (B12). Points
+    // stay unspent for the player; explicit owner orders still work.
+    if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
         return false;
 
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();

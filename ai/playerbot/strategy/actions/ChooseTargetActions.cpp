@@ -5,8 +5,13 @@
 #include "playerbot/TravelMgr.h"
 #include "playerbot/strategy/generic/PullStrategy.h"
 #include "playerbot/strategy/values/FreeMoveValues.h"
-#include "playerbot/PullRegenPolicy.h"
+#include "playerbot/policy/pull/PullRegenPolicy.h"
+#include "playerbot/SurvivePolicy.h"
 #include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
+#include "playerbot/strategy/values/GrindTargetValue.h"
+#include "playerbot/strategy/values/WorldPvpSeekChecks.h"
+#include "playerbot/strategy/values/WorldPvpSeekLog.h"
+#include "../../../../runtime/policy/pvp/WorldPvpFightPolicy.h"
 #include <map>
 
 bool DpsAssistAction::isUseful()
@@ -37,9 +42,6 @@ bool AttackAnythingAction::isUseful()
     if (!target || !ai->IsSafe(target))
         return false;
 
-    if (ai->ContainsStrategy(STRATEGY_TYPE_HEAL) && !ai->HasStrategy("offdps", BotState::BOT_STATE_COMBAT))
-        return false;
-
     // Revenge first: a mob already fighting the bot (victim set) is always
     // answered, even wounded and even while travelling - this is self-defence
     // on every trip, including a completed hand-in walk. Like the donor (whose
@@ -49,9 +51,23 @@ bool AttackAnythingAction::isUseful()
     // fighting back (quest-taker trips: 5% fought back within 90 s vs 60-93%
     // elsewhere, Oct 2026 pool). Answering an attacker that already holds the
     // bot as victim pulls nothing new, so there is no adds risk.
-    if (!target->IsPlayer() && target->IsHostileTo(bot) &&
-        target->GetVictim() == bot)
+    bool const isRevenge = !target->IsPlayer() && target->IsHostileTo(bot) &&
+        ai::ShouldAnswerAttacker(target->GetVictim() == bot);
+    if (isRevenge)
         return true;
+
+    // Healers start no fights on their own: without a dps kit (offdps) the
+    // order would arm a target the combat engine never swings at. Revenge
+    // above already answered, so this gate only ever refuses a NEW pull.
+    if (ai->ContainsStrategy(STRATEGY_TYPE_HEAL) && !ai->HasStrategy("offdps", BotState::BOT_STATE_COMBAT))
+        return false;
+
+    // A pool bot fresh from a revive (50% health, standing where it died or
+    // at the graveyard) pulls nothing for the revive grace minute: it rests
+    // first. Over half of all revives died again within 10 min (Oct 2026
+    // pool). Revenge above still answers anything that attacks it.
+    if (ai->InReviveGrace() && sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster())
+        return false;
 
     // A finished quest waiting at its taker is the bot's own business: the walk
     // to the hand-in must not lose to "attack before being attacked", or a bot
@@ -76,7 +92,7 @@ bool AttackAnythingAction::isUseful()
     // answered, so the gate below only runs with no attacker holding the bot.
     // Pool-only (masterless random): owned bots and bots with a real
     // player master keep today's behaviour.
-    if (!bot->InBattleGround() && sRandomBotFacade.IsRandomBot(bot) && !ai->HasRealPlayerMaster() &&
+    if (!bot->InBattleGround() && sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster() &&
         bot->GetAttackers().empty())
     {
         uint8 const healthPct = AI_VALUE2(uint8, "health", "self target");
@@ -109,6 +125,10 @@ bool ai::AttackAnythingAction::isPossible()
 
 bool ai::AttackAnythingAction::Execute(Event& event)
 {
+    // Recheck cached picks before AttackAction can arm a target or start moving.
+    if (!GrindTargetValue::IsAllowedInstanceTarget(ai, GetTarget()))
+        return false;
+
     bool result = AttackAction::Execute(event);
     if (result)
     {
@@ -349,9 +369,116 @@ bool ai::AttackAnythingAction::GiveUpOnGrindTarget(Unit* target)
     return true;
 }
 
+// An enemy player picked by "attack enemy player" or "attack enemy flag carrier" is
+// usually not fighting the bot yet. Attack() only selects it and arms the swing; the
+// combat engine's "invalid target" check then refused it on the next tick, because a
+// player counts as a valid target only once it is fighting the bot
+// (AttackersValue::InCombat) or is the bot's "attack target". The target was dropped,
+// combat ended, the non-combat engine gave the same order again - and the bot stood
+// still in mid-field with the order "succeeding" every tick. Arm "attack target" as
+// the grind order does, and carry the walk with the order; the reach action gives up
+// after 15 s without headway and blacklists the player ("unreachable targets", which
+// EnemyPlayersValue honours), so the bot goes back to its objective.
+static bool CommitEnemyPlayerOrder(PlayerbotAI* botAi, Unit* target, Event& event)
+{
+    botAi->GetAiObjectContext()->GetValue<ObjectGuid>("attack target")->Set(target->getObjectGuid());
+
+    const bool rangedKit = botAi->HasStrategy("ranged", BotState::BOT_STATE_COMBAT) &&
+        !botAi->HasStrategy("close", BotState::BOT_STATE_COMBAT);
+    return botAi->DoSpecificAction(rangedKit ? "reach spell" : "reach melee", event, true);
+}
+
 bool AttackEnemyPlayerAction::isUseful()
 {
-    return !sPlayerbotAIConfig.IsInPvpProhibitedZone(sServerFacade.GetAreaId(bot));
+    // A flag carrier runs the flag home instead of starting fights (mod-playerbots
+    // 79bd428 refuses this order to a carrier too).
+    if (bot->HasAura(23333) || bot->HasAura(23335))
+        return false;
+
+    if (sPlayerbotAIConfig.IsInPvpProhibitedZone(sServerFacade.GetAreaId(bot)))
+        return false;
+
+    if (!bot->InBattleGround() && WorldPvpSeekChecks::IsSeeking(ai, bot))
+    {
+        Unit* target = GetTarget();
+        Player* enemy = dynamic_cast<Player*>(target);
+        if (!enemy)
+        {
+            ai->worldPvpPursuitGuidLow_ = 0;
+            ai->worldPvpPursuitStartMs_ = 0;
+            return false;
+        }
+
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (ai->worldPvpPursuitGuidLow_ == enemy->GetGUIDLow() && ai->worldPvpPursuitStartMs_)
+        {
+            if (!TortoiseBots::WorldPvpPursuitHolds(ai->worldPvpPursuitStartMs_, nowMs,
+                bot->IsWithinDist(enemy, sPlayerbotAIConfig.sightDistance)))
+            {
+                ai->worldPvpPursuitGuidLow_ = 0;
+                ai->worldPvpPursuitStartMs_ = 0;
+                return false;
+            }
+            return true;
+        }
+
+        if (!WorldPvpSeekChecks::IsSeekTarget(ai, bot, enemy))
+        {
+            ai->worldPvpPursuitGuidLow_ = 0;
+            ai->worldPvpPursuitStartMs_ = 0;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool AttackEnemyPlayerAction::Execute(Event& event)
+{
+    if (!AttackAction::Execute(event))
+        return false;
+
+    Unit* target = GetTarget();
+    if (!target)
+        return true;
+
+    if (!bot->InBattleGround() && WorldPvpSeekChecks::IsSeeking(ai, bot))
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (ai->worldPvpCampGuidLow_ && ai->worldPvpCampStartMs_ &&
+            TortoiseBots::WorldPvpCampExpired(ai->worldPvpCampStartMs_, nowMs))
+        {
+            ai->worldPvpIgnoreGuidLow_ = ai->worldPvpCampGuidLow_;
+            ai->worldPvpIgnoreStartMs_ = nowMs;
+            ai->worldPvpCampGuidLow_ = 0;
+            ai->worldPvpCampStartMs_ = 0;
+        }
+        uint32 const targetLow = target->GetGUIDLow();
+        if (ai->worldPvpPursuitGuidLow_ != targetLow)
+        {
+            ai->worldPvpPursuitGuidLow_ = targetLow;
+            ai->worldPvpPursuitStartMs_ = nowMs;
+            WorldPvpSeekLog::LogEngagement(ai, bot, target);
+        }
+    }
+
+    // The nested reach booked its own walk wait; carry it as this action's duration
+    // (see AttackAnythingAction::Execute), or release the default when nothing moved.
+    SetDuration(CommitEnemyPlayerOrder(ai, target, event) ? ai->GetAIInternalUpdateDelay() : sPlayerbotAIConfig.reactDelay);
+    return true;
+}
+
+bool AttackEnemyFlagCarrierAction::Execute(Event& event)
+{
+    if (!AttackAction::Execute(event))
+        return false;
+
+    Unit* target = GetTarget();
+    if (!target)
+        return true;
+
+    SetDuration(CommitEnemyPlayerOrder(ai, target, event) ? ai->GetAIInternalUpdateDelay() : sPlayerbotAIConfig.reactDelay);
+    return true;
 }
 
 bool AttackEnemyFlagCarrierAction::isUseful()
@@ -383,19 +510,24 @@ bool SelectNewTargetAction::Execute(Event& event)
         }
     }
 
-    // Clear the target variables
+    // Clear the target variables. An explicit order target is exempt: it lives out to
+    // the order range, not the background scan range, and clearing it here would drop
+    // the very order the bot is walking to.
+    ObjectGuid explicitAttackTarget = AI_VALUE(ObjectGuid, "explicit attack target");
     ObjectGuid attackTarget = AI_VALUE(ObjectGuid, "attack target");
     std::list<ObjectGuid> possible = AI_VALUE(std::list<ObjectGuid>, "possible targets no los");
-    if (attackTarget && find(possible.begin(), possible.end(), attackTarget) == possible.end())
+    if (attackTarget && attackTarget != explicitAttackTarget &&
+        find(possible.begin(), possible.end(), attackTarget) == possible.end())
     {
         SET_AI_VALUE(ObjectGuid, "attack target", ObjectGuid());
     }
 
-    ObjectGuid explicitAttackTarget = AI_VALUE(ObjectGuid, "explicit attack target");
     Unit* explicitTarget = explicitAttackTarget ? ai->GetUnit(explicitAttackTarget) : nullptr;
+    // Same wider ceiling as the order itself: a target inside order range must survive
+    // reselection so the reach chain can walk the bot to it.
     if (explicitAttackTarget && (!explicitTarget ||
         !PossibleAttackTargetsValue::IsValid(explicitTarget, bot,
-            sPlayerbotAIConfig.sightDistance, false, false)))
+            sPlayerbotAIConfig.reactDistance, false, false)))
     {
         SET_AI_VALUE(ObjectGuid, "explicit attack target", ObjectGuid());
     }

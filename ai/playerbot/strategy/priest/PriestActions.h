@@ -1,5 +1,6 @@
 #pragma once
 #include "playerbot/strategy/actions/GenericActions.h"
+#include "playerbot/policy/heal/ShieldTargetPolicy.h"
 #include "playerbot/AoeFearPolicy.h"
 
 namespace ai
@@ -26,11 +27,21 @@ namespace ai
     class CastPowerWordShieldOnPartyAction : public HealPartyMemberAction
     {
     public:
-        CastPowerWordShieldOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "power word: shield") {}
+        // mod-playerbots parity (PriestActions.h:73): the donor shields at
+        // VERY_HIGH efficiency, so the almost-full tier is reachable — with
+        // the MEDIUM default ShouldStartHeal vetoes shields at/above medium.
+        CastPowerWordShieldOnPartyAction(PlayerbotAI* ai) : HealPartyMemberAction(ai, "power word: shield", 15, HealManaEfficiency::VERY_HIGH) {}
         bool isUseful() override
         {
             Unit* target = GetTarget();
             if (target && ai->HasAura(6788, target))
+                return false;
+            // A shield eats the hits a rage tank lives on (absorbed hits
+            // give no rage), so above the critical band the rows fall
+            // through to direct heals; the critical rows keep the shield.
+            if (target && !ShouldShieldTarget(target->IsPlayer() && ai->IsTank((Player*)target, false),
+                target->GetPowerType() == POWER_RAGE, target->IsInCombat(),
+                (unsigned)target->GetHealthPercent(), sPlayerbotAIConfig.criticalHealth))
                 return false;
             return HealPartyMemberAction::isUseful();
         }
@@ -55,15 +66,15 @@ namespace ai
 
     // holy
     HEAL_ACTION(CastLesserHealAction, "lesser heal");
-    HEAL_PARTY_ACTION(CastLesserHealOnPartyAction, "lesser heal");
+    HEAL_PARTY_ACTION_E(CastLesserHealOnPartyAction, "lesser heal", 50, HealManaEfficiency::MEDIUM);
     HEAL_ACTION(CastHealAction, "heal");
-    HEAL_PARTY_ACTION(CastHealOnPartyAction, "heal");
+    HEAL_PARTY_ACTION_E(CastHealOnPartyAction, "heal", 50, HealManaEfficiency::MEDIUM);
     HEAL_ACTION(CastGreaterHealAction, "greater heal");
-    HEAL_PARTY_ACTION(CastGreaterHealOnPartyAction, "greater heal");
+    HEAL_PARTY_ACTION_E(CastGreaterHealOnPartyAction, "greater heal", 50, HealManaEfficiency::MEDIUM);
     HEAL_ACTION(CastFlashHealAction, "flash heal");
-    HEAL_PARTY_ACTION(CastFlashHealOnPartyAction, "flash heal");
+    HEAL_PARTY_ACTION_E(CastFlashHealOnPartyAction, "flash heal", 15, HealManaEfficiency::LOW);
     HEAL_ACTION(CastRenewAction, "renew");
-    HEAL_HOT_PARTY_ACTION(CastRenewOnPartyAction, "renew");
+    HEAL_HOT_PARTY_ACTION_E(CastRenewOnPartyAction, "renew", 15, HealManaEfficiency::VERY_HIGH);
 
     // Prayer of Healing targets an injured party member and heals that
     // member's nearby group. Use the mature AOE-heal target/reach path rather
@@ -87,6 +98,7 @@ namespace ai
     // shadow
     RANGED_DEBUFF_ACTION(CastPowerWordPainAction, "shadow word: pain");
     RANGED_DEBUFF_ENEMY_ACTION(CastPowerWordPainOnAttackerAction, "shadow word: pain");
+    RANGED_DEBUFF_ENEMY_ACTION(CastDevouringPlagueOnAttackerAction, "devouring plague");
     SPELL_ACTION(CastMindBlastAction, "mind blast");
     class CastPsychicScreamAction : public CastSpellAction
     {
@@ -118,7 +130,7 @@ namespace ai
     SPELL_ACTION(CastMindFlayAction, "mind flay");
     RANGED_DEBUFF_ACTION(CastVampiricEmbraceAction, "vampiric embrace");
     BUFF_ACTION(CastShadowformAction, "shadowform");
-    SPELL_ACTION(CastSilenceAction, "silence");
+    INTERRUPT_SPELL_ACTION(CastSilenceAction, "silence");
     ENEMY_HEALER_ACTION(CastSilenceOnEnemyHealerAction, "silence");
 
     // racials
@@ -166,6 +178,15 @@ namespace ai
     public:
         CastPowerInfusionAction(PlayerbotAI* ai) : CastSpellTargetAction(ai, "power infusion", "boost targets", true, true) {}
         std::string GetTargetName() override { return "self target"; }
+    };
+
+    class CastFearWardOnTankAction : public BuffOnTankAction
+    {
+    public:
+        CastFearWardOnTankAction(PlayerbotAI* ai) : BuffOnTankAction(ai, "fear ward") {}
+        // BuffOnTankAction names itself "<spell> on party"; match the
+        // registered name so backoff/telemetry/log keys agree with it.
+        std::string getName() override { return "fear ward on tank"; }
     };
 
     class CastFearWardAction : public CastSpellTargetAction

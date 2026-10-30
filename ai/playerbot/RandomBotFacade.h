@@ -56,7 +56,6 @@ public:
     void UpdateGearSpells(Player* bot);
     bool ProcessBot(Player* player);
     void ChangeStrategy(Player* player);
-    void Revive(Player* player);
 
     bool GetNamedLocation(std::string const& name, WorldLocation& location);
     bool getNamedLocation(std::string const& name, WorldLocation& location)
@@ -65,6 +64,7 @@ public:
     }
     bool IsPinnedBot(uint32 guidLow);
     void PrintTeleportCache();
+    void LoadNamedLocationCache();
     void LoadBattleMastersCache();
     void LoadAuctionPrices();
     void RefreshAuctionPrices(uint32 diff);

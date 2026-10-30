@@ -1,6 +1,7 @@
 #pragma once
 #include "playerbot/strategy/Strategy.h"
 #include "playerbot/strategy/Multiplier.h"
+#include "playerbot/PullOpeningPolicy.h"
 
 namespace ai
 {
@@ -30,6 +31,12 @@ namespace ai
         void RequestPull(Unit* target, bool resetTime = true);
         bool IsPullPendingToStart() const { return pendingToStart; }
         bool HasPullStarted() const { return pullStartTime > 0; }
+        // Approach-headway clock (PullReachPolicy.h): NotePullApproach is fed
+        // the tank-to-target distance while the pull has not landed; the pull
+        // only times out after a full window without headway, or past the
+        // total cap, so a progressing cross-room walk keeps its target.
+        void NotePullApproach(float distanceNow, bool moving);
+        bool HasPullApproachExpired() const;
         bool HasPullActionCompleted() const { return pullActionCompleted; }
         // Ranged pull: the cast only opens the core's ranged auto-repeat, the
         // arrow flies a swing later (Unit::_UpdateAutoRepeatSpell) and any
@@ -46,16 +53,60 @@ namespace ai
         // Per-command mode: true while a pull/pullback command owns this pull.
         // The return leg follows the intent snapshotted by RequestPull, not the
         // strategy set at evaluation time.
-        void BeginCommand(bool pullback, bool hadPullBackStrategy, uint32 joinDelaySeconds = 0);
+        void BeginCommand(bool pullback, bool hadPullBackStrategy, uint32 joinDelaySeconds = 0, bool rangedOrder = false);
         bool IsCommandActive() const { return commandActive; }
         bool IsCommandPullback() const { return commandPullback; }
+        bool IsCommandRangedOrder() const { return commandRangedOrder; }
+        // How the commanded pull opens (decided on the first RequestPull):
+        // wanted from range or not, and why. What the tank can actually do
+        // about it is GetRangedBlocker / GetPullActionName.
+        bool CommandWantsRanged() const { return commandWantsRanged; }
+        PullOpeningReason GetOpeningReason() const { return openingReason; }
+        bool IsTargetPathReachable() const { return pathReachable; }
+        // Why the tank cannot fire its ranged weapon at `distance` yards
+        // (negative = ignore the minimum range): no weapon, skill, shoot spell,
+        // ammo, or the mob is inside the shot's dead zone. Weapon-class pulls
+        // ("shoot") only; a spell pull has no weapon to miss.
+        PullRangedBlocker GetRangedBlocker(float distance = -1.0f) const;
         bool IsPullBackIntent() const { return pullBackIntent; }
         bool HadPullBack() const { return hadPullBack; }
         uint32 GetCommandJoinDelay() const { return commandJoinDelay; }
         time_t GetReturnStartTime() const { return returnStartTime; }
+        // What BeginCommand changes, so a command refused after it can put an
+        // earlier pull's command state back exactly.
+        struct CommandState
+        {
+            bool active;
+            bool pullback;
+            bool hadPullBack;
+            uint32 joinDelay;
+            time_t returnStartTime;
+            bool rangedOrder;
+            bool wantsRanged;
+            PullOpeningReason reason;
+            bool pathReachable;
+        };
+        CommandState SaveCommand() const
+        {
+            return { commandActive, commandPullback, hadPullBack, commandJoinDelay, returnStartTime,
+                commandRangedOrder, commandWantsRanged, openingReason, pathReachable };
+        }
+        void RestoreCommand(CommandState const& state)
+        {
+            commandActive = state.active;
+            commandPullback = state.pullback;
+            hadPullBack = state.hadPullBack;
+            commandJoinDelay = state.joinDelay;
+            returnStartTime = state.returnStartTime;
+            commandRangedOrder = state.rangedOrder;
+            commandWantsRanged = state.wantsRanged;
+            openingReason = state.reason;
+            pathReachable = state.pathReachable;
+        }
 
     private:
         void SetTarget(Unit* target);
+        void DecideOpening(Unit* target);
 
         void InitCombatTriggers(std::list<TriggerNode*>& triggers) override;
         void InitNonCombatTriggers(std::list<TriggerNode*>& triggers) override;
@@ -69,6 +120,10 @@ namespace ai
         bool pendingToStart;
         bool pullActionCompleted;
         time_t pullStartTime;
+        // Approach-headway clock: last time the walk closed in, and the
+        // distance of that sample (-1 = none yet). See PullReachPolicy.h.
+        time_t approachHeadwayTime;
+        float approachDistance;
         // WorldTimer ms of the ranged pull cast this pull is waiting on, or 0.
         uint32 pullActionCastMs;
         ReactStates petReactState;
@@ -76,6 +131,12 @@ namespace ai
         // to the tank's default when the pull ends. Never sticky.
         bool commandPullback;
         bool commandActive;
+        // The order said `ranged`; and the opening decided from it, the
+        // config and the mob (DecideOpening). Both live and die with the command.
+        bool commandRangedOrder;
+        bool commandWantsRanged;
+        PullOpeningReason openingReason;
+        bool pathReachable;
         bool hadPullBack;
         // Return leg for the pull in flight (see RequestPull): the command's
         // mode, or the tank's own "pull back" for an automatic pull.

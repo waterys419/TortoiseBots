@@ -136,7 +136,7 @@ namespace ai
                 creators["shield bash"] = [](PlayerbotAI* ai) { return new ShieldBashInterruptSpellTrigger(ai); };
                 creators["disarm"] = [](PlayerbotAI* ai) { return new DisarmDebuffTrigger(ai); };
                 creators["concussion blow"] = [](PlayerbotAI* ai) { return new ConcussionBlowTrigger(ai); };
-                creators["sword and board"] = [](PlayerbotAI* ai) { return new SwordAndBoardTrigger(ai); };
+                creators["improved shield slam proc"] = [](PlayerbotAI* ai) { return new ImprovedShieldSlamProcTrigger(ai); };
                 creators["shield bash on enemy healer"] = [](PlayerbotAI* ai) { return new ShieldBashInterruptEnemyHealerSpellTrigger(ai); };
                 creators["battle stance"] = [](PlayerbotAI* ai) { return new BattleStanceTrigger(ai); };
                 creators["defensive stance"] = [](PlayerbotAI* ai) { return new DefensiveStanceTrigger(ai); };
@@ -147,6 +147,7 @@ namespace ai
                 creators["revenge"] = [](PlayerbotAI* ai) { return new RevengeAvailableTrigger(ai); };
                 creators["overpower"] = [](PlayerbotAI* ai) { return new OverpowerAvailableTrigger(ai); };
                 creators["mocking blow"] = [](PlayerbotAI* ai) { return new MockingBlowTrigger(ai); };
+                creators["mocking blow taunt"] = [](PlayerbotAI* ai) { return new MockingBlowTauntTrigger(ai); };
                 creators["mortal strike"] = [](PlayerbotAI* ai) { return new MortalStrikeDebuffTrigger(ai); };
                 creators["thunder clap on snare target"] = [](PlayerbotAI* ai) { return new ThunderClapSnareTrigger(ai); };
                 creators["thunder clap"] = [](PlayerbotAI* ai) { return new ThunderClapTrigger(ai); };
@@ -186,6 +187,7 @@ namespace ai
                 creators["rend on attacker"] = [](PlayerbotAI* ai) { return new CastRendOnAttackerAction(ai); };
                 creators["mocking blow"] = [](PlayerbotAI* ai) { return new CastMockingBlowAction(ai); };
                 creators["death wish"] = [](PlayerbotAI* ai) { return new CastDeathWishAction(ai); };
+                creators["recklessness"] = [](PlayerbotAI* ai) { return new CastRecklessnessAction(ai); };
                 creators["berserker rage"] = [](PlayerbotAI* ai) { return new CastBerserkerRageAction(ai); };
                 creators["execute"] = [](PlayerbotAI* ai) { return new CastExecuteAction(ai); };
                 creators["defensive stance"] = [](PlayerbotAI* ai) { return new CastDefensiveStanceAction(ai); };
@@ -194,6 +196,7 @@ namespace ai
                 creators["shield block"] = [](PlayerbotAI* ai) { return new CastShieldBlockAction(ai); };
                 creators["bloodrage"] = [](PlayerbotAI* ai) { return new CastBloodrageAction(ai); };
                 creators["battle stance"] = [](PlayerbotAI* ai) { return new CastBattleStanceAction(ai); };
+                creators["battle stance for mocking blow"] = [](PlayerbotAI* ai) { return new CastBattleStanceForMockingBlowAction(ai); };
                 creators["heroic strike"] = [](PlayerbotAI* ai) { return new CastHeroicStrikeAction(ai); };
                 creators["intimidating shout"] = [](PlayerbotAI* ai) { return new CastIntimidatingShoutAction(ai); };
                 creators["demoralizing shout"] = [](PlayerbotAI* ai) { return new CastDemoralizingShoutAction(ai); };
@@ -225,6 +228,7 @@ namespace ai
                 creators["intervene"] = [](PlayerbotAI* ai) { return new CastInterveneAction(ai); };
                 creators["thunder clap on snare target"] = [](PlayerbotAI* ai) { return new CastThunderClapSnareAction(ai); };
                 creators["taunt on snare target"] = [](PlayerbotAI* ai) { return new CastTauntOnSnareTargetAction(ai); };
+                creators["taunt on attacker"] = [](PlayerbotAI* ai) { return new CastTauntOnAttackerAction(ai); };
                 creators["intercept on enemy healer"] = [](PlayerbotAI* ai) { return new CastInterceptOnEnemyHealerAction(ai); };
                 creators["intercept on snare target"] = [](PlayerbotAI* ai) { return new CastInterceptOnSnareTargetAction(ai); };
                 creators["update pve strats"] = [](PlayerbotAI* ai) { return new UpdateWarriorPveStrategiesAction(ai); };

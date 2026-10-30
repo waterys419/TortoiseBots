@@ -1,10 +1,12 @@
-
 #include "playerbot/playerbot.h"
 #include "AcceptQuestAction.h"
-#include "playerbot/PullRegenPolicy.h"
-#include "playerbot/QuestLogPolicy.h"
+#include "playerbot/policy/pull/PullRegenPolicy.h"
+#include "playerbot/policy/quest/QuestLogPolicy.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
-
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireQuestPolicy.h"
+#include "../../../../runtime/AltBotService.h"
+#include "../../../../runtime/AltBotPolicy.h"
 using namespace ai;
 
 static bool IsFixedRewardUpgrade(AiObjectContext* context, Quest const* quest)
@@ -38,7 +40,19 @@ bool AcceptAllQuestsAction::WouldAcceptQuest(PlayerbotAI* ai, Player* bot, Quest
     // Donor mod-playerbots IsQuestCapableDoing (NewRpgBaseAction.cpp:573)
     // refuses +3 at any level; the pool uses +1 below 10.
     if (!ai::QuestTakerTripFits((int)quest->GetQuestLevel(), false, bot->GetLevel(),
-        sRandomBotFacade.IsRandomBot(bot) && !ai->HasRealPlayerMaster()))
+        sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster()))
+        return false;
+
+    // Solo-capability gate (RPG-A2): a masterless random bot refuses at
+    // accept the over-level / elite / group quests the log triage would
+    // later drop, so nearby givers and travel cannot pick up a quest the
+    // log pass deletes. Grouped-and-able bots (can fight boss) keep them;
+    // owned/hired bots follow the player. Donor mod-playerbots
+    // IsQuestCapableDoing, same +3 / type / suggested numbers.
+    if (sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster() &&
+        !ai::QuestAcceptSoloCapable((int)quest->GetQuestLevel(), bot->GetLevel(),
+            quest->GetType(), quest->GetSuggestedPlayers(),
+            AI_VALUE(bool, "can fight boss")))
         return false;
 
     // Accept/drop churn: banned quests (CLUCK!, inactive templates) never,
@@ -66,6 +80,13 @@ bool AcceptAllQuestsAction::WouldAcceptQuest(PlayerbotAI* ai, Player* bot, Quest
     if (questGiver && (questGiver->GetEntry() == 81030 || questGiver->GetEntry() == 62609))
         return false;
 
+    // A hired companion never takes a quest from a <Mercenary Hire>
+    // recruiter, even on an explicit order. Pool bots and owned alts are
+    // untouched.
+    if (questGiver && TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()) &&
+        TortoiseBots::IsHireQuestRecruiterEntry(questGiver->GetEntry()))
+        return false;
+
     // Tortoise-wow rogue-only quests with excessive walking and poor reward.
     static const std::unordered_set<uint32> tortoiseOnlyBlacklist = {
         50000, // Professor Malkovich
@@ -88,6 +109,18 @@ bool AcceptAllQuestsAction::WouldAcceptQuest(PlayerbotAI* ai, Player* bot, Quest
         bot->GetLevel() > bot->GetQuestLevelForPlayer(quest) + (uint32)sWorld.getConfig(CONFIG_INT32_QUEST_LOW_LEVEL_HIDE_DIFF) + 1)
     {
         if (!AI_VALUE2(bool, "need quest reward", (int32)quest->GetQuestId()) && !IsFixedRewardUpgrade(context, quest))
+            return false;
+    }
+
+    // Issue #872: an autonomous alt keeps free quest-log slots for the player
+    // (10). Count the log the same way FreeQuestLogSlotValue does.
+    if (TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()))
+    {
+        uint32 held = 0;
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (GetQuestSlotIdCompat(bot, slot))
+                ++held;
+        if (!TortoiseBots::AltBotMayAcceptQuest(held))
             return false;
     }
 
@@ -138,6 +171,9 @@ bool AcceptAllQuestsAction::ProcessQuest(Player* requester, Quest const* quest, 
 
 bool AcceptQuestAction::Execute(Event& event)
 {
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
+        return false;
+
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
     if (!requester)
         return false;
@@ -210,6 +246,8 @@ bool AcceptQuestShareAction::Execute(Event& event)
 {
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
     Player* bot = ai->GetBot();
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
+        return false;
 
     if (!ai->IsSafe(requester))
         requester = bot;
@@ -247,6 +285,8 @@ bool AcceptQuestShareAction::Execute(Event& event)
     if( bot->CanAddQuest( qInfo, false ) )
     {
         bot->AddQuest( qInfo, requester);
+        // Issue #872: remember quests the autonomous alt took itself.
+        TortoiseBots::AltBotService::Instance().AddTakenQuest(bot, quest);
 
         sPlayerbotAIConfig.logEvent(ai, "AcceptQuestShareAction", qInfo->GetTitle(), std::to_string(qInfo->GetQuestId()));
 
@@ -272,6 +312,8 @@ bool AcceptQuestShareAction::Execute(Event& event)
 bool ConfirmQuestAction::Execute(Event& event)
 {
     Player *bot = ai->GetBot();
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
+        return false;
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
 
     WorldPacket& p = event.GetPacket();
@@ -298,6 +340,8 @@ bool ConfirmQuestAction::Execute(Event& event)
     if( bot->CanAddQuest( qInfo, false ) )
     {
         bot->AddQuest( qInfo, requester );
+        // Issue #872: remember quests the autonomous alt took itself.
+        TortoiseBots::AltBotService::Instance().AddTakenQuest(bot, quest);
 
         if( bot->CanCompleteQuest( quest ) )
             bot->CompleteQuest( quest );
@@ -346,6 +390,8 @@ bool QuestDetailsAction::Execute(Event& event)
     if (bot->CanAddQuest(qInfo, false))
     {
         bot->AddQuest(qInfo, requester);
+        // Issue #872: remember quests the autonomous alt took itself.
+        TortoiseBots::AltBotService::Instance().AddTakenQuest(bot, quest);
 
         // The gossip/quest-details path is the one accept that used to be
         // invisible in bot_events.csv (the emote-time hello makes the core send

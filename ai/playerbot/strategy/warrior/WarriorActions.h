@@ -1,13 +1,30 @@
 #pragma once
 #include "playerbot/strategy/actions/GenericActions.h"
 #include "playerbot/AoeFearPolicy.h"
+#include "playerbot/RetaliationPolicy.h"
+#include "playerbot/strategy/values/PossibleTargetsValue.h"
 
 namespace ai
 {
     // stances
-    BUFF_ACTION(CastBattleStanceAction, "battle stance");
+    BUFF_ACTION_U(CastBattleStanceAction, "battle stance", !ai->IsTank(bot) && CastBuffSpellAction::isUseful());
+    // Battle Stance only for the Mocking Blow second taunt: the plain battle
+    // stance row refuses tanks, so this prerequisite carries its own name and
+    // fires only while the mocking blow taunt trigger is active.
+    class CastBattleStanceForMockingBlowAction : public CastBuffSpellAction
+    {
+    public:
+        CastBattleStanceForMockingBlowAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "battle stance") {}
+        bool isUseful() override
+        {
+            return CastBuffSpellAction::isUseful() && AI_VALUE2(bool, "trigger active", "mocking blow taunt");
+        }
+
+    protected:
+        virtual std::string getName() override { return "battle stance for mocking blow"; }
+    };
     BUFF_ACTION(CastDefensiveStanceAction, "defensive stance");
-    BUFF_ACTION(CastBerserkerStanceAction, "berserker stance");
+    BUFF_ACTION_U(CastBerserkerStanceAction, "berserker stance", !ai->IsTank(bot) && CastBuffSpellAction::isUseful());
 
     // shouts
     MELEE_ACTION_U(CastBattleShoutTauntAction, "battle shout", CastSpellAction::isUseful()); // useful to rebuff
@@ -45,7 +62,32 @@ namespace ai
     SNARE_ACTION(CastHamstringAction, "hamstring");
     MELEE_ACTION(CastOverpowerAction, "overpower");
     MELEE_ACTION(CastMockingBlowAction, "mocking blow");
-    BUFF_ACTION(CastRetaliationAction, "retaliation");
+    class CastRetaliationAction : public CastBuffSpellAction
+    {
+    public:
+        CastRetaliationAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "retaliation") {}
+
+        bool isUseful() override
+        {
+            // 30 min cooldown, and it counters melee swings only: spend it when
+            // two or more melee attackers are on the warrior (mod-playerbots
+            // CastRetaliationAction), not on one mob or a caster.
+            if (!CastBuffSpellAction::isUseful())
+                return false;
+
+            std::vector<RetaliationAttacker> attackers;
+            for (ObjectGuid const& guid : AI_VALUE(std::list<ObjectGuid>, "attackers"))
+            {
+                Unit* attacker = ai->GetUnit(guid);
+                if (!attacker)
+                    continue;
+
+                attackers.push_back({attacker->IsAlive(), attacker->GetVictim() == bot,
+                                     bot->GetDistance(attacker, SizeFactor::CombatReach) <= ATTACK_DISTANCE});
+            }
+            return RetaliationWorthCooldown(attackers);
+        }
+    };
 
     // arms talents
     MELEE_ACTION(CastMortalStrikeAction, "mortal strike");
@@ -71,12 +113,33 @@ namespace ai
     MELEE_ACTION(CastCleaveAction, "cleave");
     MELEE_ACTION(CastExecuteAction, "execute");
     REACH_ACTION(CastInterceptAction, "intercept", 8.0f);
-    ENEMY_HEALER_ACTION(CastInterceptOnEnemyHealerAction, "intercept");
-    SNARE_ACTION(CastInterceptOnSnareTargetAction, "intercept");
+    // Intercept on another target is a gap closer too: the same creature aura
+    // keep-out veto as CastReachTargetSpellAction (AiPlayerbot.AvoidCreatureAuras).
+    class CastInterceptOnEnemyHealerAction : public CastSpellOnEnemyHealerAction
+    {
+    public:
+        CastInterceptOnEnemyHealerAction(PlayerbotAI* ai) : CastSpellOnEnemyHealerAction(ai, "intercept") {}
+        bool isUseful() override
+        {
+            return CastSpellOnEnemyHealerAction::isUseful() &&
+                !(sPlayerbotAIConfig.avoidCreatureAuras && PossibleTriggersValue::GapCloserIntoKeepout(ai, GetSpellName(), GetTarget()));
+        }
+    };
+
+    class CastInterceptOnSnareTargetAction : public CastSnareSpellAction
+    {
+    public:
+        CastInterceptOnSnareTargetAction(PlayerbotAI* ai) : CastSnareSpellAction(ai, "intercept") {}
+        bool isUseful() override
+        {
+            return CastSnareSpellAction::isUseful() &&
+                !(sPlayerbotAIConfig.avoidCreatureAuras && PossibleTriggersValue::GapCloserIntoKeepout(ai, GetSpellName(), GetTarget()));
+        }
+    };
     MELEE_ACTION(CastSlamAction, "slam");
     BUFF_ACTION(CastBerserkerRageAction, "berserker rage");
     MELEE_ACTION(CastWhirlwindAction, "whirlwind");
-    MELEE_ACTION(CastPummelAction, "pummel");
+    MELEE_INTERRUPT_ACTION(CastPummelAction, "pummel");
     ENEMY_HEALER_ACTION(CastPummelOnEnemyHealerAction, "pummel");
     BUFF_ACTION(CastRecklessnessAction, "recklessness");
 
@@ -88,8 +151,21 @@ namespace ai
     // protection
     MELEE_ACTION_U(CastTauntAction, "taunt", GetTarget() && GetTarget()->GetVictim() && GetTarget()->GetVictim() != bot);
     SNARE_ACTION(CastTauntOnSnareTargetAction, "taunt");
+
+    // Taunt the mob picked by "attacker of non-tank target"; the cast reads
+    // its real range from the spell and the reach prerequisite walks the
+    // tank in.
+    class CastTauntOnAttackerAction : public CastSnareSpellAction
+    {
+    public:
+        CastTauntOnAttackerAction(PlayerbotAI* ai) : CastSnareSpellAction(ai, "taunt") {}
+
+    protected:
+        virtual std::string GetTargetName() override { return "attacker of non-tank target"; }
+        virtual std::string getName() override { return "taunt on attacker"; }
+    };
     BUFF_ACTION(CastBloodrageAction, "bloodrage");
-    MELEE_ACTION(CastShieldBashAction, "shield bash");
+    MELEE_INTERRUPT_ACTION(CastShieldBashAction, "shield bash");
     ENEMY_HEALER_ACTION(CastShieldBashOnEnemyHealerAction, "shield bash");
     MELEE_ACTION(CastRevengeAction, "revenge");
     BUFF_ACTION(CastShieldBlockAction, "shield block");
@@ -111,7 +187,7 @@ namespace ai
 
         bool isUseful() override
         {
-            static const std::vector<uint32> battleShoutIds = {6673, 5242, 6192, 11549, 11550, 11551, 25289, 2048};
+            static const std::vector<uint32> battleShoutIds = {6673, 5242, 6192, 11549, 11550, 11551, 25289};
 
             for (uint32 id : battleShoutIds)
             {
@@ -145,18 +221,57 @@ namespace ai
                 uint32 mortalStrike = AI_VALUE2(uint32, "spell id", "mortal strike");
                 uint32 shieldSlam = AI_VALUE2(uint32, "spell id", "shield slam");
 
+                // Defer sunder to a spender only when that spender can actually
+                // fire: IsSpellReady is cooldown-only, so without the rage
+                // gate below-20 rage vetoed sunder while the gated slam row
+                // was inactive — a melee-only dead zone. Slam's row lives on
+                // `light rage available`, so the veto follows the same
+                // trigger; BT/MS rows are CanCast-gated (rage-aware already).
+                bool slamLive = shieldSlam && sServerFacade.IsSpellReady(bot, shieldSlam) &&
+                    AI_VALUE2(bool, "trigger active", "light rage available");
+                // A live spender goes first, also while the stack is being built:
+                // Shield Slam (1.18.1: 20 % AP, high threat) is the opener, Sunder the filler.
                 if ((bloodThirst && sServerFacade.IsSpellReady(bot, bloodThirst)) ||
                     (mortalStrike && sServerFacade.IsSpellReady(bot, mortalStrike)) ||
-                    (shieldSlam && sServerFacade.IsSpellReady(bot, shieldSlam)))
+                    slamLive)
                 {
                     return false;
                 }
+
+                // Establish and refresh the stack before spending rage on other attacks.
+                Aura* sunder = ai->GetAura("sunder armor", target);
+                if (!target->IsPlayer() && (!sunder || sunder->GetStackAmount() < 5 ||
+                    (sunder->GetAuraDuration() >= 0 && sunder->GetAuraDuration() <= 6000)))
+                    return true;
             }
 
+            // DPS warriors sunder only when no tank warrior is in the group
+            // (donor CastSunderArmorAction::isUseful): with a real tank the
+            // stack is their job and DPS rage is better spent on damage.
+            if (!isTank)
+            {
+                Group* group = bot->GetGroup();
+                if (group)
+                {
+                    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    {
+                        Player* member = ref->GetSource();
+                        if (!member || member == bot || !member->IsAlive() || !member->IsInWorld() ||
+                            member->GetMapId() != bot->GetMapId())
+                            continue;
+
+                        if (member->GetClass() == CLASS_WARRIOR && ai->IsTank(member, false))
+                            return false;
+                    }
+                }
+            }
             if (isTank && !target->IsPlayer())
                 return true;
 
-            return !ai->HasAura("sunder armor", target, true);
+            // Stack to 5, then only refresh an expiring stack (donor
+            // CastSunderArmorAction::isUseful: stack < 5 or <=6s left).
+            Aura* aura = ai->GetAura("sunder armor", target, false);
+            return !aura || aura->GetStackAmount() < 5 || aura->GetAuraDuration() <= 6000;
         }
     };
 

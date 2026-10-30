@@ -1,13 +1,18 @@
 #include "BotPlayerAdapter.h"
 
 #include "../behavior/PlayerConvenience.h"
+#include "../commands/BotCommands.h"
+#include "../commands/BotCommandHandlers.h"
 #include "../runtime/BotManager.h"
 #include "../runtime/HireLifecycle.h"
+#include "../runtime/AltBotService.h"
 #include "../runtime/RandomBotService.h"
 #include "../runtime/PlayerbotAIStorage.h"
+#include "../runtime/PetSpawnPolicy.h"
 #include "../ai/playerbot/AiFactory.h"
 #include "../ai/playerbot/PlayerbotAI.h"
 #include "../ai/playerbot/PlayerbotAIConfig.h"
+#include "../ai/playerbot/strategy/actions/ReviveFromCorpseAction.h"
 #include "Log.h"
 #include "Map.h"
 #include "Player.h"
@@ -16,6 +21,7 @@
 #include "../runtime/ObservabilityEmitter.h"
 #include "ModuleLog.h"
 #include "ModuleVersion.h"
+#include "Pet.h"
 
 namespace TortoiseBots {
 
@@ -23,11 +29,16 @@ BotPlayerAdapter::BotPlayerAdapter()
     : PlayerScript("tortoisebots_players", {
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_MAP_CHANGED,
+        PLAYERHOOK_ON_UPDATE,
         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
         PLAYERHOOK_ON_BEFORE_LOGOUT,
         PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_IS_MANAGED_BOT,
-        PLAYERHOOK_GET_BOT_ROLES })
+        PLAYERHOOK_GET_BOT_ROLES
+#ifdef TORTOISEBOTS_CORE_HAS_BOT_REPOP
+        , PLAYERHOOK_GET_BOT_REPOP_ENTRANCE
+#endif
+        })
 {
 }
 
@@ -37,6 +48,22 @@ bool BotPlayerAdapter::IsManagedBot(Player* who)
         return false;
     return BotManager::Instance().IsBot(who->GetObjectGuid());
 }
+
+// Player::RepopAtGraveyard calls this for a managed bot released inside a
+// dungeon, before it revives the bot at a door. The core's own pick
+// (GetMapEntranceTrigger, the lowest trigger id) is one fixed door: Scarlet
+// Monastery's Graveyard wing whatever wing the bot died in. Answer the
+// external door whose destination lies nearest the corpse (its trigger id);
+// 0 (not a bot of ours, a map not validated, no eligible door) keeps the
+// core's trigger.
+#ifdef TORTOISEBOTS_CORE_HAS_BOT_REPOP
+uint32 BotPlayerAdapter::GetBotRepopEntrance(Player* bot, uint32 mapId, float x, float y, float z)
+{
+    if (!bot || !BotManager::Instance().IsBot(bot->GetObjectGuid()))
+        return 0;
+    return ai::PickRepopEntrance(bot, mapId, x, y, z);
+}
+#endif
 
 uint8 BotPlayerAdapter::GetBotRoles(Player* who)
 {
@@ -62,9 +89,10 @@ uint8 BotPlayerAdapter::GetBotRoles(Player* who)
             botAi->GetForcedRole() == 0)
         {
             // TANK: installed only by a tank click (`+protection`,
-            // `+tank feral`) or install-time prot/feral defaults.
+            // `+tank feral`, `+tank shaman`) or install-time prot/feral/tank defaults.
             if (botAi->HasStrategy("protection", BotState::BOT_STATE_COMBAT) ||
                 botAi->HasStrategy("tank feral", BotState::BOT_STATE_COMBAT) ||
+                botAi->HasStrategy("tank shaman", BotState::BOT_STATE_COMBAT) ||
                 botAi->HasStrategy("bear", BotState::BOT_STATE_COMBAT) ||
                 botAi->HasStrategy("tank", BotState::BOT_STATE_COMBAT))
                 return static_cast<uint8>(ai::BOT_ROLE_TANK);
@@ -104,12 +132,27 @@ void BotPlayerAdapter::OnLogin(Player* player)
         }
     }
     BotManager::Instance().OnPlayerLogin(player);
+    // Item-leg skip (spec D7): a crash/restart mid-run leaves given items in
+    // bags with ledger rows; destroy to count and delete the rows when no live
+    // run slot holds them.
+    BotCommands::CleanupRunGivenItems(player);
 }
 
 void BotPlayerAdapter::OnMapChanged(Player* player)
 {
-    if (!player || !player->GetSession() || !player->GetSession()->HasNetworkTransport() ||
-        !player->IsInWorld() || !player->GetMap() || player->GetMap()->IsDungeon())
+    if (!player || !player->GetSession())
+        return;
+
+    // A bot's own far teleport (PlayerbotAI::HandleTeleportAck acks it) lands
+    // here once per map change: re-apply the instance guard for the new map.
+    if (!player->GetSession()->HasNetworkTransport())
+    {
+        if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(player))
+            AiFactory::ApplyInstanceGuardOnMapChange(player, ai);
+        return;
+    }
+
+    if (!player->IsInWorld() || !player->GetMap() || player->GetMap()->IsDungeon())
     {
         return;
     }
@@ -120,6 +163,10 @@ void BotPlayerAdapter::OnMapChanged(Player* player)
     for (Player* bot : BotManager::Instance().GetBotsForMaster(player->GetObjectGuid()))
     {
         if (!bot || !bot->GetMap() || !bot->GetMap()->IsDungeon())
+            continue;
+        // Issue #884: a bot in the group this player commands remotely stays
+        // with its lead bot; leading from outside the dungeon is the point.
+        if (BotCommands::IsCommandedBy(player, bot))
             continue;
 
         if (PlayerConvenience::Instance().RequestSummon(player, bot))
@@ -134,6 +181,38 @@ void BotPlayerAdapter::OnMapChanged(Player* player)
                 bot->GetName(), player->GetName());
         }
     }
+}
+
+void BotPlayerAdapter::OnUpdate(Player* player, uint32 /*diff*/)
+{
+    // Issue #1043, second call site. The main check runs on the world thread
+    // right after each bot's AI turn (BotManager::UpdateBots), which covers the
+    // resummon after a teleport. A Call Pet or demon summon whose cast
+    // completes inside Player::Update creates its pet during the map update,
+    // and the pet's first Pet::Update follows in the same tick. This hook runs
+    // at the end of the owner's update, before the map updates its creatures.
+    //
+    // Fast path, no lock: a real player, a petless bot or a pet within 100
+    // yards returns on field reads and one map-local lookup. Only a pet about
+    // to be unsummoned for range reaches the AI lookup and the full check.
+    if (!player || !player->GetSession() || player->GetSession()->HasNetworkTransport())
+        return;
+    ObjectGuid const petGuid = player->GetPetGuid();
+    if (petGuid.IsEmpty() || !player->IsInWorld())
+        return;
+    Pet* pet = player->GetMap()->GetPet(petGuid);
+    if (!pet || !pet->IsInWorld())
+        return;
+    PetSpawnCheckInputs inputs;
+    inputs.dx = pet->GetPositionX() - player->GetPositionX();
+    inputs.dy = pet->GetPositionY() - player->GetPositionY();
+    inputs.dz = pet->GetPositionZ() - player->GetPositionZ();
+    // Only the case the pet's own update is about to unsummon (beyond 100 of
+    // the core's 120 yards): a pet at range or chasing returns here, lock-free.
+    if (!IsPetAboutToBeUnsummoned(inputs))
+        return;
+    if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(player))
+        BotManager::CheckNewPetSpawn(player, ai);
 }
 
 void BotPlayerAdapter::OnPlayerCompleteQuest(Player* player, Quest const* quest)
@@ -152,6 +231,7 @@ void BotPlayerAdapter::OnPlayerCompleteQuest(Player* player, Quest const* quest)
         return;
 
     sPlayerbotAIConfig.logEvent(botAi, "QuestCompleted", quest->GetTitle(), std::to_string(quest->GetQuestId()));
+    AltBotService::Instance().OnQuestCompleted(player);
 }
 
 void BotPlayerAdapter::OnBeforeLogout(Player* player)
@@ -172,7 +252,7 @@ void BotPlayerAdapter::OnLogout(Player* player)
 }
 
 BotUnitAdapter::BotUnitAdapter()
-    : UnitScript("tortoisebots_units", { UNITHOOK_ON_UNIT_DEATH })
+    : UnitScript("tortoisebots_units", { UNITHOOK_ON_UNIT_DEATH, UNITHOOK_ON_DAMAGE })
 {
 }
 
@@ -183,10 +263,32 @@ void BotUnitAdapter::OnUnitDeath(Unit* unit, Unit* killer)
 
     Player* player = unit->ToPlayer();
     PlayerbotAI* ai = GET_PLAYERBOT_AI(player);
+    Player* killerPlayer = killer ? killer->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+    if (ai)
+    {
+        ai->SetLastKiller(killer);
+        if (killerPlayer)
+            ai->NotePvpDeath(killerPlayer);
+    }
+    AltBotService::Instance().OnDeath(player);
+
+    if (killerPlayer && killerPlayer != player)
+    {
+        if (PlayerbotAI* killerAi = GET_PLAYERBOT_AI(killerPlayer))
+            killerAi->NotePvpKill(player);
+    }
+}
+
+void BotUnitAdapter::OnDamage(Unit* attacker, Unit* victim, uint32& /*damage*/)
+{
+    if (!attacker || !victim || attacker == victim || !victim->IsPlayer())
+        return;
+
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(victim->ToPlayer());
     if (!ai)
         return;
 
-    ai->SetLastKiller(killer);
+    ai->NoteDamager(attacker);
 }
 
 } // namespace TortoiseBots

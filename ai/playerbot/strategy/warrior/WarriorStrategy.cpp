@@ -44,6 +44,7 @@ public:
         creators["revenge"] = &revenge;
         creators["shield block"] = &shield_block;
         creators["shield wall"] = &shield_wall;
+        creators["intervene"] = &intervene;
 
         creators["berserker rage"] = &berserker_rage;
     }
@@ -95,6 +96,8 @@ private:
 
     ACTION_NODE_P(shield_wall, "shield wall", "defensive stance");
 
+    ACTION_NODE_P(intervene, "intervene", "defensive stance");
+
     ACTION_NODE_P(berserker_rage, "berserker rage", "berserker stance");
 };
 
@@ -107,11 +110,45 @@ WarriorStrategy::WarriorStrategy(PlayerbotAI* ai) : ClassStrategy(ai)
 void WarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassStrategy::InitCombatTriggers(triggers);
+
+    // Assigned tank role is independent of talent specialization.
+    triggers.push_back(new TriggerNode(
+        "defensive stance",
+        NextAction::array(0, new NextAction("defensive stance", ACTION_MOVE), NULL)));
+
+    // Base-combat interrupts (Arms/Fury DPS): pummel first, shield bash as
+    // the no-stance-dance fallback. Pummel resolves through the berserker
+    // stance node registered above; shield bash has no stance prerequisite,
+    // so the engine picks whichever the bot can cast from its current stance
+    // instead of dancing every cast. Tank specs keep their own rows.
+    triggers.push_back(new TriggerNode(
+        "pummel",
+        NextAction::array(0, new NextAction("pummel", ACTION_INTERRUPT), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "pummel on enemy healer",
+        NextAction::array(0, new NextAction("pummel on enemy healer", ACTION_INTERRUPT), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "shield bash",
+        NextAction::array(0, new NextAction("shield bash", ACTION_INTERRUPT), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "shield bash on enemy healer",
+        NextAction::array(0, new NextAction("shield bash on enemy healer", ACTION_INTERRUPT), NULL)));
 }
 
 void WarriorStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ClassStrategy::InitNonCombatTriggers(triggers);
+
+    // Pre-pull stance for tanks: Protection bots otherwise idle in Battle
+    // Stance until combat procs swap them (off-tanks holding no aggro never
+    // qualified). The trigger is IsTank-gated, so DPS specs are unaffected -
+    // their Battle/Berserker buff rows keep working as before.
+    triggers.push_back(new TriggerNode(
+        "defensive stance",
+        NextAction::array(0, new NextAction("defensive stance", ACTION_NORMAL), NULL)));
 }
 
 void WarriorStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)

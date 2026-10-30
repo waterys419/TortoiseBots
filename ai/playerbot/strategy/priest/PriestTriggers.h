@@ -1,12 +1,17 @@
 #pragma once
 
 #include "playerbot/strategy/triggers/GenericTriggers.h"
+#include "playerbot/strategy/triggers/HealthTriggers.h"
+#include "playerbot/GroupMembers.h"
+#include "playerbot/policy/heal/PrayerOfHealingPolicy.h"
+#include "playerbot/policy/heal/HealPacePolicy.h"
 
 namespace ai
 {
     DEBUFF_TRIGGER(HolyFireTrigger, "holy fire");
     DEBUFF_TRIGGER(PowerWordPainTrigger, "shadow word: pain");
     DEBUFF_ENEMY_TRIGGER(PowerWordPainOnAttackerTrigger, "shadow word: pain");
+    DEBUFF_ENEMY_TRIGGER(DevouringPlagueOnAttackerTrigger, "devouring plague");
     DEBUFF_TRIGGER(VampiricEmbraceTrigger, "vampiric embrace");
     CURE_TRIGGER(DispelMagicTrigger, "dispel magic", DISPEL_MAGIC);
     CURE_PARTY_TRIGGER(DispelMagicPartyMemberTrigger, "dispel magic", DISPEL_MAGIC);
@@ -15,7 +20,128 @@ namespace ai
     BUFF_TRIGGER_A(InnerFireTrigger, "inner fire");
     BUFF_TRIGGER_A(ShadowformTrigger, "shadowform");
     BUFF_TRIGGER(InnerFocusTrigger, "inner focus");
-    BUFF_TRIGGER(AscendanceTrigger, "ascendance");
+
+    // mod-playerbots parity (PRI-7): Inner Focus pre-cast when mana is low
+    // and a heal target exists. Self-gated on the trained spell, the
+    // cooldown, medium-or-lower mana and a medium-or-worse heal target, so
+    // untalented bots and cooling-down bots never queue an impossible cast.
+    class InnerFocusForHealTrigger : public Trigger
+    {
+    public:
+        InnerFocusForHealTrigger(PlayerbotAI* ai) : Trigger(ai, "inner focus for heal") {}
+        bool IsActive() override;
+    };
+
+    // Owner-approved behaviour (2026-10-14): while the tank does not hold the
+    // whole pack - two or more attackers on someone other than a tank - a
+    // party healer takes Flash Heal over Greater Heal. The long cast lost the
+    // race against the damage and drew threat from every loose mob (ZF hire
+    // run: 3555 -> 1354 mana in 38 s, healer top threat 28.5 s).
+    bool PriestPackLoose(PlayerbotAI* ai);
+
+    class PartyMemberLowHealthLoosePackTrigger : public PartyMemberLowHealthTrigger
+    {
+    public:
+        PartyMemberLowHealthLoosePackTrigger(PlayerbotAI* ai) : PartyMemberLowHealthTrigger(ai, "party member low health loose pack") {}
+        bool IsActive() override { return PartyMemberLowHealthTrigger::IsActive() && PriestPackLoose(ai); }
+    };
+
+    class PartyMemberMediumHealthLoosePackTrigger : public PartyMemberLowHealthTrigger
+    {
+    public:
+        PartyMemberMediumHealthLoosePackTrigger(PlayerbotAI* ai) :
+            PartyMemberLowHealthTrigger(ai, "party member medium health loose pack", sPlayerbotAIConfig.mediumHealth, sPlayerbotAIConfig.lowHealth) {}
+        bool IsActive() override { return PartyMemberLowHealthTrigger::IsActive() && PriestPackLoose(ai); }
+    };
+
+    class LowHealthLoosePackTrigger : public LowHealthTrigger
+    {
+    public:
+        LowHealthLoosePackTrigger(PlayerbotAI* ai) : LowHealthTrigger(ai, "low health loose pack") {}
+        bool IsActive() override { return LowHealthTrigger::IsActive() && PriestPackLoose(ai); }
+    };
+
+    // Direct-heal pick by the pace of the damage (HealPacePolicy.h), one
+    // trigger across the low and medium bands so the pick cannot downgrade
+    // from a fast heal to a slow one as the bar crosses the band line. The
+    // "incoming damage" value - the same signal the preheal gate reads -
+    // is one melee swing of each attacker in reach of the target (melee
+    // autos only: spells, ranged and dots are not counted). With enough
+    // healer mana, damage heavy enough to push the bar into the critical
+    // band (medium: out of the band entirely) before a 3 s Heal/Greater
+    // Heal lands takes Flash Heal; slow or stable damage (or a healer low
+    // on mana) keeps the efficient rows, leaving Flash Heal for the
+    // critical-prediction case. The loose-pack rows below outrank the
+    // efficient rows, so a pack off the tank still takes Flash Heal first.
+    class PartyMemberFastDamageTrigger : public PartyMemberLowHealthTrigger
+    {
+    public:
+        PartyMemberFastDamageTrigger(PlayerbotAI* ai) : PartyMemberLowHealthTrigger(ai, "party member fast damage",
+            sPlayerbotAIConfig.mediumHealth, sPlayerbotAIConfig.criticalHealth) {}
+        // Band gate on the CURRENT health, not the preheal-predicted one the
+        // base trigger checks: heavy damage must not push a member out of
+        // the band here - that would switch the pace pick off exactly when
+        // the damage is fastest.
+        bool IsActive() override
+        {
+            Unit* target = GetTarget();
+            if (!target || AI_VALUE2(bool, "dead", GetTargetName()))
+                return false;
+            float const healthPercent = GetValue();
+            if (healthPercent >= sPlayerbotAIConfig.mediumHealth || healthPercent < sPlayerbotAIConfig.criticalHealth)
+                return false;
+            if (!target->GetMaxHealth())
+                return false;
+            uint32 const incDmg = AI_VALUE2(uint32, "incoming damage", GetTargetName());
+            // Heal/Greater Heal 3 s - fixed base cast.
+            HealPaceState const state{
+                healthPercent,
+                float(incDmg) / float(target->GetMaxHealth()) * 100.0f,
+                3.0f,
+                float(AI_VALUE2(uint8, "mana", "self target")),
+                float(sPlayerbotAIConfig.mediumMana),
+                float(sPlayerbotAIConfig.lowHealth),
+                float(sPlayerbotAIConfig.criticalHealth)};
+            return PickPacedHeal(state) == HealPaceChoice::Flash;
+        }
+    };
+
+    // Prayer of Healing targets 37 (the caster's party) while the shared
+    // "medium aoe heal" value counts the whole raid. Count the priest's own
+    // subgroup (SameSubGroup, the ImbueAction pattern), alive and in world,
+    // within 30 yd 2D at or below medium health, through the pure policy.
+    class PrayerOfHealingPartyTrigger : public Trigger
+    {
+    public:
+        PrayerOfHealingPartyTrigger(PlayerbotAI* ai) : Trigger(ai, "prayer of healing party") {}
+        bool IsActive() override;
+    };
+
+    // The capstone's cooldown runs all but a sliver of the fight while the
+    // aura is missing, so a plain buff trigger would arm the row (and refuse
+    // the cast) every tick; the balance gate stays the row's own business.
+    class AscendanceTrigger : public BuffTrigger
+    {
+    public:
+        AscendanceTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "ascendance") {}
+        bool IsActive() override;
+    };
+
+    // The threat ratio reads 100 while the tank holds nothing, so the
+    // climbing-threat Fade waits for the tank to hold the mob
+    // (runtime/policy/class/PriestFadePolicy.h). A mob on the priest sheds
+    // through the separate "target of attacker" row instead.
+    class PriestFadeThreatTrigger : public MediumThreatTrigger
+    {
+    public:
+        PriestFadeThreatTrigger(PlayerbotAI* ai) : MediumThreatTrigger(ai, "priest fade threat") {}
+        bool IsActive() override;
+    };
+
+    // Fade's 30 s cooldown keeps the aura missing almost the whole window,
+    // so the shed-aggro rows ("fade ready and ...") arm only while the spell
+    // is trained and the cooldown spent.
+    CD_TRIGGER(FadeReadyTrigger, "fade");
     CC_TRIGGER(ShackleUndeadTrigger, "shackle undead");
     INTERRUPT_TRIGGER(SilenceTrigger, "silence");
     INTERRUPT_HEALER_TRIGGER(SilenceEnemyHealerTrigger, "silence");
@@ -99,6 +225,18 @@ namespace ai
         std::string GetTargetName() override { return "self target"; }
     };
 
+    // mod-playerbots parity (FearWardOnMainTankTrigger): ward the tank first
+    // in combat instead of only whoever lacks the buff. The cooldown guard
+    // mirrors the donor: Fear Ward has a 30 s cooldown and the BuffTrigger
+    // base never checks it, so without the guard the trigger spins (and the
+    // cast fails) every tick while the tank's ward is consumed.
+    class FearWardOnTankTrigger : public BuffOnTankTrigger
+    {
+    public:
+        FearWardOnTankTrigger(PlayerbotAI* ai) : BuffOnTankTrigger(ai, "fear ward") {}
+        bool IsActive() override;
+    };
+
     class FearWardTrigger : public SpellTargetTrigger
     {
     public:
@@ -144,6 +282,11 @@ namespace ai
     // Trigger fires when the target is MISSING the Priest Shadow Weaving
     // debuff. Used to prioritize Mind Flay / SW:P after target swap to
     // rebuild stacks before Mind Blast burst.
+    //
+    // Only a priest with the Shadow Weaving talent can apply the debuff, so
+    // without it the trigger would fire forever and burn mana on the Mind
+    // Flay -> Smite fallback. Spellbook check on the talent ranks, same
+    // pattern as the mage Improved Scorch gate.
     class ShadowWeavingMissingTrigger : public Trigger
     {
     public:
@@ -153,11 +296,31 @@ namespace ai
 
         virtual bool IsActive() override
         {
+            // Shadow Weaving talent ranks 1-5.
+            if (!bot->HasSpell(15257) && !bot->HasSpell(15331) && !bot->HasSpell(15332) &&
+                !bot->HasSpell(15333) && !bot->HasSpell(15334))
+                return false;
+
             Unit* target = GetTarget();
             if (!target || !target->IsAlive())
                 return false;
             // 15258 is the Priest Shadow Weaving debuff specifically.
-            return !ai->HasAura(15258, target);
+            // Not ai->HasAura(): its IsRealAura filter hides another
+            // priest's stack on a hostile unit until it reaches 5, so a
+            // 1-4 stack read as missing (but 5 did not). Check the target
+            // directly: any caster, any stack count.
+            return !target->HasAura(15258);
         }
+    };
+
+    // A wand is running while a heal the priest's heal rows want, or a nuke
+    // its damage rows want, is held back only by the GCD each wand shot
+    // renews on Turtle (WandPolicy.h): stop the wand so the priest heals or
+    // casts instead of wanding while the party drops or at full mana.
+    class PriestWandBlocksCastTrigger : public WandBlocksCastTrigger
+    {
+    public:
+        PriestWandBlocksCastTrigger(PlayerbotAI* ai) : WandBlocksCastTrigger(ai, "wand blocks cast") {}
+        bool IsActive() override;
     };
 }

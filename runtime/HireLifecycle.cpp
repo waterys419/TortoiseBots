@@ -4,8 +4,9 @@
 #include "BotManager.h"
 #include "BotActivityLease.h"
 #include "CharacterCleanup.h"
-#include "HireDeletionPolicy.h"
-#include "HireDeparturePolicy.h"
+#include "runtime/policy/hire/HireDeletionPolicy.h"
+#include "runtime/policy/hire/HireDeparturePolicy.h"
+#include "runtime/policy/hire/HirePvpPolicy.h"
 #include "PlayerbotAIStorage.h"
 #include "RandomBotAccountRegistry.h"
 #include "RandomBotPoolReset.h"
@@ -15,15 +16,23 @@
 #include "../ai/playerbot/PlayerbotAIConfig.h"
 #include "../ai/playerbot/PlayerbotFactory.h"
 #include "../ai/playerbot/strategy/Event.h"
+#include "CommandedGroupQuery.h"
 
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "WorldSession.h"
 #include "Chat.h"
 #include "Group/Group.h"
+#include "Maps/Map.h"
 #include "Database/DatabaseEnv.h"
 #include "Log.h"
-
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Battlegrounds/BattleGroundMgr.h"
+#include "Battlegrounds/BattleGround.h"
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Opcodes.h"
+#include "../ai/playerbot/ServerFacade.h"
+#include <algorithm>
 #include <cstddef>
 #include <ctime>
 #include <memory>
@@ -33,6 +42,16 @@ namespace TortoiseBots
 
 namespace
 {
+// Battleground raids temporarily replace GetGroup(). Hire ownership remains
+// with the ordinary party saved by SetBattleGroundRaid, even during entry.
+Group* HireParty(Player* player)
+{
+    if (!player)
+        return nullptr;
+    Group* group = player->GetGroup();
+    return group && group->isBGGroup() ? player->GetOriginalGroup() : group;
+}
+
 // A dismissed hire's Headless session is expected to close on the next ticks.
 // One that refuses is escalated to an explicit stop request, and then
 // abandoned: the character is never deleted while it may still be live, and
@@ -114,6 +133,19 @@ void HireLifecycle::MarkGrouped(ObjectGuid botGuid)
         it->second.everGrouped = true;
 }
 
+void HireLifecycle::SetGearTier(ObjectGuid botGuid, uint8_t tier)
+{
+    auto it = m_hired.find(botGuid.GetCounter());
+    if (it != m_hired.end())
+        it->second.gearTier = tier;
+}
+
+uint8_t HireLifecycle::GearTier(ObjectGuid botGuid) const
+{
+    auto it = m_hired.find(botGuid.GetCounter());
+    return it == m_hired.end() ? 0 : it->second.gearTier;
+}
+
 bool HireLifecycle::MasterOnline(HiredRecord const& record) const
 {
     Player* master = sObjectAccessor.FindPlayer(record.masterGuid);
@@ -132,8 +164,269 @@ bool HireLifecycle::MasterLeftGroup(HiredRecord const& record) const
     // grouped: the runtime-record watchdog owns that case, not this rule.
     // Issue #387: raid membership, not subgroup: a hire in another raid
     // subgroup still shares the master's group.
-    bool inSameGroup = !bot || !bot->IsInWorld() || !master || bot->IsInSameRaidWith(master);
-    return ShouldDismissHireOnGroupDeparture(true, masterOnline, record.everGrouped, inSameGroup);
+    bool inSameGroup = !bot || !bot->IsInWorld() || !master ||
+        (HireParty(bot) && HireParty(bot) == HireParty(master));
+    return ShouldDismissHireOnGroupDeparture(true, masterOnline, record.everGrouped, inSameGroup,
+        record.commandState);
+}
+
+bool HireLifecycle::BeginCommand(ObjectGuid botGuid, ObjectGuid commanderGuid)
+{
+    auto it = m_hired.find(botGuid.GetCounter());
+    if (it == m_hired.end() || commanderGuid.IsEmpty() || it->second.masterGuid != commanderGuid)
+        return false; // a pool bot, an alt, or another player's hire: untouched
+    it->second.commandState = HireCommandState::Transition;
+    return true;
+}
+
+void HireLifecycle::ConfirmCommand(ObjectGuid commanderGuid)
+{
+    for (auto& kv : m_hired)
+        // A hire held out of world from an earlier binding (regroupOnReturn) is not part of this one.
+        if (kv.second.masterGuid == commanderGuid && kv.second.commandState == HireCommandState::Transition &&
+            !kv.second.regroupOnReturn)
+            kv.second.commandState = HireCommandState::Bound;
+}
+
+uint32_t HireLifecycle::CommandedHireCount(ObjectGuid commanderGuid) const
+{
+    uint32_t count = 0;
+    for (auto const& kv : m_hired)
+        if (kv.second.masterGuid == commanderGuid && kv.second.commandState != HireCommandState::None)
+            ++count;
+    return count;
+}
+
+void HireLifecycle::KeepInstanceAfterPartyMove(Player* bot)
+{
+    if (!bot || !bot->IsInWorld() || bot->IsGameMaster())
+        return;
+    Map* map = bot->GetMap();
+    Group* party = bot->GetGroup();
+    if (!map || !party || party->isBGGroup() || !map->IsDungeon())
+        return;
+    DungeonMap* dungeon = static_cast<DungeonMap*>(map);
+    DungeonPersistentState* state = dungeon->GetPersistanceState();
+    if (!state)
+        return;
+    InstanceGroupBind* bind = party->GetBoundInstance(map->GetId());
+    PartyMoveInstance const decision = DecidePartyMoveInstance(true, dungeon->IsUnloadingBeforeReset(),
+        bind != nullptr, bind && bind->state == state);
+    InstancePlayerBind* solo = bot->GetBoundInstance(map->GetId());
+    if (DropSoloBindAfterPartyMove(decision, solo != nullptr, solo && solo->perm, solo && solo->state == state))
+        bot->UnbindInstance(map->GetId());
+    switch (decision)
+    {
+        case PartyMoveInstance::BindParty:
+            party->BindToInstance(state, false);
+            bot->m_InstanceValid = true;
+            break;
+        case PartyMoveInstance::KeepValid:
+            bot->m_InstanceValid = true;
+            break;
+        case PartyMoveInstance::Nothing:
+            break;
+    }
+}
+
+uint32_t HireLifecycle::EndCommand(ObjectGuid commanderGuid)
+{
+    // The whole set enters its transition first: pulling one hire out of the
+    // bound party must not end the others (a party left with two members
+    // disbands, and every hire in it is then a disband casualty).
+    std::vector<ObjectGuid> hires;
+    for (auto& kv : m_hired)
+    {
+        HiredRecord& record = kv.second;
+        if (record.masterGuid != commanderGuid || record.commandState == HireCommandState::None)
+            continue;
+        record.commandState = HireCommandState::Transition;
+        hires.push_back(record.botGuid);
+    }
+    if (hires.empty())
+        return 0;
+
+    Player* master = sObjectAccessor.FindPlayer(commanderGuid);
+    uint32_t handled = 0;
+    for (ObjectGuid const& guid : hires)
+    {
+        auto it = m_hired.find(guid.GetCounter());
+        if (it == m_hired.end())
+            continue; // dismissed meanwhile
+        HiredRecord& record = it->second;
+        // FindPlayer is null for a character that is out of world (a far
+        // teleport, an instance entry): look it up as it is, so such a hire is
+        // held and re-joined instead of being released to the ordinary rules.
+        Player* bot = sObjectAccessor.FindPlayerNotInWorld(guid);
+        bool const live = bot && bot->IsInWorld();
+        bool const masterOnline = master && MasterOnline(record) && !record.masterOfflineSince;
+        bool keepTransition = false;
+        switch (DecideHireBindingEnd(live, masterOnline, live && master && bot->IsInSameRaidWith(master), bot != nullptr))
+        {
+            case HireBindingEnd::AwaitWorld:
+            {
+                // Held in transition: the sweep re-joins it once it is back in
+                // world, for at most the logout grace period (at least a minute).
+                time_t const bound = std::max<time_t>(60, static_cast<time_t>(sPlayerbotAIConfig.hireDisconnectGracePeriod));
+                record.regroupOnReturn = true;
+                record.regroupDeadline = time(nullptr) + bound;
+                keepTransition = true;
+                ++handled;
+                break;
+            }
+            case HireBindingEnd::RejoinHirer:
+                record.regroupOnReturn = true;
+                Reunite(record, master);
+                // The invitation did not land: held and invited again by the
+                // sweep within the same bound as a hire out of world.
+                if (KeepAwaitingRegroup(bot->IsInSameRaidWith(master), false))
+                {
+                    record.regroupOnReturn = true;
+                    record.regroupDeadline = time(nullptr) +
+                        std::max<time_t>(60, static_cast<time_t>(sPlayerbotAIConfig.hireDisconnectGracePeriod));
+                    keepTransition = true;
+                }
+                ++handled;
+                break;
+            case HireBindingEnd::ParkForLogin:
+                record.regroupOnReturn = true;
+                ++handled;
+                break;
+            case HireBindingEnd::Keep:
+                ++handled;
+                break;
+            case HireBindingEnd::Leave:
+                break;
+        }
+        if (!keepTransition)
+            record.commandState = HireCommandState::None;
+    }
+    TB_LOG_DETAIL("TortoiseBots: commander %s released %u hired companion(s) back to their hirer",
+        commanderGuid.GetString().c_str(), handled);
+    return handled;
+}
+
+void HireLifecycle::QueueDismissal(HiredRecord const& record, DismissalReason reason)
+{
+    for (PendingDismissal& pending : m_pendingDismissals)
+    {
+        if (pending.botGuid == record.botGuid && pending.masterGuid == record.masterGuid)
+        {
+            // An explicit kick takes precedence over a master departure.
+            if (reason > pending.reason)
+                pending.reason = reason;
+            return;
+        }
+    }
+    m_pendingDismissals.push_back({record.botGuid, record.masterGuid, reason});
+}
+
+void HireLifecycle::DrainDismissals()
+{
+    // Callbacks raised by logout are left for the next tick. No group pointer
+    // or active-registry reference survives across a dismissal.
+    std::vector<PendingDismissal> pending;
+    pending.swap(m_pendingDismissals);
+    for (PendingDismissal const& entry : pending)
+    {
+        auto it = m_hired.find(entry.botGuid.GetCounter());
+        if (it == m_hired.end() || it->second.masterGuid != entry.masterGuid)
+            continue;
+        HiredRecord record = it->second;
+        switch (entry.reason)
+        {
+            case DismissalReason::Removed:
+                if (ShouldDismissHireOnOwnRemoval(record.commandState))
+                    Dismiss(record, "removed from group", false);
+                break;
+            case DismissalReason::Disbanded:
+                if (!record.masterOfflineSince && ShouldDismissHireOnDisband(record.commandState))
+                    Dismiss(record, "group disbanded", false);
+                break;
+            case DismissalReason::MasterLeft:
+                if (MasterLeftGroup(record))
+                    Dismiss(record, "master left the group", false);
+                break;
+            case DismissalReason::EnteredBattleground:
+                Dismiss(record, "entered a battleground", false);
+                break;
+        }
+    }
+}
+
+void HireLifecycle::WarnMasterOnQueueEntry(Player* master)
+{
+    if (!master || !master->IsInWorld())
+        return;
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_SYSTEM,
+        "Your hired companions are PvE-only and will be dismissed when you enter the battleground.",
+        LANG_UNIVERSAL, CHAT_TAG_NONE, master->GetObjectGuid());
+    master->GetSession()->SendPacket(&data);
+}
+
+void HireLifecycle::LeaveBattlegroundQueue(Player* bot)
+{
+    if (!bot || !bot->InBattleGroundQueue() || !bot->GetSession() || bot->InBattleGround())
+        return;
+    for (uint32 i = 1; i < MAX_BATTLEGROUND_QUEUE_TYPES; ++i)
+    {
+        BattleGroundQueueTypeId queueType = BattleGroundQueueTypeId(i);
+        if (!bot->InBattleGroundQueueForBattleGroundQueueType(queueType))
+            continue;
+        BattleGroundTypeId bgType = sServerFacade.BGTemplateId(queueType);
+        BattleGround* bg = sBattleGroundMgr.GetBattleGroundTemplate(bgType);
+        uint32 mapId = bg ? bg->GetMapId() : 0;
+        if (!mapId)
+            continue;
+        WorldPacket packet(CMSG_BATTLEFIELD_PORT, 8);
+        packet << mapId << uint8(0);
+        bot->GetSession()->HandleBattleFieldPortOpcode(packet);
+    }
+}
+
+void HireLifecycle::SweepBattlegroundBoundary()
+{
+    bool hireAllowPvP = sPlayerbotAIConfig.hireAllowPvP;
+    // One notice per master and pass, however many hires it has.
+    std::unordered_set<uint32_t> notified;
+    for (auto& kv : m_hired)
+    {
+        HiredRecord& record = kv.second;
+        Player* master = sObjectAccessor.FindPlayer(record.masterGuid);
+        Player* bot = sObjectAccessor.FindPlayer(record.botGuid);
+        bool masterInQueue = master && master->InBattleGroundQueue();
+        bool masterInside = master && master->InBattleGround();
+        bool botQueued = bot && bot->InBattleGroundQueue();
+        bool botInside = bot && bot->InBattleGround();
+        if (ShouldDismissHireOnBattleground(hireAllowPvP, masterInside, botInside))
+        {
+            QueueDismissal(record, DismissalReason::EnteredBattleground);
+            if (master && master->IsInWorld() && master->GetSession() && masterInside &&
+                notified.insert(record.masterGuid.GetCounter()).second)
+            {
+                WorldPacket data;
+                ChatHandler::BuildChatPacket(data, CHAT_MSG_SYSTEM,
+                    "Your hired companions were dismissed: they are PvE-only.",
+                    LANG_UNIVERSAL, CHAT_TAG_NONE, master->GetObjectGuid());
+                master->GetSession()->SendPacket(&data);
+            }
+            continue;
+        }
+        if (ShouldDequeueHireFromBgQueue(hireAllowPvP, botQueued, botInside, masterInside))
+            LeaveBattlegroundQueue(bot);
+        if (!master)
+            continue;
+        if (ShouldWarnMasterOnBgQueue(hireAllowPvP, masterInQueue, masterInside, record.bgQueueWarned))
+        {
+            record.bgQueueWarned = true;
+            if (notified.insert(record.masterGuid.GetCounter()).second)
+                WarnMasterOnQueueEntry(master);
+            continue;
+        }
+        if (!masterInQueue)
+            record.bgQueueWarned = false;
+    }
 }
 
 void HireLifecycle::Dismiss(HiredRecord const& record, char const* reason, bool removeFromGroup)
@@ -172,7 +465,7 @@ void HireLifecycle::Dismiss(HiredRecord const& record, char const* reason, bool 
 
 void HireLifecycle::OnGroupMemberRemoved(Group* group, ObjectGuid guid)
 {
-    if (!group || guid.IsEmpty())
+    if (!group || group->isBGGroup() || guid.IsEmpty())
         return;
 
     // The removed member is itself a hire: the hire ends. Kicked or left by
@@ -182,7 +475,9 @@ void HireLifecycle::OnGroupMemberRemoved(Group* group, ObjectGuid guid)
     if (auto it = m_hired.find(guid.GetCounter()); it != m_hired.end())
     {
         HiredRecord record = it->second;
-        Dismiss(record, "removed from group", false);
+        // A bind or unbind step moving the hire between parties is not an end.
+        if (ShouldDismissHireOnOwnRemoval(record.commandState))
+            QueueDismissal(record, DismissalReason::Removed);
         return;
     }
 
@@ -202,16 +497,17 @@ void HireLifecycle::OnGroupMemberRemoved(Group* group, ObjectGuid guid)
             departing.push_back(record);
     }
     for (HiredRecord const& record : departing)
-        Dismiss(record, "master left the group", false);
+        QueueDismissal(record, DismissalReason::MasterLeft);
 }
 
 void HireLifecycle::OnGroupDisband(Group* group)
 {
-    if (!group)
+    if (!group || group->isBGGroup())
         return;
     // Issue #243: The group is already being disbanded by the core, which will
-    // clean up member slots and session state. Snapshot hired members first,
-    // then dismiss without calling RemoveMember to prevent infinite Disband recursion.
+    // clean up member slots and session state. Logging out here can recursively
+    // delete that group through LeaveBattleground, even without RemoveMember.
+    // Snapshot identities and defer all dismissal work until the world update.
     std::vector<HiredRecord> departing;
     for (auto const& kv : m_hired)
     {
@@ -225,7 +521,10 @@ void HireLifecycle::OnGroupDisband(Group* group)
         // disband with an online master ends it here.
         if (record.masterOfflineSince)
             continue;
-        Dismiss(record, "group disbanded", false);
+        // A hire held by its hirer's binding is returned by the binding's end.
+        if (!ShouldDismissHireOnDisband(record.commandState))
+            continue;
+        QueueDismissal(record, DismissalReason::Disbanded);
     }
 }
 
@@ -234,13 +533,37 @@ void HireLifecycle::OnMasterLogin(Player* master)
     if (!master || !master->GetSession() || master->GetSession()->IsHeadless())
         return;
     ObjectGuid masterGuid = master->GetObjectGuid();
+    // Snapshot first: re-grouping a hire runs group hooks that may end other
+    // hires, which must not happen under this loop.
+    std::vector<ObjectGuid> mine;
+    std::vector<ObjectGuid> parked;
     for (auto& kv : m_hired)
     {
         HiredRecord& record = kv.second;
         if (record.masterGuid != masterGuid)
             continue;
         record.masterOfflineSince = 0;
-        Reunite(record, master);
+        mine.push_back(record.botGuid);
+        // Hires parked in a bot-only party when their hirer's binding ended
+        // while it was offline: all of them are in transition before the first
+        // one leaves that party (a party left with two members disbands).
+        if (record.regroupOnReturn)
+        {
+            record.commandState = HireCommandState::Transition;
+            parked.push_back(record.botGuid);
+        }
+    }
+    for (ObjectGuid const& guid : mine)
+    {
+        auto it = m_hired.find(guid.GetCounter());
+        if (it != m_hired.end())
+            Reunite(it->second, master);
+    }
+    for (ObjectGuid const& guid : parked)
+    {
+        auto it = m_hired.find(guid.GetCounter());
+        if (it != m_hired.end())
+            it->second.commandState = HireCommandState::None;
     }
 }
 
@@ -281,6 +604,25 @@ void HireLifecycle::Reunite(HiredRecord& record, Player* master)
     Player* bot = sObjectAccessor.FindPlayer(record.botGuid);
     if (!bot || !BotManager::Instance().IsControllableBot(bot))
         return;
+    if (record.regroupOnReturn)
+    {
+        // The hirer's binding ended while the hire sat in the bound party:
+        // leave it so the hirer's invitation below can be accepted. The caller
+        // holds the hire (and the rest of that party) in its transition, so the
+        // removal does not end it.
+        record.regroupOnReturn = false;
+        if (bot->GetGroup() && !bot->IsInSameRaidWith(master))
+            if (Group* bound = bot->GetGroup())
+                bound->RemoveMember(record.botGuid, 0);
+    }
+    // A clean logout removes the master from a non-raid party (WorldSession::LogoutPlayer), but a
+    // party of three or more survives without them, so the hires are still grouped together and
+    // turn down the invite below ("already in a group"). Put the master back into that party as
+    // its leader instead.
+    Group* botGroup = bot->GetGroup();
+    if (!bot->IsInSameRaidWith(master) && !master->GetGroup() && botGroup && !botGroup->isBGGroup() &&
+        !botGroup->IsFull() && botGroup->AddMember(master->GetObjectGuid(), master->GetName()))
+        botGroup->ChangeLeader(master->GetObjectGuid());
     if (!bot->IsInSameRaidWith(master))
     {
         Group* masterGroup = master->GetGroup();
@@ -303,6 +645,8 @@ void HireLifecycle::Reunite(HiredRecord& record, Player* master)
     }
     if (bot->IsInSameRaidWith(master))
     {
+        // Back in its hirer's party inside a dungeon: it stays there.
+        KeepInstanceAfterPartyMove(bot);
         // Issue #378: the hire is confirmed grouped, so a later departure of
         // the master ends the hire instead of being treated as a provisioning
         // artefact.
@@ -332,6 +676,24 @@ void HireLifecycle::Reunite(HiredRecord& record, Player* master)
 void HireLifecycle::SweepGracePeriod(time_t now)
 {
     uint32_t grace = sPlayerbotAIConfig.hireDisconnectGracePeriod;
+    // Settle the binding of every commander that has bound hires first, before
+    // the loop judges any hire: the commander's own 1 s sweep may not have run
+    // yet, and a lead that logged off or left would otherwise make its bound
+    // hires look like hires that left their hirer's party. Settling may return
+    // hires (group changes), so it runs outside the loop over m_hired.
+    {
+        std::vector<ObjectGuid> commanders;
+        for (auto const& kv : m_hired)
+            if (kv.second.commandState == HireCommandState::Bound &&
+                std::find(commanders.begin(), commanders.end(), kv.second.masterGuid) == commanders.end())
+                commanders.push_back(kv.second.masterGuid);
+        for (ObjectGuid const& commander : commanders)
+            BotCommands::SettleCommanderBinding(commander.GetRawValue());
+    }
+    // Dismissals run after the loop: Dismiss removes the bot from its group,
+    // and a group that falls apart dismisses the other hires through
+    // OnGroupDisband, erasing m_hired entries under this iterator (SIGSEGV).
+    std::vector<std::pair<HiredRecord, char const*>> ending;
     for (auto it = m_hired.begin(); it != m_hired.end();)
     {
         HiredRecord& record = it->second;
@@ -341,10 +703,52 @@ void HireLifecycle::SweepGracePeriod(time_t now)
         // character. Bookkeeping is never dropped silently.
         if (!BotManager::Instance().FindBot(record.botGuid))
         {
-            HiredRecord orphan = record;
-            it = m_hired.erase(it);
-            Dismiss(orphan, "runtime record gone");
+            ending.emplace_back(record, "runtime record gone");
+            ++it;
             continue;
+        }
+        // A hire held in transition because it was out of world when its hirer's
+        // binding ended: re-join it once it is back, within the bound.
+        if (record.commandState == HireCommandState::Transition && record.regroupOnReturn)
+        {
+            Player* held = sObjectAccessor.FindPlayer(record.botGuid);
+            Player* hirer = sObjectAccessor.FindPlayer(record.masterGuid);
+            bool const hirerOnline = hirer && MasterOnline(record) && !record.masterOfflineSince;
+            switch (DecideAwaitedRegroup(hirerOnline, held && held->IsInWorld(), now >= record.regroupDeadline))
+            {
+                case AwaitedRegroup::Wait:
+                    ++it;
+                    continue;
+                case AwaitedRegroup::Retry:
+                    Reunite(record, hirer);
+                    if (KeepAwaitingRegroup(held->IsInSameRaidWith(hirer), false))
+                    {
+                        record.regroupOnReturn = true; // invited again next sweep
+                        ++it;
+                        continue;
+                    }
+                    record.commandState = HireCommandState::None;
+                    break; // judged by the rules below, now back with its hirer
+                case AwaitedRegroup::Park:
+                    record.commandState = HireCommandState::None; // regroupOnReturn stays: the hirer's return re-joins it
+                    break;
+                case AwaitedRegroup::GiveUp:
+                    record.commandState = HireCommandState::None;
+                    record.regroupOnReturn = false;
+                    break;
+            }
+        }
+        // A hire bound to its hirer is judged only after the hirer's binding
+        // was settled (see the pre-pass above): a binding that lost its lead
+        // or its group is released first, which returns the hire instead of
+        // letting this sweep read "not in the commanded group" as a departure.
+        if (record.commandState == HireCommandState::Bound)
+        {
+            Player* commanded = sObjectAccessor.FindPlayer(record.botGuid);
+            bool const live = commanded && commanded->IsInWorld();
+            if (DecideBoundHireSweep(BotCommands::HasCommanderBinding(record.masterGuid.GetRawValue()), live,
+                    live && BotCommands::IsInCommandedGroup(commanded)) == BoundHireVerdict::DropState)
+                record.commandState = HireCommandState::None;
         }
         // Issue #378 backstop: a master that left the party in a way no group
         // hook reported (a raid removal before the module registered, a group
@@ -354,9 +758,8 @@ void HireLifecycle::SweepGracePeriod(time_t now)
         // are excluded by MasterLeftGroup.
         if (MasterLeftGroup(record))
         {
-            HiredRecord departing = record;
-            it = m_hired.erase(it);
-            Dismiss(departing, "master left the group");
+            ending.emplace_back(record, "master left the group");
+            ++it;
             continue;
         }
         if (!record.masterOfflineSince)
@@ -387,9 +790,14 @@ void HireLifecycle::SweepGracePeriod(time_t now)
             ++it;
             continue;
         }
-        HiredRecord expired = record;
-        it = m_hired.erase(it);
-        Dismiss(expired, "master grace expired");
+        ending.emplace_back(record, "master grace expired");
+        ++it;
+    }
+    for (auto const& [record, reason] : ending)
+    {
+        // An earlier dismissal can already have ended this hire (group disband).
+        if (IsHired(record.botGuid))
+            Dismiss(record, reason);
     }
 }
 
@@ -600,6 +1008,7 @@ void HireLifecycle::SweepDeletions(time_t now)
 void HireLifecycle::Update(uint32_t diff)
 {
     time_t now = time(nullptr);
+    DrainDismissals();
 
     // The deletion queue is pumped on every world tick (one character per
     // pass), so a dismissed companion is gone within ticks - a kicked party of
@@ -608,6 +1017,12 @@ void HireLifecycle::Update(uint32_t diff)
     SweepDeletions(now);
 
     m_updateElapsedMs += diff;
+    m_bgElapsedMs += diff;
+    if (m_bgElapsedMs >= 1000)
+    {
+        m_bgElapsedMs = 0;
+        SweepBattlegroundBoundary();
+    }
     if (m_updateElapsedMs < 5000)
         return;
     m_updateElapsedMs = 0;

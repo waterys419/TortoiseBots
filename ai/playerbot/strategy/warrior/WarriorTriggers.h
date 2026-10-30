@@ -1,25 +1,90 @@
 #pragma once
 #include "playerbot/strategy/triggers/GenericTriggers.h"
+#include "playerbot/BattleShoutPolicy.h"
+#include "playerbot/WarriorRageGatePolicy.h"
 
 namespace ai
 {
-    BUFF_TRIGGER(BattleStanceTrigger, "battle stance");
-    BUFF_TRIGGER(DefensiveStanceTrigger, "defensive stance");
-    BUFF_TRIGGER(BerserkerStanceTrigger, "berserker stance");
-    BUFF_TRIGGER(ShieldBlockTrigger, "shield block");
+    BUFF_TRIGGER_A(BattleStanceTrigger, "battle stance");
+    BUFF_TRIGGER_A(DefensiveStanceTrigger, "defensive stance");
+    BUFF_TRIGGER_A(BerserkerStanceTrigger, "berserker stance");
+    BUFF_TRIGGER_A(ShieldBlockTrigger, "shield block");
     DEBUFF_TRIGGER(RendDebuffTrigger, "rend");
-    DEBUFF_TRIGGER(DisarmDebuffTrigger, "disarm");
+
     DEBUFF_TRIGGER_A(SunderArmorDebuffTrigger, "sunder armor");
+    // Disarm only strips a target that carries a weapon and only with the
+    // rage it costs; anything else fails the cast and stalls the rotation.
+    class DisarmDebuffTrigger : public DebuffTrigger
+    {
+    public:
+        DisarmDebuffTrigger(PlayerbotAI* ai) : DebuffTrigger(ai, "disarm") {}
+
+        bool IsActive() override
+        {
+            if (!DebuffTrigger::IsActive())
+                return false;
+
+            if (AI_VALUE2(uint8, "rage", "self target") < WARRIOR_DISARM_RAGE_COST)
+                return false;
+
+            Unit* target = GetTarget();
+            if (!target)
+                return false;
+
+            if (Player* playerTarget = target->ToPlayer())
+                return playerTarget->GetWeaponForAttack(BASE_ATTACK, true, true) != nullptr;
+
+            Creature* creatureTarget = target->ToCreature();
+            return creatureTarget && creatureTarget->HasWeapon();
+        }
+    };
     DEBUFF_TRIGGER(DemoralizingShoutDebuffTrigger, "demoralizing shout");
     DEBUFF_TRIGGER(MortalStrikeDebuffTrigger, "mortal strike");
     DEBUFF_ENEMY_TRIGGER(RendDebuffOnAttackerTrigger, "rend");
     CAN_CAST_TRIGGER(RevengeAvailableTrigger, "revenge");
     CAN_CAST_TRIGGER(OverpowerAvailableTrigger, "overpower");
     BUFF_TRIGGER_A(BloodrageBuffTrigger, "bloodrage");
-    HAS_AURA_TRIGGER(SwordAndBoardTrigger, "sword and board");
+    // Turtle Improved Shield Slam proc (51596/51597, +35%/+70% slam damage
+    // on melee-ability hit): same slot as the donor's Sword-and-Board row,
+    // but matched by spell id, not name — the permanent talent (51598/51599)
+    // shares the "Improved Shield Slam" name and would keep a name trigger
+    // active forever. Proc aura is 1 charge (procCharges=1), so firing slam
+    // immediately consumes the bonus before it expires.
+    class ImprovedShieldSlamProcTrigger : public Trigger
+    {
+    public:
+        ImprovedShieldSlamProcTrigger(PlayerbotAI* ai) : Trigger(ai, "improved shield slam proc") {}
+
+        bool IsActive() override
+        {
+            return ai->HasAura(51596, bot) || ai->HasAura(51597, bot);
+        }
+    };
     SNARE_TRIGGER(ConcussionBlowTrigger, "concussion blow");
     SNARE_TRIGGER(HamstringTrigger, "hamstring");
     SNARE_TRIGGER(MockingBlowTrigger, "mocking blow");
+    class MockingBlowTauntTrigger : public LoseAggroTrigger
+    {
+    public:
+        MockingBlowTauntTrigger(PlayerbotAI* ai) : LoseAggroTrigger(ai, "mocking blow taunt") {}
+
+        bool IsActive() override
+        {
+            Unit* target = AI_VALUE(Unit*, "current target");
+            uint32 taunt = AI_VALUE2(uint32, "spell id", "taunt");
+            uint32 mocking = AI_VALUE2(uint32, "spell id", "mocking blow");
+            // The stance dance drains the bar: the core keeps only what
+            // Tactical Mastery allows (5 per rank), so gate on the rage the
+            // bot has AFTER the swap, not the pre-swap bar.
+            uint32_t rage = AI_VALUE2(uint8, "rage", "self target");
+            unsigned tmRank = TacticalMasteryRank(bot->HasSpell(WARRIOR_TACTICAL_MASTERY_RANK_1),
+                bot->HasSpell(WARRIOR_TACTICAL_MASTERY_RANK_2), bot->HasSpell(WARRIOR_TACTICAL_MASTERY_RANK_3));
+            return ShouldMockingBlow(ai->HasSpell("mocking blow"), LoseAggroTrigger::IsActive(),
+                taunt && sServerFacade.IsSpellReady(bot, taunt), mocking && sServerFacade.IsSpellReady(bot, mocking),
+                target && bot->CanReachWithMeleeAutoAttack(target),
+                RageAfterStanceSwap(ai->HasAura("battle stance", bot), rage, tmRank));
+        }
+    };
     SNARE_TRIGGER(ThunderClapSnareTrigger, "thunder clap");
     DEBUFF_TRIGGER(ThunderClapTrigger, "thunder clap");
     SNARE_TRIGGER(TauntSnareTrigger, "taunt");
@@ -32,7 +97,16 @@ namespace ai
     INTERRUPT_HEALER_TRIGGER(PummelInterruptEnemyHealerSpellTrigger, "pummel");
     INTERRUPT_TRIGGER(PummelInterruptSpellTrigger, "pummel");
     INTERRUPT_HEALER_TRIGGER(InterceptInterruptEnemyHealerSpellTrigger, "intercept");
-    INTERRUPT_TRIGGER(InterceptInterruptSpellTrigger, "intercept");
+    // The "intercept" action (CastReachTargetSpellAction) closes on and
+    // casts at the current target, so this trigger stays on the current
+    // target too - it must not point at a different mob than its action
+    // charges.
+    class InterceptInterruptSpellTrigger : public InterruptSpellTrigger
+    {
+    public:
+        InterceptInterruptSpellTrigger(PlayerbotAI* ai) : InterruptSpellTrigger(ai, "intercept") {}
+        virtual Value<Unit*>* GetTargetValue() override { return context->GetValue<Unit*>("current target"); }
+    };
     HAS_AURA_TRIGGER(SuddenDeathTrigger, "sudden death");
     HAS_AURA_TRIGGER(SlamInstantTrigger, "slam!");
     HAS_AURA_TRIGGER(TasteForBloodTrigger, "taste for blood");
@@ -44,11 +118,44 @@ namespace ai
 
         bool IsActive() override
         {
-            static const std::vector<uint32> battleShoutIds = {6673, 5242, 6192, 11549, 11550, 11551, 25289, 2048};
+            static const std::vector<uint32> battleShoutIds = {6673, 5242, 6192, 11549, 11550, 11551, 25289};
+
+            // The shout costs 10 rage; below that the cast fails.
+            if (!ShouldBattleShout(AI_VALUE2(uint8, "rage", "self target")))
+                return false;
 
             for (uint32 id : battleShoutIds)
             {
                 if (bot->HasAura(id))
+                    return false;
+            }
+
+            // Skip Battle Shout when a stronger Blessing of Might is up (donor
+            // BattleShoutTrigger compares AP values). Tables + rule live in
+            // BattleShoutPolicy.h (unit-tested). Own AP scaled by Improved
+            // Battle Shout talent (donor COMMANDING_PRESENCE_RANKS are these
+            // same Vanilla ids); highest learned rank wins. Spellbook check
+            // (not aura): passive talent auras may not be visible.
+            static const uint32 impBattleShoutRanks[] = { 12318, 12857, 12858, 12860, 12861 };
+            float talentBonus = 0.0f;
+            for (int rank = 4; rank >= 0; --rank)
+            {
+                if (bot->HasSpell(impBattleShoutRanks[rank]))
+                {
+                    talentBonus = ImprovedBattleShoutBonus(impBattleShoutRanks[rank]);
+                    break;
+                }
+            }
+            int32 shoutAp = EffectiveBattleShoutAp(
+                BattleShoutAttackPower(AI_VALUE2(uint32, "spell id", "battle shout")), talentBonus);
+            if (Aura* might = ai->GetAura("blessing of might", bot))
+            {
+                if (!ShouldBattleShout(shoutAp, true, BlessingOfMightAttackPower(might->GetSpellProto()->Id)))
+                    return false;
+            }
+            if (Aura* greaterMight = ai->GetAura("greater blessing of might", bot))
+            {
+                if (!ShouldBattleShout(shoutAp, true, BlessingOfMightAttackPower(greaterMight->GetSpellProto()->Id)))
                     return false;
             }
             return true;
@@ -109,13 +216,16 @@ namespace ai
         HeroicStrikeTrigger(PlayerbotAI* ai) : SpellCanBeCastedTrigger(ai, "heroic strike") {}
         bool IsActive() override
         {
-            bool hasTalents = bot->HasSpell(12294) || bot->HasSpell(21551) || bot->HasSpell(21552) || bot->HasSpell(21553) || bot->HasSpell(25248) || bot->HasSpell(23881) || bot->HasSpell(23892) || bot->HasSpell(23893) || bot->HasSpell(23894) || bot->HasSpell(25251);
-            if ((hasTalents && AI_VALUE2(uint8, "rage", "self target") > 60) || (!hasTalents && AI_VALUE2(uint8, "rage", "self target") >= 15))
-            {
-                return SpellCanBeCastedTrigger::IsActive()
-                    && (AI_VALUE2(uint8, "health", "current target") > 20 || ai->IsTank(bot));
-            }
-            return false;
+            // Rage dump, not a builder: hold heroic strike until 40+ rage so
+            // bloodthirst/whirlwind (30/25 rage) fire first, then dump every
+            // spare swing above that (donor FuryWarriorStrategy runs HS on
+            // "medium rage available" = 40, 79bd4281). The old 60-rage floor
+            // almost never held on a boss: heroic strike fired 6 times in a
+            // 77 s Patchwerk window while rage sat in the 40-60 band.
+            if (AI_VALUE2(uint8, "rage", "self target") < 40)
+                return false;
+            return SpellCanBeCastedTrigger::IsActive()
+                && (AI_VALUE2(uint8, "health", "current target") > 20 || ai->IsTank(bot));
         }
     };
 

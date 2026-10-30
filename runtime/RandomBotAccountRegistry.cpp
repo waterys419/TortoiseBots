@@ -1,6 +1,6 @@
 #include "RandomBotAccountRegistry.h"
 
-#include "PoolResetPolicy.h"
+#include "runtime/policy/infra/PoolResetPolicy.h"
 #include "../host/ModuleLog.h"
 #include "../ai/playerbot/PlayerbotAIConfig.h"
 
@@ -195,7 +195,8 @@ bool RandomBotAccountRegistry::CountManagedCharacters(uint32_t& out, std::string
 
     std::string accounts = AccountIdList();
     std::unique_ptr<QueryResult> count(CharacterDatabase.PQuery(
-        "SELECT COUNT(*) FROM `characters` WHERE `deleteDate` IS NULL AND `account` IN (%s)", accounts.c_str()));
+        "SELECT COUNT(*) FROM `characters` WHERE `deleteDate` IS NULL AND `account` IN (%s) "
+        "AND `guid` NOT IN (SELECT `bot_guid` FROM `tortoise_bots_claimed`)", accounts.c_str()));
     if (!count)
     {
         error = "managed character count could not be read";
@@ -299,6 +300,21 @@ bool RandomBotAccountRegistry::DiscoverPrefixMatches(std::vector<LegacyAccount>&
     // The prefix is matched in code, not by a SQL LIKE: the configured value is
     // never interpolated into a pattern, and no wildcard in it can widen the
     // result set.
+    std::unique_ptr<QueryResult> probe(LoginDatabase.PQuery("SELECT COUNT(*) FROM `account`"));
+    uint32_t accountTotal = 0;
+    if (probe)
+        accountTotal = probe->Fetch()[0].GetUInt32();
+    switch (VerdictForAccountScanProbe(probe != nullptr, accountTotal))
+    {
+        case AccountScanVerdict::Failed:
+            error = "the login database did not answer the account scan";
+            return false;
+        case AccountScanVerdict::Empty:
+            return true;
+        case AccountScanVerdict::Populate:
+            break;
+    }
+
     std::unique_ptr<QueryResult> rows(LoginDatabase.PQuery("SELECT `id`, `username` FROM `account` ORDER BY `id`"));
     if (!rows)
     {

@@ -3,6 +3,10 @@
 #include "playerbot/strategy/AiObjectContext.h"
 #include "playerbot/strategy/Value.h"
 #include "playerbot/TravelNode.h"
+#include "playerbot/CombatSpreadPolicy.h"
+#include "playerbot/TravelRouteCachePolicy.h"
+#include "playerbot/MagmaHazardPolicy.h"
+#include "../../../../runtime/StayArrivalPolicy.h"
 
 namespace ai
 {
@@ -26,6 +30,8 @@ namespace ai
         MOVE_FAIL_HAZARD_SHORT = 10,  // DispatchMovement: hazard rewrite left nothing to walk
         MOVE_FAIL_BAD_UNIT_TARGET = 11, // MoveTo(Unit*): null target or not in world
         MOVE_FAIL_NO_FORMATION = 12,  // MoveTo(Unit*): hostile target with no formation slot
+        MOVE_FAIL_MAGMA = 13,         // MoveTo2: end point in magma, or magma right ahead (MagmaHazardPolicy.h)
+        MOVE_FAIL_BOUND_RUN_MAP = 14, // MoveTo2: a bound run's bot never leaves the plan's map (BoundRunMapGuard.h)
     };
 
     inline const char* MoveFailReasonName(uint32 reason)
@@ -44,6 +50,8 @@ namespace ai
             case MOVE_FAIL_HAZARD_SHORT: return "hazard-short";
             case MOVE_FAIL_BAD_UNIT_TARGET: return "bad-unit-target";
             case MOVE_FAIL_NO_FORMATION: return "no-formation";
+            case MOVE_FAIL_MAGMA: return "magma";
+            case MOVE_FAIL_BOUND_RUN_MAP: return "bound-run-map";
             default: return "none";
         }
     }
@@ -64,34 +72,45 @@ namespace ai
             lastAreaTrigger = other.lastAreaTrigger;
             lastTransportEntry = other.lastTransportEntry;
             lastPath = other.lastPath;
+            routeCache = other.routeCache;
             lastMoveShort = other.lastMoveShort;
             nextTeleport = other.nextTeleport;
             fleeCount = other.fleeCount;
             lastFleeAttempt = other.lastFleeAttempt;
-            lastFleeAngles[0] = other.lastFleeAngles[0];
-            lastFleeAngles[1] = other.lastFleeAngles[1];
-            lastFleeAngleCount = other.lastFleeAngleCount;
+            fleeFailures = other.fleeFailures;
+            spreadFailures = other.spreadFailures;
             lastSpreadStepMs = other.lastSpreadStepMs;
+            fleeNoSpotMs = other.fleeNoSpotMs;
             moveFailReason = other.moveFailReason;
+            movePathType = other.movePathType;
+            positionMoveFailMs = other.positionMoveFailMs;
+            moveTries = other.moveTries;
+            magmaLogAt = other.magmaLogAt;
+            swimHandoffLogAt = other.swimHandoffLogAt;
+            magmaRefusal = other.magmaRefusal;
+            stayWalk = other.stayWalk;
             moveEvent = Event();
         }
 
         void clear()
         {
             lastPath.clear();
+            routeCache = TravelRouteCacheEntry();
             lastFollow = NULL;
             lastAreaTrigger = 0;
             lastTransportEntry = 0;
             lastFlee = 0;
             fleeCount = 0;
             lastFleeAttempt = 0;
-            lastFleeAngles[0] = 10.0f;
-            lastFleeAngles[1] = 10.0f;
-            lastFleeAngleCount = 0;
+            fleeFailures.Clear();
+            spreadFailures.Clear();
             lastSpreadStepMs = 0;
+            fleeNoSpotMs = 0;
             lastMoveShort = WorldPosition();
             nextTeleport = 0;
             moveFailReason = 0;
+            movePathType = 0;
+            positionMoveFailMs = 0;
             moveEvent = Event();
         }
 
@@ -115,18 +134,22 @@ namespace ai
         // Wall-clock of the last dispatched flee, used to decide whether the next flee is
         // "subsequent" (close in time) or a fresh flee (window lapsed -> count resets).
         time_t lastFleeAttempt;
-        // Donor "recently flee info" (mod-playerbots MovementAction::FleePosition/
-        // CheckLastFlee): last two flee destination angles, so a repeated flee
-        // steps somewhere else instead of re-picking the same bad vector.
-        // Angles are absolute world headings like FleeManager's ring uses;
-        // 10.0f marks an empty slot. Written only on a dispatched combat flee.
-        float lastFleeAngles[2] = { 10.0f, 10.0f };
-        uint32 lastFleeAngleCount = 0;
+        // Failed headings only; each cache is scoped to its threat/friendly
+        // anchor and map. Dispatches are observed before they can veto.
+        FleeFailureMemory fleeFailures;
+        FleeFailureMemory spreadFailures;
         // WorldTimer ms of the last spread/flee step-out dispatch. Throttles
         // RaidSpreadAction to one step per kSpreadStepCooldownMs so stacked
         // ranged bots settle instead of ping-ponging every tick. 0 = none yet.
         uint32 lastSpreadStepMs = 0;
+        // WorldTimer ms of the last pool-bot flee search that found no spot
+        // (PoolFleePolicy.h backoff). 0 = none.
+        uint32 fleeNoSpotMs = 0;
         TravelPath lastPath;
+        // What the last long-route rebuild was asked and produced (TravelRouteCachePolicy.h):
+        // lets ResolveMovePath keep a partial route for a few seconds instead of rebuilding
+        // it every turn. One entry per bot; cleared with the rest of the movement state.
+        TravelRouteCacheEntry routeCache;
         WorldPosition lastMoveShort;
         time_t nextTeleport;
         // MoveFailReason above: which return-false site fired last (0 = none
@@ -134,6 +157,32 @@ namespace ai
         // `return false` so the TravelMoveFailed row can say more than the
         // navmesh probe bucket; cleared on success paths.
         uint32 moveFailReason;
+        // The core PathFinder's type for MoveTo2's own route on its last try
+        // (WorldPosition::LastPathStepType; 0 = no pathfinding on that try, the
+        // route was reused). The FAILED action-log line shows it (MoveFailNotePolicy.h).
+        uint32 movePathType = 0;
+        // WorldTimer ms of the last "move to position" (a stay, guard or pull
+        // anchor) that failed; 0 = the last one did not. The run leader reads it
+        // for the lead bot (DungeonRun::Facts::leadMoveFailed, PositionMoveFailing).
+        uint32 positionMoveFailMs = 0;
+        // MoveTo2 / MoveTo(Unit*) tries so far (each resets moveFailReason and movePathType
+        // first); the FAILED line's note shows a reason only when a try happened during
+        // that Execute (MoveFailNoteReason). clear() leaves it alone.
+        uint32 moveTries = 0;
+        // Wall-clock of the last "move refused: magma" log line (one per bot
+        // per 10 s, MovementActions.cpp); clear() leaves it alone.
+        time_t magmaLogAt = 0;
+        // Wall-clock of the last "swim hand-off" log line (one per bot per 10 s, MovementActions.cpp);
+        // clear() leaves it alone.
+        time_t swimHandoffLogAt = 0;
+        // The destination the magma guard refused last (MagmaHazardPolicy.h):
+        // MoveTo2 refuses it again from memory, without terrain queries, for
+        // kMagmaRefusalSeconds. clear() leaves it alone too.
+        MagmaRefusal magmaRefusal;
+        // The stay walk's failures and back-off (StayArrivalPolicy.h StayWalkBackoff), read by
+        // "return to stay position" and its trigger; clear() leaves it alone (a move's clear
+        // must not end a back-off the stay walk earned).
+        TortoiseBots::StayWalkBackoff stayWalk;
         Event moveEvent;
     };
 

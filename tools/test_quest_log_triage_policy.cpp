@@ -1,4 +1,4 @@
-#include "../ai/playerbot/QuestLogPolicy.h"
+#include "../ai/playerbot/policy/quest/QuestLogPolicy.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -12,6 +12,8 @@
 
 using ai::IsBannedQuest;
 using ai::IsWarEffortTurnIn;
+using ai::QuestAcceptSoloCapable;
+using ai::QuestTriageRank;
 using ai::QuestTriageShouldDrop;
 using ai::ShouldRefuseQuestAtAccept;
 using ai::kBoneChewToyGoEntry;
@@ -114,6 +116,33 @@ int main()
         CHECK(kBoneChewToyItemId == 51751);
         CHECK(kBoneChewToyGoEntry == 1000380);
         std::cout << "  [PASS] Bone Chew Toy ids pinned\n";
+    }
+
+    // (11) Accept-time solo gate (RPG-A2): over-level (+3), non-solo type
+    // and group-suggested quests are refused solo; scaling (0) never
+    // over-level; grouped-and-able keeps them.
+    {
+        CHECK(!QuestAcceptSoloCapable(14, 10, 0, 0, false));
+        CHECK(QuestAcceptSoloCapable(13, 10, 0, 0, false));
+        CHECK(QuestAcceptSoloCapable(0, 10, 0, 0, false));
+        CHECK(!QuestAcceptSoloCapable(10, 10, 1, 0, false));
+        CHECK(!QuestAcceptSoloCapable(10, 10, 0, 2, false));
+        CHECK(QuestAcceptSoloCapable(10, 10, 0, 0, false));
+        CHECK(QuestAcceptSoloCapable(10, 10, 1, 3, true));
+        CHECK(!QuestAcceptSoloCapable(14, 10, 1, 3, true));
+        std::cout << "  [PASS] accept-time solo gate matches donor numbers\n";
+    }
+
+    // (12) Triage order: unfinishable first, then zone-only without
+    // progress, then zone-only with progress; in-zone doable is not a drop.
+    {
+        CHECK(QuestTriageRank(20, 10, 0, 0, 12, 12, true) == 3);
+        CHECK(QuestTriageRank(10, 10, 1, 0, 12, 12, false) == 3);
+        CHECK(QuestTriageRank(10, 10, 0, 0, 14, 12, false) == 2);
+        CHECK(QuestTriageRank(10, 10, 0, 0, 14, 12, true) == 1);
+        CHECK(QuestTriageRank(10, 10, 0, 0, 12, 12, false) == 0);
+        CHECK(QuestTriageRank(10, 10, 0, 0, -141, 12, false) == 0);
+        std::cout << "  [PASS] triage rank orders unfinishable > no-progress > progress\n";
     }
 
     std::cout << "All quest-log triage checks PASSED!\n";

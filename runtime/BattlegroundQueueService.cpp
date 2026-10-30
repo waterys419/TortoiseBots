@@ -1,8 +1,11 @@
 #include "BattlegroundQueueService.h"
+#include "runtime/policy/pvp/AutonomousBgPolicy.h"
+#include "runtime/policy/pvp/HumanBgDemandPolicy.h"
 #include "BotActivityLease.h"
 
 // pi-lens-ignore: clang:pp_file_not_found
 #include "BotManager.h"
+#include "HireLifecycle.h"
 #include "RandomBotService.h"
 #include "PlayerbotAIStorage.h"
 #include "../ai/playerbot/PlayerbotAI.h"
@@ -53,8 +56,20 @@ struct HumanBgDemand
     BattleGroundQueueTypeId queueType;
     BattleGroundTypeId bgType;
     BattleGroundBracketId bracket;
-    Team underrepresentedTeam = TEAM_NONE;
+    // Bots still wanted per side ([0] Alliance, [1] Horde) and bots queued
+    // per side in the current check.
+    uint32 need[2] = {0, 0};
+    uint32 queuedThisCheck[2] = {0, 0};
 };
+
+int BgSideIndex(Team team)
+{
+    if (team == ALLIANCE)
+        return 0;
+    if (team == HORDE)
+        return 1;
+    return -1;
+}
 
 bool IsHumanWaitingParticipant(BattleGroundQueue::QueuedParticipantInfo const& info)
 {
@@ -79,35 +94,51 @@ std::vector<HumanBgDemand> GetHumanBgDemands()
         if (bgType != BATTLEGROUND_WS && bgType != BATTLEGROUND_AB && bgType != BATTLEGROUND_AV)
             continue;
 
-        if (!sBattleGroundMgr.GetBattleGroundTemplate(bgType))
+        BattleGround* bgTemplate = sBattleGroundMgr.GetBattleGroundTemplate(bgType);
+        if (!bgTemplate)
             continue;
+        // Fill to the match minimum plus a small margin, not the team size:
+        // the core starts the match at the minimum, and bots queued past it
+        // would wait on and could start a second match with no human in it.
+        // AV honours the core's Alterac.MinPlayersInQueue gate (default 0).
+        uint32 queueFloor = bgType == BATTLEGROUND_AV
+            ? sWorld.getConfig(CONFIG_UINT32_AV_MIN_PLAYERS_IN_QUEUE) : 0;
+        uint32 sideTarget = HumanBgSideTarget(bgTemplate->GetMinPlayersPerTeam(),
+            bgTemplate->GetMaxPlayersPerTeam(), queueFloor);
 
         for (uint32 bracketIndex = 0; bracketIndex < MAX_BATTLEGROUND_BRACKETS; ++bracketIndex)
         {
             BattleGroundBracketId bracket = BattleGroundBracketId(bracketIndex);
             std::vector<BattleGroundQueue::QueuedParticipantInfo> participants =
                 sBattleGroundMgr.GetQueuedParticipants(queueType, bracket);
-            uint32 alliance = 0;
-            uint32 horde = 0;
+            // Humans waiting decide whether the bucket has demand at all, so
+            // demand ends once the human is invited; everyone waiting
+            // (humans and bots, not yet invited) counts toward each side's
+            // fill target. Both sides are filled: the core needs
+            // MinPlayersPerTeam on each side, so a solo human's own side
+            // needs bots as much as the other one.
+            uint32 humans = 0;
+            uint32 waiting[2] = {0, 0};
             for (auto const& participant : participants)
             {
-                if (participant.bgTypeId != bgType || participant.bracketId != bracket ||
-                    !IsHumanWaitingParticipant(participant))
+                if (participant.bgTypeId != bgType || participant.bracketId != bracket)
                     continue;
-                if (participant.team == ALLIANCE)
-                    ++alliance;
-                else if (participant.team == HORDE)
-                    ++horde;
+                if (participant.isInvited || !participant.online)
+                    continue;
+                int side = BgSideIndex(participant.team);
+                if (side < 0)
+                    continue;
+                ++waiting[side];
+                if (IsHumanWaitingParticipant(participant))
+                    ++humans;
             }
 
-            if (!alliance && !horde)
+            if (!humans)
                 continue;
 
             HumanBgDemand demand{queueType, bgType, bracket};
-            if (alliance < horde)
-                demand.underrepresentedTeam = ALLIANCE;
-            else if (horde < alliance)
-                demand.underrepresentedTeam = HORDE;
+            demand.need[0] = HumanBgSideNeed(sideTarget, waiting[0]);
+            demand.need[1] = HumanBgSideNeed(sideTarget, waiting[1]);
             demands.push_back(demand);
         }
     }
@@ -127,6 +158,7 @@ void BattlegroundQueueService::Initialize()
         return;
     m_initialized = true;
     m_elapsedMs = 0;
+    m_demandElapsedMs = 0;
 
     if (!sPlayerbotAIConfig.enabled || !sPlayerbotAIConfig.randomBotBgEnabled)
     {
@@ -135,8 +167,9 @@ void BattlegroundQueueService::Initialize()
         return;
     }
 
-    TB_LOG_BASIC("TortoiseBots: demand-aware BG auto-queue enabled interval %u max %u (WSG/AB/AV, guid 1337 bypass, core BattleGroundMgr ownership)",
-        sPlayerbotAIConfig.randomBotBgQueueInterval, sPlayerbotAIConfig.randomBotBgMaxQueuePerInterval);
+    TB_LOG_BASIC("TortoiseBots: demand-aware BG auto-queue enabled interval %u max %u, human demand every %u ms up to %u (WSG/AB/AV, guid 1337 bypass, core BattleGroundMgr ownership)",
+        sPlayerbotAIConfig.randomBotBgQueueInterval, sPlayerbotAIConfig.randomBotBgMaxQueuePerInterval,
+        kHumanBgDemandIntervalMs, kHumanBgDemandMaxPerCheck);
 }
 
 bool BattlegroundQueueService::IsEligible(::Player* bot) const
@@ -149,8 +182,12 @@ bool BattlegroundQueueService::IsEligible(::Player* bot) const
         return false;
     // In-memory live Headless/random selection: only random bots discovered
     // via RandomBotService's RNDBOT pool (pinned included). Owned/manual bots
-    // remain human-driven.
+    // remain human-driven. Hired companions never queue on their own: with
+    // HireAllowPvP they ride only in their master's group queue.
     if (!BotManager::Instance().IsRandomBot(bot->GetObjectGuid()))
+        return false;
+    if (!sPlayerbotAIConfig.hireAllowPvP &&
+        HireLifecycle::Instance().IsHired(bot->GetObjectGuid()))
         return false;
     if (bot->InBattleGround())
         return false;
@@ -318,6 +355,13 @@ bool BattlegroundQueueService::TryQueue(::Player* bot, uint32 queueTypeValue)
     uint8 joinAsGroup = (bot->GetGroup() && bot->GetGroup()->IsLeader(bot->GetObjectGuid())) ? 1 : 0;
     if (bot->GetGroup() && !joinAsGroup)
         return false;
+    // The module's own auto-queue never starts a queue from a party with a
+    // hire in it: the core's group path would queue its members, and the
+    // HireLifecycle sweep owns hires queued any other way (human master).
+    if (!sPlayerbotAIConfig.hireAllowPvP && bot->GetGroup())
+        for (auto const& slot : bot->GetGroup()->GetMemberSlots())
+            if (HireLifecycle::Instance().IsHired(slot.guid))
+                return false;
     // AV cannot queue as group in core (BattleGroundHandler returns early
     // for bgTypeId==BATTLEGROUND_AV && joinAsGroup). Force solo to avoid
     // silent failure and never report success for joinAsGroup AV.
@@ -468,6 +512,8 @@ void BattlegroundQueueService::ReconcileMasterQueue()
 {
     if (!sPlayerbotAIConfig.enabled || !sPlayerbotAIConfig.randomBotBgEnabled)
         return;
+    if (m_ownedQueuedGuids.empty())
+        return;
     PruneOwnedQueueSet();
     // Reconcile service-owned queued bots whose human master became active
     // before invite. Only touches (guid, queueType) pairs owned by this service
@@ -530,9 +576,16 @@ void BattlegroundQueueService::Update(uint32_t diff)
     if (!RandomBotService::Instance().IsPoolAvailable())
         return;
 
-    // Reconcile every tick: if a bot queued by this service now has an active
-    // human master, leave queue via native BattleGroundQueue before invite.
-    ReconcileMasterQueue();
+    // Reconcile once a second: if a bot queued by this service now has an
+    // active human master, leave queue via native BattleGroundQueue before
+    // invite. Every tick it scanned the whole pool twice (~4% of the world
+    // thread at 2000 bots) for a queue that is almost always empty.
+    m_reconcileElapsedMs += diff;
+    if (m_reconcileElapsedMs >= 1000)
+    {
+        m_reconcileElapsedMs = 0;
+        ReconcileMasterQueue();
+    }
 
     uint32 interval = sPlayerbotAIConfig.randomBotBgQueueInterval;
     if (interval < 5000)
@@ -540,21 +593,40 @@ void BattlegroundQueueService::Update(uint32_t diff)
     if (interval > 600000)
         interval = 600000;
 
+    // Two cadences: the configured interval paces the autonomous bot-only
+    // seeder (unchanged); a fixed 5 s check serves a waiting human so a
+    // match forms in seconds, not after 1 bot per 30 s.
     m_elapsedMs += diff;
-    if (m_elapsedMs < interval)
+    m_demandElapsedMs += diff;
+    bool seedDue = m_elapsedMs >= interval;
+    bool demandDue = m_demandElapsedMs >= kHumanBgDemandIntervalMs;
+    if (!seedDue && !demandDue)
         return;
-    m_elapsedMs = 0;
+    if (seedDue)
+        m_elapsedMs = 0;
+    if (demandDue)
+        m_demandElapsedMs = 0;
 
-    uint32 maxPerInterval = sPlayerbotAIConfig.randomBotBgMaxQueuePerInterval;
-    if (!maxPerInterval)
+    // Budget 0 still switches both paths off.
+    if (!sPlayerbotAIConfig.randomBotBgMaxQueuePerInterval)
         return;
-    if (maxPerInterval > 10)
-        maxPerInterval = 10;
-
-    // Observe actual human demand through the core's copy-only snapshot. No
-    // demand means no autonomous queueing; the service never fills blindly.
+    // Observe actual human demand through the core's copy-only snapshot.
     std::vector<HumanBgDemand> demands = GetHumanBgDemands();
     if (demands.empty())
+    {
+        // No human demand: autonomous bot-only WSG seeding (default on,
+        // opt out with AiPlayerbot.RandomBotBgAutonomous = 0) runs on the
+        // configured cadence/budget instead of idling.
+        if (seedDue)
+            UpdateAutonomousSeeding();
+        return;
+    }
+
+    bool anyNeed = false;
+    for (HumanBgDemand const& demand : demands)
+        if (demand.need[0] || demand.need[1])
+            anyNeed = true;
+    if (!anyNeed)
         return;
 
     // In-memory live Headless/random candidate selection: no DB or world scan.
@@ -573,33 +645,358 @@ void BattlegroundQueueService::Update(uint32_t diff)
         std::swap(candidates[i], candidates[j]);
     }
 
+    // Fill both sides of every human-demand bucket up to the match minimum
+    // plus a small margin, a few bots per side per check so the sides grow
+    // together.
     uint32 queued = 0;
     for (Player* bot : candidates)
     {
-        if (queued >= maxPerInterval)
+        if (queued >= kHumanBgDemandMaxPerCheck)
             break;
         if (!IsEligible(bot))
             continue;
+        int side = BgSideIndex(bot->GetTeam());
+        if (side < 0)
+            continue;
 
-        for (HumanBgDemand const& demand : demands)
+        for (HumanBgDemand& demand : demands)
         {
             if (bot->GetBattleGroundBracketIdFromLevel(demand.bgType) != demand.bracket)
                 continue;
-            if (demand.underrepresentedTeam != TEAM_NONE &&
-                bot->GetTeam() != demand.underrepresentedTeam)
+            // A WSG/AB bot group leader queues its whole group; count every
+            // member so a group never pushes the side past its target (AV is
+            // always queued solo).
+            uint32 entrySize = 1;
+            if (demand.bgType != BATTLEGROUND_AV)
+                if (Group* group = bot->GetGroup())
+                    entrySize = group->GetMembersCount();
+            if (!HumanBgSideWantsBot(demand.need[side], demand.queuedThisCheck[side], entrySize))
                 continue;
             if (TryQueue(bot, uint32(demand.queueType)))
             {
                 ++queued;
+                demand.need[side] -= std::min(entrySize, demand.need[side]);
+                ++demand.queuedThisCheck[side];
                 break;
             }
         }
     }
 
     if (queued)
-        TB_LOG_DEBUG("TortoiseBots: BG auto-queue tick queued %u/%u for human demand (eligible %u, demand buckets %u, interval %u ms)",
-            queued, maxPerInterval, static_cast<uint32>(candidates.size()),
-            static_cast<uint32>(demands.size()), interval);
+        TB_LOG_DEBUG("TortoiseBots: BG auto-queue check queued %u/%u for human demand (eligible %u, demand buckets %u, every %u ms)",
+            queued, kHumanBgDemandMaxPerCheck, static_cast<uint32>(candidates.size()),
+            static_cast<uint32>(demands.size()), kHumanBgDemandIntervalMs);
+}
+
+uint32_t BattlegroundQueueService::CountRunningBotOnlyWsg(uint32_t bracketIndex) const
+{
+    // A FULL bot-only instance of THIS bracket: running WSG whose players are
+    // all service Headless random bots and whose sides are both at max, so
+    // the core's free-slot path no longer invites queued seeds into it.
+    // A still-forming match (either side below max) absorbs queued seeds
+    // through FillPlayersToBG, so it must NOT count — otherwise top-up would
+    // stall at core min (4v4) instead of reaching 10v10. Humans, owned/party
+    // bots, other brackets, or an empty map fail the check so mixed matches
+    // and parallel brackets never count against this bracket's cap.
+    uint32_t count = 0;
+    for (auto it = sBattleGroundMgr.GetBattleGroundsBegin(BATTLEGROUND_WS);
+        it != sBattleGroundMgr.GetBattleGroundsEnd(BATTLEGROUND_WS); ++it)
+    {
+        BattleGround* bg = it->second;
+        if (!bg || bg->GetStatus() == STATUS_WAIT_LEAVE)
+            continue;
+        if (bracketIndex < MAX_BATTLEGROUND_BRACKETS &&
+            bg->GetBracketId() != BattleGroundBracketId(bracketIndex))
+            continue;
+        if (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS)
+            continue;
+        uint32_t maxPerTeam = bg->GetMaxPlayersPerTeam();
+        if (!maxPerTeam)
+            maxPerTeam = AutonomousBgTeamTarget();
+        BattleGround::BattleGroundPlayerMap const& players = bg->GetPlayers();
+        if (players.empty())
+            continue;
+        bool botOnly = true;
+        uint32_t inAlliance = 0;
+        uint32_t inHorde = 0;
+        for (BattleGround::BattleGroundPlayerMap::value_type const& pair : players)
+        {
+            Player* member = sObjectAccessor.FindPlayer(pair.first);
+            if (!member || !member->IsInWorld() || !member->GetSession() ||
+                !member->GetSession()->IsHeadless() ||
+                !BotManager::Instance().IsRandomBot(pair.first))
+            {
+                botOnly = false;
+                break;
+            }
+            if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(member))
+                if (ai->HasActivePlayerMaster())
+                {
+                    botOnly = false;
+                    break;
+                }
+            if (uint32(member->GetTeam()) == uint32(ALLIANCE))
+                ++inAlliance;
+            else if (uint32(member->GetTeam()) == uint32(HORDE))
+                ++inHorde;
+        }
+        if (!botOnly)
+            continue;
+        // Both sides at max: full, closed to top-up. Anything less is still
+        // forming and keeps absorbing queued seeds.
+        if (inAlliance >= maxPerTeam && inHorde >= maxPerTeam)
+            ++count;
+    }
+    return count;
+}
+
+uint32_t BattlegroundQueueService::CountOwnedQueuedFor(uint32_t queueTypeValue, uint32_t bracketIndex) const
+{
+    if (queueTypeValue >= MAX_BATTLEGROUND_QUEUE_TYPES || bracketIndex >= MAX_BATTLEGROUND_BRACKETS)
+        return 0;
+    BattleGroundQueueTypeId queueType = BattleGroundQueueTypeId(queueTypeValue);
+    BattleGroundTypeId bgType = sServerFacade.BGTemplateId(queueType);
+    uint32_t count = 0;
+    // Service-owned seeds only: entries this service queued (m_ownedQueuedGuids
+    // as (guidLow, queueType) pairs). Demand backfill and party/manual queues
+    // belong to other paths and must not steer the seed bracket.
+    for (uint64_t key : m_ownedQueuedGuids)
+    {
+        if (uint32_t(key & 0xFFFFFFFFu) != queueTypeValue)
+            continue;
+        ObjectGuid guid(HIGHGUID_PLAYER, uint32_t(key >> 32));
+        Player* p = sObjectAccessor.FindPlayer(guid);
+        if (!p || !p->InBattleGroundQueueForBattleGroundQueueType(queueType))
+            continue;
+        if (p->GetBattleGroundBracketIdFromLevel(bgType) != BattleGroundBracketId(bracketIndex))
+            continue;
+        ++count;
+    }
+    return count;
+}
+
+void BattlegroundQueueService::CountSeededForTeams(uint32_t queueTypeValue, uint32_t bracketIndex,
+    uint32_t& seededAlliance, uint32_t& seededHorde) const
+{
+    seededAlliance = 0;
+    seededHorde = 0;
+    if (queueTypeValue >= MAX_BATTLEGROUND_QUEUE_TYPES || bracketIndex >= MAX_BATTLEGROUND_BRACKETS)
+        return;
+    BattleGroundQueueTypeId queueType = BattleGroundQueueTypeId(queueTypeValue);
+    BattleGroundTypeId bgType = sServerFacade.BGTemplateId(queueType);
+    // Queued seeds for this bracket, both teams in one pass.
+    for (Player* p : BotManager::Instance().GetAllBots())
+    {
+        if (!p || !p->InBattleGroundQueueForBattleGroundQueueType(queueType))
+            continue;
+        // The queue slot stays set after entry (the core clears it only on
+        // leave), so bots already inside are counted by the in-match loop
+        // below, not here - counting both stalled top-up at ~5v5.
+        if (p->InBattleGround())
+            continue;
+        if (p->GetBattleGroundBracketIdFromLevel(bgType) != BattleGroundBracketId(bracketIndex))
+            continue;
+        if (uint32(p->GetTeam()) == uint32(ALLIANCE))
+            ++seededAlliance;
+        else if (uint32(p->GetTeam()) == uint32(HORDE))
+            ++seededHorde;
+    }
+    // In-match bots of a still-forming bot-only instance count toward the
+    // target: the queued seeds plus the players already inside must reach
+    // 10v10 together, and the core's free-slot path keeps inviting the queued
+    // seeds in while either side is below max. A FULL instance (both sides at
+    // max) absorbs nothing more, so it contributes nothing here — the
+    // bracket-scoped cap in UpdateAutonomousSeeding stops new seeds.
+    for (auto it = sBattleGroundMgr.GetBattleGroundsBegin(BATTLEGROUND_WS);
+        it != sBattleGroundMgr.GetBattleGroundsEnd(BATTLEGROUND_WS); ++it)
+    {
+        BattleGround* bg = it->second;
+        if (!bg || bg->GetStatus() == STATUS_WAIT_LEAVE)
+            continue;
+        if (bg->GetBracketId() != BattleGroundBracketId(bracketIndex))
+            continue;
+        if (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS)
+            continue;
+        uint32_t maxPerTeam = bg->GetMaxPlayersPerTeam();
+        if (!maxPerTeam)
+            maxPerTeam = AutonomousBgTeamTarget();
+        BattleGround::BattleGroundPlayerMap const& players = bg->GetPlayers();
+        if (players.empty())
+            continue;
+        // Bot-only instance: every player a service Headless random bot.
+        bool botOnly = true;
+        uint32_t inAlliance = 0;
+        uint32_t inHorde = 0;
+        for (BattleGround::BattleGroundPlayerMap::value_type const& pair : players)
+        {
+            Player* inMember = sObjectAccessor.FindPlayer(pair.first);
+            if (!inMember || !inMember->IsInWorld() || !inMember->GetSession() ||
+                !inMember->GetSession()->IsHeadless() ||
+                !BotManager::Instance().IsRandomBot(pair.first))
+            {
+                botOnly = false;
+                break;
+            }
+            if (PlayerbotAI* inAi = PlayerbotAIStorage::Instance().GetAI(inMember))
+                if (inAi->HasActivePlayerMaster())
+                {
+                    botOnly = false;
+                    break;
+                }
+            if (uint32(inMember->GetTeam()) == uint32(ALLIANCE))
+                ++inAlliance;
+            else if (uint32(inMember->GetTeam()) == uint32(HORDE))
+                ++inHorde;
+        }
+        if (!botOnly)
+            continue;
+        // Full on both sides: absorbs nothing more; the cap path stops seeds.
+        if (inAlliance >= maxPerTeam && inHorde >= maxPerTeam)
+            continue;
+        seededAlliance += inAlliance;
+        seededHorde += inHorde;
+    }
+}
+
+void BattlegroundQueueService::UpdateAutonomousSeeding()
+{
+    if (!sPlayerbotAIConfig.randomBotBgAutonomous)
+        return;
+    // Pool reset in progress: same guard as the demand path (issue #265).
+    if (!RandomBotService::Instance().IsPoolAvailable())
+        return;
+    uint32_t maxPerInterval = sPlayerbotAIConfig.randomBotBgMaxQueuePerInterval;
+    if (!maxPerInterval)
+        return;
+    if (maxPerInterval > 10)
+        maxPerInterval = 10;
+
+    // Single in-memory snapshot for the whole tick: per-bracket eligible
+    // counts per team plus the reusable candidate list (no 8x pool scans,
+    // no per-candidate recounts). Readiness counts solo bots only — the queue
+    // loop never seeds grouped bots, so grouped leaders must not make a
+    // bracket look ready.
+    uint32_t wsgQueue = uint32(BATTLEGROUND_QUEUE_WS);
+    std::vector<Player*> snapshot = BotManager::Instance().GetAllBots();
+    uint32_t eligible[MAX_BATTLEGROUND_BRACKETS][2] = {};
+    std::vector<Player*> wsgEligible;
+    wsgEligible.reserve(snapshot.size());
+    for (Player* p : snapshot)
+    {
+        if (!IsEligible(p))
+            continue;
+        if (!p->GetBGAccessByLevel(BATTLEGROUND_WS))
+            continue;
+        BattleGroundBracketId bracket = p->GetBattleGroundBracketIdFromLevel(BATTLEGROUND_WS);
+        if (bracket < 0 || bracket >= MAX_BATTLEGROUND_BRACKETS)
+            continue;
+        if (p->GetGroup())
+            continue;
+        uint32 team = uint32(p->GetTeam());
+        uint32 side = (team == uint32(ALLIANCE)) ? 0 : (team == uint32(HORDE) ? 1 : 2);
+        if (side > 1)
+            continue;
+        ++eligible[uint32(bracket)][side];
+        wsgEligible.push_back(p);
+    }
+
+    // Sticky seed bracket: while service-owned seeds wait in a bracket, keep
+    // filling it so 1-per-tick batches converge instead of scattering.
+    // Only when no seeds are queued anywhere pick the most populated ready
+    // bracket (both teams >= target, so a 19/1 bracket never seeds).
+    uint32_t bestBracket = 0;
+    bool found = false;
+    for (uint32_t b = 0; b < MAX_BATTLEGROUND_BRACKETS; ++b)
+    {
+        if (CountOwnedQueuedFor(wsgQueue, b) > 0)
+        {
+            bestBracket = b;
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+    {
+        uint32_t bestTotal = 0;
+        for (uint32_t b = 0; b < MAX_BATTLEGROUND_BRACKETS; ++b)
+        {
+            if (!BracketCanSeed(eligible[b][0], eligible[b][1]))
+                continue;
+            uint32_t total = eligible[b][0] + eligible[b][1];
+            if (total > bestTotal)
+            {
+                bestTotal = total;
+                bestBracket = b;
+                found = true;
+            }
+        }
+    }
+    if (!found)
+        return;
+
+    // Bracket-scoped cap: a FULL bot-only instance in THIS bracket blocks new
+    // seeds for it; a still-forming match keeps absorbing queued seeds, so it
+    // does not count. Other brackets are unaffected.
+    uint32_t running = CountRunningBotOnlyWsg(bestBracket);
+    uint32_t seededAlliance = 0;
+    uint32_t seededHorde = 0;
+    CountSeededForTeams(wsgQueue, bestBracket, seededAlliance, seededHorde);
+    bool needAlliance = TeamNeedsSeedBots(seededAlliance);
+    bool needHorde = TeamNeedsSeedBots(seededHorde);
+    if (!ShouldSeedAutonomousBg(true, false, running, needAlliance || needHorde,
+        sPlayerbotAIConfig.randomBotBgAutonomousMaxInstances))
+        return;
+
+    // Candidates for the seed bracket, shuffled so the same bots are not
+    // always picked. Solo-only: groups stay out of autonomous seeds (a group
+    // leader queueing would silently pull members into a bot-only match).
+    std::vector<Player*> candidates;
+    candidates.reserve(wsgEligible.size());
+    for (Player* p : wsgEligible)
+    {
+        if (p->GetBattleGroundBracketIdFromLevel(BATTLEGROUND_WS) != BattleGroundBracketId(bestBracket))
+            continue;
+        if (p->GetGroup())
+            continue;
+        candidates.push_back(p);
+    }
+    if (candidates.empty())
+        return;
+    for (size_t i = candidates.size() - 1; i > 0; --i)
+    {
+        size_t j = urand(0, static_cast<uint32>(i));
+        std::swap(candidates[i], candidates[j]);
+    }
+
+    // Local per-team counters: computed once above, incremented on each
+    // success — no per-candidate recount over the pool and BG maps.
+    uint32_t queued = 0;
+    for (Player* bot : candidates)
+    {
+        if (queued >= maxPerInterval)
+            break;
+        if (!IsEligible(bot) || bot->GetGroup())
+            continue;
+        bool isAlliance = uint32(bot->GetTeam()) == uint32(ALLIANCE);
+        bool isHorde = uint32(bot->GetTeam()) == uint32(HORDE);
+        if (!isAlliance && !isHorde)
+            continue;
+        uint32_t seeded = isAlliance ? seededAlliance : seededHorde;
+        if (!TeamNeedsSeedBots(seeded))
+            continue;
+        if (TryQueue(bot, wsgQueue))
+        {
+            ++queued;
+            if (isAlliance)
+                ++seededAlliance;
+            else
+                ++seededHorde;
+        }
+    }
+
+    if (queued)
+        TB_LOG_DEBUG("TortoiseBots: BG autonomous seed queued %u/%u WSG bracket %u (running %u)",
+            queued, maxPerInterval, bestBracket, running);
 }
 
 void BattlegroundQueueService::Shutdown()
@@ -611,6 +1008,7 @@ void BattlegroundQueueService::Shutdown()
     m_ownedQueuedGuids.clear();
     m_initialized = false;
     m_elapsedMs = 0;
+    m_demandElapsedMs = 0;
 }
 
 void BattlegroundQueueService::OnLeaseEvicted(uint32_t guidLow)

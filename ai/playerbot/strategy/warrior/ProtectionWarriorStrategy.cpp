@@ -13,6 +13,7 @@ public:
         creators["sunder armor"] = &sunder_armor;
         creators["last stand"] = &last_stand;
         creators["taunt"] = &taunt;
+        creators["mocking blow"] = &mocking_blow;
         creators["berserker rage fear"] = &berserker_rage_fear;
     }
 
@@ -26,6 +27,7 @@ private:
     ACTION_NODE_A(taunt, "taunt", "battle shout taunt");
 
     ACTION_NODE_A(berserker_rage_fear, "berserker rage", "death wish");
+    ACTION_NODE_P(mocking_blow, "mocking blow", "battle stance for mocking blow");
 };
 
 ProtectionWarriorStrategy::ProtectionWarriorStrategy(PlayerbotAI* ai) : WarriorStrategy(ai)
@@ -41,15 +43,46 @@ NextAction** ProtectionWarriorStrategy::GetDefaultCombatActions()
 
 void ProtectionWarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
-    WarriorStrategy::InitCombatTriggers(triggers);
+    // Skip WarriorStrategy's base interrupt rows: their Pummel resolves
+    // through the berserker-stance prerequisite, so a tank facing a caster
+    // left Defensive Stance, could not Pummel (no rage after the swap), and
+    // the "defensive stance" buff row swapped it straight back - every tick
+    // for as long as the mob kept casting. The tank interrupts with Shield
+    // Bash only (donor TankWarriorStrategy), which Defensive Stance allows.
+    ClassStrategy::InitCombatTriggers(triggers);
+
+    // Standalone Defensive Stance maintenance (donor TankWarriorStrategy
+    // keeps the same row at HIGH+9): without it the stance only returns as
+    // a prerequisite of taunt/revenge/shield block/shield wall, so a tank
+    // that enters combat in Battle Stance (charge, overpower dance, summon)
+    // waits on a dodge/parry/block proc or losing aggro before swapping -
+    // off-tanks holding no aggro never qualified and fought the whole pull
+    // in Battle Stance. Deliberately below the overpower dance (battle
+    // HIGH+5, overpower HIGH+4): at HIGH+9 it would outbid the dance and
+    // the dodge proc would expire unused.
+    triggers.push_back(new TriggerNode(
+        "defensive stance",
+        NextAction::array(0, new NextAction("defensive stance", ACTION_HIGH + 2), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "shield bash",
+        NextAction::array(0, new NextAction("shield bash", ACTION_INTERRUPT), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "shield bash on enemy healer",
+        NextAction::array(0, new NextAction("shield bash on enemy healer", ACTION_INTERRUPT), NULL)));
+
+    // Staggered defensives (donor TankWarriorStrategy): Shield Wall fires
+    // early at low health (20-50%), Last Stand only at critical (<20%).
+    // Stacking both at critical wastes Wall's 30-min cooldown on fights
+    // Last Stand alone would survive.
+    triggers.push_back(new TriggerNode(
+        "low health",
+        NextAction::array(0, new NextAction("shield wall", ACTION_MEDIUM_HEAL), NULL)));
 
     triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("last stand", ACTION_EMERGENCY + 2), NULL)));
-
-    triggers.push_back(new TriggerNode(
-        "critical health",
-        NextAction::array(0, new NextAction("shield wall", ACTION_EMERGENCY + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "has blessing of salvation",
@@ -63,17 +96,37 @@ void ProtectionWarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
         "enemy out of melee",
         NextAction::array(0, new NextAction("charge", ACTION_MOVE + 7), NULL)));
 
-    triggers.push_back(new TriggerNode(
-        "intercept and rage",
-        NextAction::array(0, new NextAction("berserker stance", ACTION_MOVE + 6), NULL)));
+    // No Intercept rows: Intercept needs Berserker Stance, and the donor tank
+    // never leaves Defensive Stance to close a gap (charge / reach melee and
+    // taunt cover it).
 
+    // Intervene a focused party member (donor TankWarriorStrategy fires at
+    // EMERGENCY): Intervene 45595 is a real learnable 1.18.1 spell
+    // (Defensive-locked, taught by 47277), and the trigger/action/PROTECT
+    // targeting were already registered — only this row was missing.
     triggers.push_back(new TriggerNode(
-        "intercept and rage",
-        NextAction::array(0, new NextAction("intercept", ACTION_MOVE + 5), NULL)));
+        "protect party member",
+        NextAction::array(0, new NextAction("intervene", ACTION_EMERGENCY), NULL)));
 
+    // Lost aggro (donor TankWarriorStrategy: taunt at INTERRUPT+1): a mob
+    // peeling onto a non-tank member outranks DPS spenders and interrupts —
+    // a missed kick costs damage, a missed taunt costs the healer.
+    // Sits below EMERGENCY defensives, above pummel/shield-bash
+    // (ACTION_INTERRUPT), every DPS row (HIGH band) and the out-of-melee
+    // charge path (MOVE+7).
     triggers.push_back(new TriggerNode(
         "lose aggro",
-        NextAction::array(0, new NextAction("taunt", ACTION_MOVE + 4), NULL)));
+        NextAction::array(0, new NextAction("taunt", ACTION_INTERRUPT + 1), NULL)));
+    triggers.push_back(new TriggerNode(
+        "mocking blow taunt",
+        NextAction::array(0, new NextAction("mocking blow", ACTION_INTERRUPT), NULL)));
+
+    // A mob sitting on a non-tank member: "lose aggro" only sees the tank's
+    // current target and the snare row skips an arrived mob. A missed taunt
+    // costs the healer.
+    triggers.push_back(new TriggerNode(
+        "party member attacked",
+        NextAction::array(0, new NextAction("taunt on attacker", ACTION_INTERRUPT + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "taunt on snare target",
@@ -85,16 +138,42 @@ void ProtectionWarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
 
     triggers.push_back(new TriggerNode(
         "shield block",
-        NextAction::array(0, new NextAction("shield block", ACTION_HIGH + 5), NULL)));
+        NextAction::array(0, new NextAction("shield block", ACTION_HIGH + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "sunder armor",
-        NextAction::array(0, new NextAction("sunder armor", ACTION_HIGH + 2), NULL)));
+        NextAction::array(0, new NextAction("sunder armor", ACTION_HIGH + 5), NULL)));
+
+    // Two or more mobs in melee: Thunder Clap (Turtle allows it in Defensive
+    // Stance) is the tank's threat on every mob at once, so it goes before
+    // the single-target builders (Demoralizing Shout HIGH+6, Sunder HIGH+5).
+    // At HIGH+1 Sunder took every 15 rage first and the clap almost never
+    // fired: 2 claps in 175 pack frames, ZF hires-2 run 6. The action is a
+    // debuff, so it is recast only once the current target lost the clap.
+    // Donor TankWarriorStrategy puts it higher still ("thunder clap and
+    // rage", ACTION_MOVE + 11, on one mob too).
+    triggers.push_back(new TriggerNode(
+        "melee light aoe",
+        NextAction::array(0, new NextAction("thunder clap", ACTION_HIGH + 7), NULL)));
 
     triggers.push_back(new TriggerNode(
         "revenge",
         NextAction::array(0, new NextAction("revenge", ACTION_HIGH + 3), NULL)));
 
+    // The proc stays below taunt and ties Sunder; stack building is listed first.
+    triggers.push_back(new TriggerNode(
+        "improved shield slam proc",
+        NextAction::array(0, new NextAction("shield slam", ACTION_HIGH + 5), NULL)));
+
+    // Shield Slam at any affordable rage (donor TankWarriorStrategy gates at
+    // 40, but that stranded rage-thin off-tanks): Slam costs 20 rage, and a
+    // Protection bot that is not the boss's victim earns almost no rage
+    // from hits taken - white swings plus Bloodrage only. Gating the row at
+    // 40 parked such bots in melee-only for most of a boss fight (H7
+    // Patchwerk: Fury passed three living off-tanks on threat at 57/69 s
+    // while Shield Slam sat IMPOSSIBLE at 20-39 rage), so the row fires as
+    // soon as the spell is affordable. The main tank is unaffected (it
+    // already slams near cooldown). Thunder clap stays below at HIGH+1.
     triggers.push_back(new TriggerNode(
         "light rage available",
         NextAction::array(0, new NextAction("shield slam", ACTION_HIGH + 4), NULL)));
@@ -107,13 +186,16 @@ void ProtectionWarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
         "mortal strike",
         NextAction::array(0, new NextAction("mortal strike", ACTION_HIGH + 4), NULL)));
 
+    // Queue the 60+ rage next-swing dump before the GCD builders.
     triggers.push_back(new TriggerNode(
         "heroic strike",
-        NextAction::array(0, new NextAction("heroic strike", ACTION_HIGH + 1), NULL)));
+        NextAction::array(0, new NextAction("heroic strike", ACTION_HIGH + 6), NULL)));
 
+    // Disarm at HIGH+1 (donor TankWarriorStrategy): stripping the mob's
+    // weapon cuts tank damage taken; buried at NORMAL it never fired.
     triggers.push_back(new TriggerNode(
         "disarm",
-        NextAction::array(0, new NextAction("disarm", ACTION_NORMAL), NULL)));
+        NextAction::array(0, new NextAction("disarm", ACTION_HIGH + 1), NULL)));
 
     // Tortoise build additions:
     //
@@ -137,12 +219,17 @@ void ProtectionWarriorStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
                              new NextAction("overpower", ACTION_HIGH + 4),
                              new NextAction("defensive stance", ACTION_HIGH + 3), NULL)));
 
-    // Bloodrage opener: Improved Bloodrage 2/2 gives +50% rage generation.
+    // Bloodrage opener and rage maintenance (donor TankWarriorStrategy runs
+    // it at HIGH+2): Improved Bloodrage 2/2 gives +50% rage generation.
     // Cast on engage to jump-start the rotation (Shield Slam needs ~15 rage
-    // to fire, Bloodrage gives 30+).
+    // to fire, Bloodrage gives 30+) and on cooldown for rage-thin
+    // off-tanks. NORMAL+5 lost to the sunder row's melee alternative
+    // (25.04) while the sunder stack was incomplete, delaying the first
+    // Bloodrage ~10 s into the pull; HIGH+2 sits below every threat
+    // builder, so it only ever wins rage the builders cannot spend.
     triggers.push_back(new TriggerNode(
         "bloodrage",
-        NextAction::array(0, new NextAction("bloodrage", ACTION_NORMAL + 5), NULL)));
+        NextAction::array(0, new NextAction("bloodrage", ACTION_HIGH + 2), NULL)));
 }
 
 void ProtectionWarriorStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -245,8 +332,8 @@ void ProtectionWarriorAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& t
     WarriorAoeStrategy::InitCombatTriggers(triggers);
 
     triggers.push_back(new TriggerNode(
-        "melee medium aoe",
-        NextAction::array(0, new NextAction("challenging shout", ACTION_HIGH + 1), NULL)));
+        "loose adds near",
+        NextAction::array(0, new NextAction("challenging shout", ACTION_INTERRUPT + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "melee medium aoe",
@@ -297,10 +384,6 @@ void ProtectionWarriorAoeRaidStrategy::InitNonCombatTriggers(std::list<TriggerNo
 void ProtectionWarriorBuffStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     WarriorBuffStrategy::InitCombatTriggers(triggers);
-
-    triggers.push_back(new TriggerNode(
-        "defensive stance",
-        NextAction::array(0, new NextAction("defensive stance", ACTION_MOVE), NULL)));
 
     triggers.push_back(new TriggerNode(
         "feared",

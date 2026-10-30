@@ -1,9 +1,112 @@
 
 #include "playerbot/playerbot.h"
+#include "playerbot/policy/class/ArcaneRupturePolicy.h"
+#include "playerbot/policy/class/FlamestrikeWindowPolicy.h"
+#include "playerbot/policy/class/MageAoeSafetyPolicy.h"
+#include "playerbot/strategy/values/LastSpellCastValue.h"
+#include "playerbot/policy/class/HotStreakPolicy.h"
+#include "playerbot/strategy/values/AoeValues.h"
 #include "MageTriggers.h"
 #include "MageActions.h"
 
 using namespace ai;
+
+bool BlinkBackTrigger::IsActive()
+{
+    // Blink spell id 1953; ready check keeps the escape for when it can run.
+    if (!sServerFacade.IsSpellReady(bot, 1953))
+        return false;
+    // Rooted/stunned handled by the plain blink node above (EMERGENCY).
+    if (bot->HasAuraType(SPELL_AURA_MOD_ROOT) || bot->HasAuraType(SPELL_AURA_MOD_STUN))
+        return false;
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsAlive())
+        return false;
+    // Only a mob that is attacking the mage is a kiting threat. A target
+    // the tank holds can come within 8 yd while the mage walks up to cast;
+    // blinking away from it lands the mage out of cast (and CC) reach.
+    if (target->GetVictim() != bot)
+        return false;
+    // Inside ~8 yd melee reach of the bot: blink away, then resume nuking.
+    return sServerFacade.getDistance2d(bot, target) <= 8.0f;
+}
+
+namespace
+{
+// Too little mana for this nuke (NukeUnaffordable, WandPolicy.h); false for
+// a spell the bot does not know or one that costs no mana.
+bool ManaShortForNuke(PlayerbotAI* ai, Player* bot, std::string const& nuke)
+{
+    // A mana pool, whatever is left of it (0 included).
+    if (nuke.empty() || bot->GetMaxPower(POWER_MANA) == 0)
+        return false;
+    uint32 const spellId = ai->GetAiObjectContext()->GetValue<uint32>("spell id", nuke)->Get();
+    if (!spellId)
+        return false;
+    SpellEntry const* spellInfo = sServerFacade.LookupSpellInfo(spellId);
+    if (!spellInfo || spellInfo->powerType != POWER_MANA)
+        return false;
+    uint32 const cost = Spell::CalculatePowerCost(spellInfo, bot, nullptr, nullptr);
+    return NukeUnaffordable(true, bot->GetPower(POWER_MANA), cost);
+}
+
+// The filler (default action) of the mage's spec placeholder strategy.
+std::string SpecFillerNuke(PlayerbotAI* ai)
+{
+    if (ai->HasStrategy("arcane", BotState::BOT_STATE_COMBAT))
+        return "arcane missiles";
+    if (ai->HasStrategy("fire", BotState::BOT_STATE_COMBAT))
+        return "fireball";
+    if (ai->HasStrategy("frost", BotState::BOT_STATE_COMBAT))
+        return "frostbolt";
+    return "";
+}
+}
+
+bool WandBlocksNukeTrigger::IsActive()
+{
+    if (!IsWanding())
+        return false;
+
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsAlive())
+        return false;
+
+    // The raid strategy wands on purpose while the mage holds aggro
+    // ("has aggro" -> shoot, MageRaidStrategy); leave that wand alone.
+    bool const keepWandForThreat = RaidAggroWand();
+    if (keepWandForThreat)
+        return false;
+
+    // Below 5% mana the "no mana" -> shoot row (MageStrategy) wands on purpose.
+    bool const noManaRowActive = NoManaRowActive();
+    if (noManaRowActive)
+        return false;
+
+    // Near the tank's threat the "threat" multiplier vetoes the nukes, so
+    // stopping a running wand would only leave the mage idle. The veto no
+    // longer starts the wand (the nukes have no "shoot" fallback).
+    bool const nukeThreatVetoed = ThreatVetoesNuke();
+    if (nukeThreatVetoed)
+        return false;
+
+    WandState state{
+        true,
+        BetterWandSpellProbe(ProbeSpell("frostbolt", target), ProbeSpell("fireball", target)),
+        keepWandForThreat,
+        noManaRowActive,
+        WandSpellProbe::Blocked,
+        nukeThreatVetoed};
+    // Too little mana for the spec's filler: the "<filler> unaffordable"
+    // row wands on purpose (a cheaper Frostbolt probe must not stop it).
+    state.manaShortRowActive = ManaShortForNuke(ai, bot, SpecFillerNuke(ai));
+    return ShouldStopWandToCast(state);
+}
+
+bool NukeUnaffordableTrigger::IsActive()
+{
+    return ManaShortForNuke(ai, bot, nuke);
+}
 
 bool AnyMageArmorTrigger::IsActive()
 {
@@ -34,14 +137,41 @@ bool ManaShieldTrigger::IsActive()
     return !ai->HasAura("mana shield", bot) && AI_VALUE2(uint8, "mana", "self target") > sPlayerbotAIConfig.mediumMana;
 }
 
+bool HotStreakTrigger::IsActive()
+{
+    // Proc auras only (51930/51931): the talent auras 51927/51928 share
+    // the "Hot Streak" name and sit on the bot permanently, so a
+    // name-based HasAura check would fire on every tick for any talented
+    // bot. Turtle's proc stacks cast-time reduction (5 stacks ≈ instant);
+    // fire only at full stacks so a 1-stack proc is not spent early.
+    HotStreakState state{false, 0, false, 0};
+    if (Aura* aura = ai->GetAura(HOT_STREAK_PROC_RANK_1, bot))
+    {
+        state.hasProcRank1 = true;
+        state.procRank1Stacks = aura->GetStackAmount();
+    }
+    if (Aura* aura = ai->GetAura(HOT_STREAK_PROC_RANK_2, bot))
+    {
+        state.hasProcRank2 = true;
+        state.procRank2Stacks = aura->GetStackAmount();
+    }
+    return ShouldCastHotStreakPyroblast(state);
+}
+
 bool NoImprovedScorchDebuffTrigger::IsActive()
 {
-    if (bot->HasSpell(11095) || bot->HasSpell(12872) || bot->HasSpell(12873))
-    {
-        return DebuffTrigger::IsActive();
-    }
+    // Fire Vulnerability talent ranks (Turtle ids, same set as
+    // NoFireVulnerabilityTrigger).
+    if (!bot->HasSpell(11095) && !bot->HasSpell(12872) && !bot->HasSpell(12873) && !bot->HasSpell(12874) && !bot->HasSpell(12875))
+        return false;
 
-    return false;
+    Unit* target = GetTarget();
+    if (!target || !target->IsAlive() || target->IsPlayer())
+        return false;
+
+    // Fire Vulnerability debuff (22959) missing: open with Scorch. Stack and
+    // refresh upkeep stays with NoFireVulnerabilityTrigger.
+    return ai->GetAura(22959, target) == nullptr;
 }
 
 bool ArcanePowerTrigger::IsActive()
@@ -122,6 +252,129 @@ bool EvocationChannelCheckTrigger::IsActive()
             if (!AI_VALUE2(bool, "has mana", "self target"))
                 return false;
             return AI_VALUE2(uint8, "mana", "self target") >= 95;
+        }
+    }
+    return false;
+}
+
+bool ArcaneRuptureTrigger::IsActive()
+{
+    // Cheap gates first: known spell, then the self-buff aura check.
+    if (!ai->HasSpell("arcane rupture"))
+        return false;
+    // 15s category cooldown (category 1013) outlives the 8s self buff, so
+    // without a readiness gate the trigger would sit active-but-uncastable
+    // most of each cycle. ColdSnapTrigger in this file is the precedent.
+    uint32 ruptureId = AI_VALUE2(uint32, "spell id", "arcane rupture");
+    if (!ruptureId || !sServerFacade.IsSpellReady(bot, ruptureId))
+        return false;
+    // Rupture targets an enemy; refuse without a live one.
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsAlive())
+        return false;
+    ArcaneRuptureState state{false, true, false};
+    state.hasRuptureBuff = ai->HasAura(52502, bot) || ai->HasAura(52588, bot);
+    return ShouldCastArcaneRupture(state);
+}
+bool FlamestrikeWindowTrigger::IsActive()
+{
+    // Cheap checks first: last cast must be our flamestrike, then the
+    // pack-density scan. Mirrors donor ordering (blizzard-on-active above
+    // the plain medium-aoe rows); the pack check reuses the medium-aoe
+    // trigger so CC interlock and density stay identical.
+    LastSpellCast& lastSpell = AI_VALUE(LastSpellCast&, "last spell cast");
+    FlamestrikeWindowState state{lastSpell.id, lastSpell.time, time(0), false};
+    if (!IsFlamestrikeCastId(state.lastCastSpellId))
+        return false;
+    if (state.now < state.lastCastTime)
+        return false;
+    if ((state.now - state.lastCastTime) > FLAMESTRIKE_WINDOW_SECONDS)
+        return false;
+
+    Trigger* mediumAoe = ai->GetAiObjectContext()->GetTrigger("ranged medium aoe");
+    state.packStillGrouped = mediumAoe && mediumAoe->IsActive();
+    return ShouldBlizzardAfterFlamestrike(state);
+}
+
+bool ArcaneExplosionWindowTrigger::IsActive()
+{
+    // Density + breakable-CC interlock from the shared AoeTrigger family,
+    // at Arcane Explosion's 10yd radius instead of the 40yd ranged scan.
+    bool const aoeInterlockSafe = AoeTrigger::IsActive();
+
+    // Same cluster the base just accepted; re-derived because AoeTrigger
+    // keeps no state. Triggers on this interval run every 2s.
+    std::list<ObjectGuid> splash = AoeCountValue::FindMaxDensity(bot, 10.0f);
+    bool safeSplash = true;
+    for (std::list<ObjectGuid>::iterator i = splash.begin(); i != splash.end(); ++i)
+    {
+        Unit* unit = ai->GetUnit(*i);
+        if (!unit)
+            continue;
+
+        // Splash threat rides on whoever holds the mob: only a mob on a
+        // tank or already on the mage is safe to burst.
+        Unit* victim = unit->GetVictim();
+        Player* victimPlayer = victim ? victim->ToPlayer() : nullptr;
+        bool const victimIsTank = victimPlayer && ai->IsTank(victimPlayer);
+        bool const victimIsBot = victim == bot;
+        if (!IsSplashSafeForExplosion(ClassifyMobHolder(victim != nullptr, victimIsTank, victimIsBot)))
+        {
+            safeSplash = false;
+            break;
+        }
+    }
+
+    ArcaneExplosionGate gate;
+    gate.mobsInSplash = splash.size();
+    gate.minMobs = amount;
+    gate.aoeInterlockSafe = aoeInterlockSafe;
+    gate.safeSplash = safeSplash;
+    return ShouldArcaneExplosion(gate);
+}
+
+bool FrostNovaWindowTrigger::IsActive()
+{
+    // Only a mob attacking the mage itself is worth the emergency root
+    // (BlinkBackTrigger's read); the tank's held pack must not burn the
+    // cooldown.
+    std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
+    for (std::list<ObjectGuid>::iterator i = attackers.begin(); i != attackers.end(); ++i)
+    {
+        Unit* unit = ai->GetUnit(*i);
+        if (!unit || !unit->IsAlive())
+            continue;
+
+        // Nova reaches 10yd; a mob beyond it cannot be rooted by this cast.
+        if (!sServerFacade.IsDistanceLessOrEqualThan(sServerFacade.getDistance2d(bot, unit), 10.0f))
+            continue;
+
+        if (unit->GetVictim() == bot)
+            return true;
+    }
+    return false;
+}
+
+bool BlizzardChannelCheckTrigger::IsActive()
+{
+    if (Spell* spell = bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+    {
+        if (spell->m_spellInfo)
+        {
+            // Per-rank Blizzard channel ids (effect spells): 10 rank 1,
+            // 6141 rank 2, 8427 rank 3, 10185/10186/10187 ranks 4-6.
+            // Matches mod-playerbots BlizzardChannelCheckTrigger ids.
+            uint32 id = spell->m_spellInfo->Id;
+            if (id == 10 || id == 6141 || id == 8427 ||
+                id == 10185 || id == 10186 || id == 10187)
+            {
+                // Pack thinned below a blizzard's worth: stop channeling.
+                // NOTE: the donor reads singular "attacker count", which is
+                // NOT registered here (only "attackers count" plural is) —
+                // the singular name null-derefs in AI_VALUE. Do not "fix"
+                // this back to the donor spelling.
+                return AI_VALUE(uint8, "attackers count") < 2;
+            }
         }
     }
     return false;

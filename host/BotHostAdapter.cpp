@@ -4,12 +4,21 @@
 #include "../runtime/BotActivityLease.h"
 #include "../runtime/BotManager.h"
 #include "../runtime/HireLifecycle.h"
+#include "../runtime/ClaimLifecycle.h"
 #include "../runtime/HireProvisionService.h"
+#include "../runtime/HireGearCache.h"
 #include "../runtime/RandomBotService.h"
 #include "../runtime/AhMarketService.h"
 #include "../runtime/BattlegroundQueueService.h"
+#include "../runtime/BotLfgService.h"
 #include "../runtime/ObservabilityEmitter.h"
+#include "../runtime/RunTrace.h"
+#include "BotChatAdapter.h"
+#include "BotPacketAdapter.h"
 #include "HireRecruiterScript.h"
+#include "../commands/BotCommandQueue.h"
+#include "../commands/BotCommands.h"
+#include "../commands/BotCommandHandlers.h"
 #include "../ai/playerbot/PlayerbotAIConfig.h"
 #include "Config/Config.h"
 #include "ObjectMgr.h"
@@ -17,6 +26,7 @@
 #include "ModuleLog.h"
 #include "ModuleVersion.h"
 
+#include <atomic>
 #include <cctype>
 #include <string>
 
@@ -71,9 +81,16 @@ BotHostAdapter::BotHostAdapter()
 {
 }
 
-void BotHostAdapter::OnAfterConfigLoad(bool /*reload*/)
+// Set by a `.reload config` (OnAfterConfigLoad, on whichever thread ran the
+// command); the next world tick reads the run leader's keys again (OnUpdate),
+// on the thread that reads them.
+static std::atomic<bool> s_dungeonRunKeysDue{false};
+
+void BotHostAdapter::OnAfterConfigLoad(bool reload)
 {
     ModuleLog::Instance().ApplyConfig();
+    if (reload)
+        s_dungeonRunKeysDue.store(true);
 }
 
 void BotHostAdapter::OnStartup()
@@ -84,9 +101,19 @@ void BotHostAdapter::OnStartup()
     ModuleLog::Instance().ApplyConfig();
 
     bool configured = sPlayerbotAIConfig.Initialize();
+    // The dashboard's boss list: one pass over the creature spawns, here at start (the plans were just sealed), never in a 2 s snapshot.
+    // Only for the dungeon features that read it; everyone else skips the scan and the readers fall back.
+    if (sPlayerbotAIConfig.dungeonTactics || sPlayerbotAIConfig.dungeonSelfClear)
+        BotCommands::BuildBossSpawnCache();
     HireRecruiterScript::SyncUnlockFees();
+    HireRecruiterScript::SyncHireUnlockChain();
+    // Issue #490: static hire-gear sets, one pass over the table rows.
+    HireGearCache::Instance().Load();
     RandomBotService::Instance().Initialize();
     BattlegroundQueueService::Instance().Initialize();
+    ClaimLifecycle::Instance().Initialize();
+    // Run trace: mark the summaries of runs the last server never finalised.
+    RunTraceService::Instance().Initialize();
 
     if (sConfig.GetBoolDefault("TortoiseBots.PendingAddRemoveTest", false))
     {
@@ -125,13 +152,59 @@ void BotHostAdapter::OnStartup()
     TB_LOG_BASIC("TortoiseBots %s (AI %s)", BuildVersion().c_str(), configured ? "enabled" : "disabled");
     TB_LOG_BASIC("%s", AttributionLine().c_str());
     ObservabilityEmitter::Instance().Initialize();
+    // The dashboard's Commanders tab: the standing remote-commander bindings.
+    ObservabilityEmitter::Instance().SetCommanderProvider(
+        [](std::vector<CommanderTelemetry::BindingRef>& out) { BotCommands::CollectCommanderTelemetry(out); });
+    // The Dungeons tab (issue #1101): the mobs of every dungeon run.
+    ObservabilityEmitter::Instance().SetDungeonMobProvider(
+        [](std::vector<DungeonMobTelemetry::RunRef>& runs) { BotCommands::CollectDungeonMobs(runs); });
 }
 void BotHostAdapter::OnUpdate(uint32 diff)
 {
-    ++m_ticks;
-    // Expire stale leases before services select candidates (issue #89).
-    BotActivityLeaseManager::Instance().Update(diff);
+    // Issue #844: before anything that can send packets to bots (the command
+    // drain included: a `.bot hire` drops its level-up echo right after the
+    // jump), so their packet hooks on this thread reach the AI inline.
+    BotPacketAdapter::MarkWorldThread();
+
+    // A `.reload config` came: the run leader's keys (AiPlayerbot.DungeonSelfClear,
+    // AiPlayerbot.DungeonRun*) are read again from aiplayerbot.conf, only those.
+    if (s_dungeonRunKeysDue.exchange(false))
+        sPlayerbotAIConfig.ReloadDungeonRunKeys();
+
+    // Initialization stops before service configuration when AI is disabled.
+    // Do not tick those services against an uninitialized registry/config.
+    if (sPlayerbotAIConfig.enabled)
+    {
+        ++m_ticks;
+        // Expire stale leases before services select candidates (issue #89).
+        BotActivityLeaseManager::Instance().Update(diff);
+    }
+
+    // Issue #833: players' `.bot` / TBM commands arrive on map and
+    // AsyncPackets threads and are queued; run them here, on the world thread
+    // and before the bot update. This runs even with the AI disabled, so no
+    // command ever executes off the world thread. Issue #846: before each
+    // command it runs the bot chat and packets queued ahead of it.
+    uint64_t const deferredLimit = BotChatAdapter::DrainQueuedCommands();
+
+    // Read again: a command may have reloaded the configuration.
+    if (!sPlayerbotAIConfig.enabled)
+    {
+        // A run trace still going ends here ("disabled"); with none, this is
+        // its usual one atomic load.
+        RunTraceService::Instance().Update(diff);
+        return;
+    }
+
+    // Issue #839 / #844: the rest of the chat and packets that reached bots on
+    // other threads (party / whisper commands included), before the bot update;
+    // anything queued behind a command that arrived meanwhile waits for it
+    // (issue #846).
+    BotPacketAdapter::DrainDeferredPackets(deferredLimit, true);
     BotManager::Instance().OnWorldUpdate(diff);
+    // Issue #884: release remote-commander bindings whose commander logged
+    // out or whose group broke up (nothing runs while none is bound).
+    BotCommands::UpdateRemoteCommanders(diff);
     PlayerConvenience::Instance().Update(diff);
     RandomBotService::Instance().Update(diff);
     // Issue #192: complete queued hire provisions, then sweep grace timers.
@@ -140,12 +213,23 @@ void BotHostAdapter::OnUpdate(uint32 diff)
     AhMarketService::Instance().Update(diff);
     BattlegroundQueueService::Instance().Update(diff);
     ObservabilityEmitter::Instance().Update(diff);
+    // Item-leg skip (spec D7): first world tick after startup: the crash
+    // ledger cleanup for bots already in the world.
+    BotCommands::CleanupRunGivenItemsTick();
+    // Opt-in run trace (one atomic load per tick while no run is active).
+    RunTraceService::Instance().Update(diff);
 }
 
 void BotHostAdapter::OnShutdown()
 {
+    BotLfgService::Instance().Shutdown();
+    RunTraceService::Instance().Shutdown();
     ObservabilityEmitter::Instance().Shutdown();
     BattlegroundQueueService::Instance().Shutdown();
+    BotCommandQueue::Instance().Clear();
+    BotCommands::ClearRemoteCommanders();
+    BotPacketAdapter::ClearDeferredPackets();
+    BotManager::Instance().Shutdown();
     RandomBotService::Instance().Shutdown();
     BotActivityLeaseManager::Instance().Clear();
     TB_LOG_BASIC("TortoiseBots: native module shutting down after %u world ticks", m_ticks);

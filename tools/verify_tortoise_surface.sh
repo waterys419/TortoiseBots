@@ -13,28 +13,28 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT_DIR"
 
 test -f data/sql/world/20260824090000_world.sql || fail "world migration is missing"
-test -f data/sql/char/20260824090001_char.sql || fail "character migration is missing"
+test -f data/sql/character/20260824090001_char.sql || fail "character migration is missing"
 test -f data/sql/world/20260824090002_world.sql || fail "world compatibility migration is missing"
-test -f data/sql/char/20260824090002_char.sql || fail "character compatibility migration is missing"
+test -f data/sql/character/20260824090002_char.sql || fail "character compatibility migration is missing"
 test -f data/sql/world/20260824090003_world.sql || fail "world cleanup migration is missing"
-test -f data/sql/char/20260824090003_char.sql || fail "character cleanup migration is missing"
+test -f data/sql/character/20260824090003_char.sql || fail "character cleanup migration is missing"
 test -f data/sql/world/20260916090001_world.sql || fail "weight-scale seed migration is missing"
 test ! -e data/sql/World || fail "uppercase World migration directory remains"
 test ! -e data/sql/Char || fail "uppercase Char migration directory remains"
 
 grep -q 'template_changed' data/sql/world/20260824090002_world.sql \
     || fail "help schema lacks template_changed"
-grep -q 'scale_32' data/sql/char/20260824090002_char.sql \
+grep -q 'scale_32' data/sql/character/20260824090002_char.sql \
     || fail "item-info schema lacks scale_32"
 grep -q 'ai_playerbot_zone_level' data/sql/world/20260824090002_world.sql \
     || fail "zone-level schema is not owned by World migration"
-grep -q 'ADD COLUMN IF NOT EXISTS' data/sql/world/20260824090002_world.sql \
+grep -q 'information_schema' data/sql/world/20260824090002_world.sql \
     || fail "World compatibility migration is not additive"
-grep -q 'scale_32' data/sql/char/20260824090002_char.sql \
+grep -q 'scale_32' data/sql/character/20260824090002_char.sql \
     || fail "Char compatibility migration lacks scale_32"
 grep -q 'DROP TABLE IF EXISTS' data/sql/world/20260824090003_world.sql \
     || fail "World cleanup migration lacks explicit dead-table cleanup"
-grep -q 'DROP TABLE IF EXISTS' data/sql/char/20260824090003_char.sql \
+grep -q 'DROP TABLE IF EXISTS' data/sql/character/20260824090003_char.sql \
     || fail "Char cleanup migration lacks explicit dead-table cleanup"
 grep -q 'ai_playerbot_weightscale_data' data/sql/world/20260916090001_world.sql \
     || fail "weight-scale stat data is not seeded"
@@ -44,6 +44,9 @@ grep -q "(20, 'elem', 7)" data/sql/world/20260916090001_world.sql \
     || fail "weight-scale shaman spec ids are not the donor ids"
 grep -q "(31, 'resto', 11)" data/sql/world/20260916090001_world.sql \
     || fail "weight-scale druid spec ids are not the donor ids"
+test -f data/sql/world/20261013150000_world.sql || fail "fish spot migration is missing"
+grep -q 'FISH_LOCATION' data/sql/world/20261013150000_world.sql \
+    || fail "fish spot data is not seeded"
 
 if rg -n -i 'rtsc|see spell|bossaura|ai_playerbot_(random_bots|rpg_races|tele_cache|rarity_cache)' \
     ai host runtime commands conf; then
@@ -91,20 +94,20 @@ fi
 # Vetted player controls must stay mapped to fixed mature actions. Do not turn
 # the public shell into an unrestricted forwarding path while adding aliases.
 for control in guard free ready attack formation status; do
-    grep -q "cmd == \"$control\"" commands/BotCommands.cpp \
+    grep -q "{\"$control\", Handle" commands/BotCommands.cpp \
         || fail "public player control is missing: $control"
 done
-grep -q 'guard chat shortcut' commands/BotCommands.cpp \
+grep -q 'guard chat shortcut' commands/Party.cpp \
     || fail "guard is no longer mapped to its mature shortcut action"
-grep -q 'free chat shortcut' commands/BotCommands.cpp \
+grep -q 'free chat shortcut' commands/Party.cpp \
     || fail "free is no longer mapped to its mature shortcut action"
-grep -q '"ready check"' commands/BotCommands.cpp \
+grep -q '"ready check"' commands/Party.cpp \
     || fail "ready is no longer mapped to the mature ready-check action"
-grep -q '"attack my target"' commands/BotCommands.cpp \
+grep -q '"attack my target"' commands/Party.cpp \
     || fail "attack is no longer mapped to the mature selected-target action"
-grep -q 'DoSpecificAction("formation"' commands/BotCommands.cpp \
+grep -q 'DoSpecificAction("formation"' commands/Party.cpp \
     || fail "formation is no longer mapped to the mature formation action"
-grep -q 'formation == "shield"' commands/BotCommands.cpp \
+grep -q 'formation == "shield"' commands/Party.cpp \
     || fail "formation no longer uses the reviewed finite enum"
 
 # CC executor selection must come from the mature action graph, not a second

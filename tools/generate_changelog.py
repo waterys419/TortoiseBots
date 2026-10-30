@@ -60,33 +60,64 @@ def get_last_release_info():
     return None, None
 
 
-def get_merged_prs_since(since_iso_date=None):
-    """Retrieve merged pull requests using the gh CLI."""
+def list_merged_prs(base, limit):
+    """Merged pull requests into `base`, newest first, via the gh CLI."""
     cmd = [
         "gh", "pr", "list",
         "--state", "merged",
-        "--base", "main",
-        "--limit", "100",
-        "--json", "number,title,body,mergedAt,author,url"
+        "--base", base,
+        "--limit", str(limit),
+        "--json", "number,title,body,mergedAt,author,url,headRefName,mergeCommit"
     ]
     try:
         output = subprocess.check_output(cmd, text=True)
-        prs = json.loads(output)
+        return json.loads(output)
     except Exception as e:
-        print(f"Error fetching PRs via gh CLI: {e}", file=sys.stderr)
+        print(f"Error fetching PRs into {base} via gh CLI: {e}", file=sys.stderr)
         return []
 
-    if not since_iso_date:
-        return prs
 
-    # Filter by mergedAt > since_iso_date
-    filtered = []
-    for pr in prs:
+def is_ancestor(commit, ref):
+    return subprocess.call(["git", "merge-base", "--is-ancestor", commit, ref],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def get_merged_prs_since(since_iso_date=None, since_tag=None):
+    """Merged pull requests that reach main in this release.
+
+    Collaborators merge into `dev`; the owner brings dev to main with a
+    dev -> main PR (any merge method) or by pushing dev to main. Either way
+    the PRs merged into dev are what the changelog describes, so they are
+    listed one by one instead of the dev -> main PR itself:
+      * a dev PR whose merge commit is now on main but was not on the last
+        release tag (merge commit or fast-forward of dev into main);
+      * a dev PR merged before a dev -> main PR of this window and after the
+        previous one (a squashed dev -> main PR leaves no dev commits on main).
+    """
+    def in_window(pr):
         merged_at = pr.get("mergedAt")
-        if merged_at and merged_at > since_iso_date:
-            filtered.append(pr)
+        return bool(merged_at) and (not since_iso_date or merged_at > since_iso_date)
 
-    return filtered
+    main_prs = list_merged_prs("main", 100)
+    window = [pr for pr in main_prs if in_window(pr)]
+    syncs = [pr for pr in window if pr.get("headRefName") == "dev"]
+    earlier_syncs = [pr["mergedAt"] for pr in main_prs
+                     if pr.get("headRefName") == "dev" and pr.get("mergedAt") and not in_window(pr)]
+    previous_sync = max(earlier_syncs) if earlier_syncs else None
+
+    dev_prs = []
+    for pr in list_merged_prs("dev", 200):
+        merged_at = pr.get("mergedAt")
+        oid = (pr.get("mergeCommit") or {}).get("oid")
+        reached = bool(oid) and is_ancestor(oid, "HEAD") and not (since_tag and is_ancestor(oid, since_tag))
+        synced = bool(merged_at) and any(merged_at <= s["mergedAt"] for s in syncs) and \
+            (previous_sync is None or merged_at > previous_sync)
+        if reached or synced:
+            dev_prs.append(pr)
+
+    # The dev -> main PR only carries the dev PRs; keep it when none was found.
+    prs = [pr for pr in window if pr not in syncs] if dev_prs else window
+    return sorted(prs + dev_prs, key=lambda pr: pr.get("mergedAt") or "")
 
 
 def generate_summary_with_ai(prs, api_key, base_url, model):
@@ -108,17 +139,25 @@ def generate_summary_with_ai(prs, api_key, base_url, model):
     pr_text = "\n\n".join(pr_summaries)
 
     system_prompt = (
-        "You are an assistant generating release notes and changelog entries for TortoiseBots, "
-        "an optional native PlayerBots C++ module for Tortoise WoW 1.18.1.\n"
-        "Your audience consists of players, guild leaders, and private server operators.\n"
+        "You write release notes for TortoiseBots, an optional bot module for Tortoise WoW 1.18.1 "
+        "(AI companions and a living world of bots). Most readers are players, not programmers: "
+        "they want to know what they will notice in game.\n"
         "Rules:\n"
-        "1. Group changes into clear, logical categories (e.g., 'Combat & AI', 'Starter Zones & World', 'Observability & Engine', 'Core Sync & Fixes'). Only include categories that have changes.\n"
-        "2. Write concise, punchy, pragmatic bullet points explaining the gameplay or stability impact.\n"
-        "3. Always reference the pull request as a markdown link like [#123](https://github.com/Sagiroth/TortoiseBots/pull/123) at the end of each bullet point.\n"
-        "4. Do NOT output fluff, introductions, greetings, or sign-offs. Output ONLY the categorized markdown bullets starting with category headers (### Category).\n"
-        "5. Keep the tone pragmatic and developer/gamer friendly.\n"
-        "6. When a pull request body lists several changes (one line per pull request number, e.g. '- #456 ...'), write one bullet per listed change, "
-        "link the listed pull request number (not the daily merge PR), and never drop or merge away any listed change."
+        "1. Write in plain, everyday English. One short sentence per bullet (aim for under 25 words). "
+        "Say what changed in the game and why a player cares, e.g. 'Warlocks now spread their DoTs to extra enemies.'\n"
+        "2. No jargon or internals: no function, file, class or C++ names, no config keys, no 'parity', 'tick', "
+        "'epsilon', 'seam', 'refactor' or similar. Name a config setting or command only when a player or "
+        "server owner has to use it to get the change, and then explain it in a few words.\n"
+        "3. Group bullets under short ### headers players understand, e.g. 'Classes & Combat', 'Groups & Dungeons', "
+        "'Quests & Levelling', 'World & Economy', 'Commands', 'Dashboard', 'Behind the scenes'. Only include headers that have changes; "
+        "put the most noticeable gameplay changes first.\n"
+        "4. Put changes players never see (CI, build, docs, licensing, tests, code cleanup) under one final "
+        "'Behind the scenes' header, at most one short bullet per topic, and combine related pull requests into one bullet.\n"
+        "5. End every bullet with its pull request link(s) as markdown, like [#123](https://github.com/Sagiroth/TortoiseBots/pull/123).\n"
+        "6. When a pull request body lists several changes (one line per pull request number, e.g. '- #456 ...'), "
+        "cover every listed change and link the listed pull request number (not the daily merge PR); rule 4 may combine "
+        "behind-the-scenes items, but no listed number may be left out.\n"
+        "7. Output ONLY the ### headers and bullets: no introduction, greeting, summary or sign-off. Never write 'we'."
     )
 
     user_prompt = f"Summarize the following merged pull requests:\n\n{pr_text}"
@@ -151,7 +190,8 @@ def generate_summary_with_ai(prs, api_key, base_url, model):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        # A batch merge can carry 50+ PRs; writing that summary takes minutes.
+        with urllib.request.urlopen(req, timeout=600) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             content = data["choices"][0]["message"]["content"].strip()
             return content
@@ -299,6 +339,7 @@ def main():
     parser.add_argument("--out-version", help="Write the per-merge build version (<UTC date>-v<N>) to the given file (e.g. VERSION)")
     parser.add_argument("--out-build-number", help="Write the day's build number N to the given file")
     parser.add_argument("--version-date", help="UTC date for the build version (default: --date)")
+    parser.add_argument("--tag", help="Release tag name (e.g. v1.0.0)")
     parser.add_argument("--prs", help="Comma-separated PR numbers to summarize instead of auto-detecting (manual re-post; skips the CHANGELOG.md de-duplication)")
     args = parser.parse_args()
 
@@ -336,7 +377,7 @@ def main():
         print(f"Summarizing requested PRs: {args.prs}")
     else:
         print(f"Checking for merged PRs since: {since_date or 'beginning'} (reference: {since_tag or 'none'})")
-        prs = get_merged_prs_since(since_date)
+        prs = get_merged_prs_since(since_date, since_tag)
 
     # Exclude any PRs that are already documented in CHANGELOG.md
     if not args.prs and os.path.exists(CHANGELOG_PATH):
@@ -377,14 +418,17 @@ def main():
     print(summary)
     print("\n" + "=" * 40)
 
-    release_tag = f"v{args.date}"
+    release_tag = args.tag or f"v{args.date}"
     exists, existing_body = release_exists_on_github(release_tag)
 
-    # The daily release notes always open with the day's build range so players
-    # can map the release to the per-merge build tags (e.g. Builds 2026-09-25-v1 – v7).
-    base_body = existing_body.strip() if exists and existing_body else ""
-    ranged_base = with_build_range(base_body, args.date, build_number)
-    notes_to_write = ranged_base.rstrip() + "\n\n" + summary.strip() + "\n"
+    if args.tag:
+        notes_to_write = summary.strip() + "\n"
+    else:
+        # The daily release notes always open with the day's build range so players
+        # can map the release to the per-merge build tags (e.g. Builds 2026-09-25-v1 – v7).
+        base_body = existing_body.strip() if exists and existing_body else ""
+        ranged_base = with_build_range(base_body, args.date, build_number)
+        notes_to_write = ranged_base.rstrip() + "\n\n" + summary.strip() + "\n"
     if args.out_notes:
         with open(args.out_notes, "w", encoding="utf-8") as f:
             f.write(notes_to_write.strip() + "\n")

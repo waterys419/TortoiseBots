@@ -29,6 +29,10 @@ public:
 
     void OnHumanLogin();
     void OnHumanLogout();
+    // A deliberate logout the module asks for (an alt-bot taking this bot's
+    // slot, issue #872) is not a quick logout: the level ladder must not set
+    // the character aside for an hour.
+    void ForgetDeliberateLogout(ObjectGuid guid);
 
     // False while the startup pool reset is draining, deleting, verifying or
     // has failed. Every pool consumer (autologin, auto-create, pinned
@@ -43,6 +47,7 @@ private:
         ObjectGuid characterGuid;
         uint8_t level = 1;      // from the characters table at load, refreshed while online
         uint32_t team = 0;      // Team enum from the race (ALLIANCE / HORDE)
+        uint8_t race = 0;       // SharedDefines Races value, for the even-start-zone count
     };
 
     RandomBotService() = default;
@@ -109,6 +114,10 @@ private:
     std::unordered_map<uint32_t, XpProgress> m_xpProgress;
     uint32_t m_quickLogoutLogMs = 0;
     uint32_t m_serviceElapsedMs = 0;
+    // Service pass counter; spreads ProcessBot so each bot gets it about once
+    // every kProcessBotIntervalMs, whatever the service cadence.
+    uint32_t m_servicePass = 0;
+    static constexpr uint32_t kProcessBotIntervalMs = 60000;
     // Stable target: snapshot of DesiredTargetCount once at Initialize when
     // auto-create is enabled (no per-cadence re-roll/ratchet toward Max). For
     // non-auto, snapshot of TargetCount (capped). Handles bounds and deficit

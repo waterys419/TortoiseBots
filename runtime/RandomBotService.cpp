@@ -4,7 +4,11 @@
 #include "PlayerbotAIStorage.h"
 #include "playerbot/PlayerbotAI.h"
 #include "GearSeedingGuard.h"
+#include "runtime/policy/pvp/WorldPvpSeekPolicy.h"
+#include "runtime/policy/pvp/WorldPvpFightPolicy.h"
 #include "HireLifecycle.h"
+#include "ClaimLifecycle.h"
+#include "AltBotService.h"
 #include "../host/BotSessionAdapter.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -14,10 +18,13 @@
 #include "Log.h"
 #include "Database/DatabaseEnv.h"
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/AiFactory.h"
 #include "playerbot/RandomBotFacade.h"
 #include "RandomBotAccountRegistry.h"
 #include "RandomBotPoolReset.h"
 #include "StartZoneBalance.h"
+#include "BotNameService.h"
+#include "runtime/policy/provision/BotAppearancePolicy.h"
 #include "AccountMgr.h"
 #include "SharedDefines.h"
 #include "Database/DBCStores.h"
@@ -56,35 +63,6 @@ namespace
 // legitimately carry.
 uint32_t const LADDER_BUSY_RETRY_MS = 60000;
 uint32_t const LADDER_QUICK_LOGOUT_HOLD_MS = 3600000;
-
-std::string GenerateRndBotName()
-{
-    // Pronounceable 2-3 syllable fantasy names (consonant onset + vowel nucleus,
-    // optional coda). Letters only, first upper -> passes CheckPlayerName.
-    // Uniqueness via DB (GetPlayerGuidByName + core NAME_IN_USE) with retry.
-    static const char* onset[] = {
-        "b","br","c","cr","d","dr","f","g","gr","h","j","k","kr","l","m","n",
-        "p","r","s","sh","st","t","th","tr","v","w","z","kh","gh","mor","thar","zar"
-    };
-    static const char* nucleus[] = { "a","e","i","o","u","ae","ar","or","ur","al","yr" };
-    static const char* coda[]    = { "","","","n","r","k","l","th","sh","g","rn" };
-    uint32 const nOn = sizeof(onset)   / sizeof(onset[0]);
-    uint32 const nNu = sizeof(nucleus) / sizeof(nucleus[0]);
-    uint32 const nCo = sizeof(coda)    / sizeof(coda[0]);
-    uint32 const syllables = urand(2, 3);
-    std::string name;
-    name.reserve(12);
-    for (uint32 i = 0; i < syllables; ++i)
-    {
-        name += onset[urand(0, nOn - 1)];
-        name += nucleus[urand(0, nNu - 1)];
-    }
-    name += coda[urand(0, nCo - 1)];
-    if (name.size() > 11)
-        name.resize(11);
-    name[0] = char(name[0] & ~0x20); // uppercase first letter, ASCII a-z
-    return name;
-}
 
 std::string GenerateRandomPassword()
 {
@@ -356,7 +334,8 @@ void RandomBotService::LoadCandidates()
             candidate.accountId = accountId;
             candidate.characterGuid = ObjectGuid(HIGHGUID_PLAYER, guidLow);
             candidate.level = std::max<uint8_t>(1, fields[1].GetUInt8());
-            candidate.team = Player::TeamForRace(fields[2].GetUInt8());
+            candidate.race = fields[2].GetUInt8();
+            candidate.team = Player::TeamForRace(candidate.race);
             m_candidates.push_back(candidate);
         } while (characters->NextRow());
     }
@@ -445,37 +424,32 @@ uint32_t RandomBotService::GetAccountAllowedTeam(uint32_t accountId, bool& isMix
 
 void RandomBotService::StartZoneCountsForBatch(uint32_t batch)
 {
-    // One bounded characters-table pass per creation batch (the Update loop
-    // below runs up to 5 TryAutoCreate calls per cadence). Counts level-1
-    // pool characters per start zone; fail-closed keeps the previous (or
-    // zeroed) counts so a DB miss never blocks creation. A creation inside
-    // the same batch bumps the picked zone locally, so consecutive picks see
-    // each other without another SELECT.
+    // One in-memory candidate pass per creation batch (the Update loop below
+    // runs up to 5 TryAutoCreate calls per cadence). Counts every pool
+    // character per start zone (its race's zone, at any level) from the
+    // candidates loaded at startup plus auto-created appends; a creation
+    // inside the same batch bumps the picked zone locally, so consecutive
+    // picks see each other. No DB hit on the world thread: the old
+    // characters-table SELECT blocked inside SSL_read at 2000 bots.
+    // Characters deleted after load drift the count until the next reload,
+    // which only biases the even-spread pick, never blocks creation.
     if (m_startZoneBatch == batch && batch != 0)
         return;
     m_startZoneBatch = batch;
     if (!sPlayerbotAIConfig.randomBotEvenStartZones)
         return;
-
-    RandomBotAccountRegistry& registry = RandomBotAccountRegistry::Instance();
-    if (!registry.IsValidated())
-        return;
-    std::string accounts = registry.AccountIdList();
-    if (accounts.empty())
-        return;
     for (uint32_t& count : m_startZoneCounts)
         count = 0;
-    std::unique_ptr<QueryResult> rows(CharacterDatabase.PQuery(
-        "SELECT `race` FROM `characters` WHERE `deleteDate` IS NULL AND `level` = 1 AND `account` IN (%s)",
-        accounts.c_str()));
-    if (!rows)
-        return;
-    do
+    for (Candidate const& candidate : m_candidates)
     {
-        int zone = StartZoneIndexForRace(rows->Fetch()[0].GetUInt32());
+        // Any level: a level band (1-9) read an empty pool whenever bots start
+        // at 10+ or level past 9, so ties fell to zone order and Dun Morogh
+        // and Teldrassil got ~60% of the others (live 2026-10-11, 1000 bots
+        // at start levels 10-60: Alliance 431 / Horde 569).
+        int zone = StartZoneIndexForRace(candidate.race);
         if (zone >= 0 && zone < int(kStartZoneCount))
             ++m_startZoneCounts[zone];
-    } while (rows->NextRow());
+    }
 }
 
 namespace
@@ -526,6 +500,51 @@ std::vector<std::pair<uint8_t, uint8_t>> LeastPopulatedZoneCombos(
     }
     return {};
 }
+
+// Keep only the rolled faction's races (AiPlayerbot.RandomBotFactionRatio).
+// Empty when the account-eligible list has no race of that faction: the
+// caller falls back to the full list instead of blocking creation.
+std::vector<std::pair<uint8_t, uint8_t>> FactionFilteredCombos(
+    std::vector<std::pair<uint8_t, uint8_t>> const& validForAccount, bool wantAlliance)
+{
+    std::vector<std::pair<uint8_t, uint8_t>> filtered;
+    for (auto const& pr : validForAccount)
+        if ((Player::TeamForRace(pr.first) == ALLIANCE) == wantAlliance)
+            filtered.push_back(pr);
+    return filtered;
+}
+
+// Narrow to one weighted start zone (AiPlayerbot.RandomBotStartZoneWeights)
+// within the already faction-filtered list. Empty when weights are off or
+// when no eligible zone carries weight: the caller keeps today's even or
+// uniform pick.
+std::vector<std::pair<uint8_t, uint8_t>> WeightedZoneCombos(
+    std::vector<std::pair<uint8_t, uint8_t>> const& combos)
+{
+    if (!sPlayerbotAIConfig.randomBotStartZoneWeightsValid)
+        return {};
+    bool hasRace[kStartZoneCount] = {};
+    for (auto const& pr : combos)
+    {
+        int zone = StartZoneIndexForRace(pr.first);
+        if (zone >= 0 && zone < int(kStartZoneCount))
+            hasRace[zone] = true;
+    }
+    uint32_t weights[kStartZoneCount] = {};
+    for (uint32_t zone = 0; zone < kStartZoneCount; ++zone)
+        weights[zone] = sPlayerbotAIConfig.randomBotStartZoneWeights[zone];
+    uint32_t total = StartZoneWeightedTotal(weights, hasRace);
+    if (!total)
+        return {};
+    int picked = StartZoneWeightedPick(weights, hasRace, urand(0, total - 1));
+    if (picked < 0)
+        return {};
+    std::vector<std::pair<uint8_t, uint8_t>> narrowed;
+    for (auto const& pr : combos)
+        if (StartZoneIndexForRace(pr.first) == picked)
+            narrowed.push_back(pr);
+    return narrowed;
+}
 } // namespace
 
 RandomBotService::AutoCreateCharResult RandomBotService::TryCreateCharacterOnAccount(uint32_t accountId, std::vector<std::pair<uint8_t, uint8_t>> const& validForAccount)
@@ -551,37 +570,61 @@ RandomBotService::AutoCreateCharResult RandomBotService::TryCreateCharacterOnAcc
     // team-filtered, so remaining DISABLED/PVP is likely transient server state
     // that must not permanently poison a healthy account (bounded via
     // m_charCreateErrorNextRetry).
+    // Faction is rolled once per account visit (not per name attempt), then
+    // the zone is picked inside that faction. 50 = off: the code below is
+    // byte-for-byte today's path. Empty after filtering keeps the full
+    // account-eligible list (PvP-locked accounts, unknown races).
+    std::vector<std::pair<uint8_t, uint8_t>> factionPool;
+    std::vector<std::pair<uint8_t, uint8_t>> const* factionBase = &validForAccount;
+    uint32 ratio = sPlayerbotAIConfig.randomBotFactionRatio;
+    if (ratio != 50)
+    {
+        bool wantAlliance = urand(0, 99) < ratio;
+        factionPool = FactionFilteredCombos(validForAccount, wantAlliance);
+        if (!factionPool.empty())
+            factionBase = &factionPool;
+        else
+            TB_LOG_DEBUG("TortoiseBots: auto-create ratio %u has no %s race on account %u, keeping the full list",
+                ratio, wantAlliance ? "Alliance" : "Horde", accountId);
+    }
     for (int nameAttempt = 0; nameAttempt < 5; ++nameAttempt)
     {
-        std::string name = GenerateRndBotName();
-        std::string norm = name;
-        if (!normalizePlayerName(norm))
-            continue;
-        if (sObjectMgr.GetPlayerGuidByName(norm))
-            continue;
-
-        std::vector<std::pair<uint8_t, uint8_t>> const* pool = &validForAccount;
-        std::vector<std::pair<uint8_t, uint8_t>> evenPool;
-        if (sPlayerbotAIConfig.randomBotEvenStartZones)
+        // Zone re-rolls per attempt on purpose (faction does not): each
+        // attempt is an independent weighted draw, so a failed creation just
+        // redraws instead of pinning a colliding name to one zone.
+        std::vector<std::pair<uint8_t, uint8_t>> const* pool = factionBase;
+        std::vector<std::pair<uint8_t, uint8_t>> zonePool = WeightedZoneCombos(*pool);
+        if (!zonePool.empty())
+            pool = &zonePool;
+        else if (sPlayerbotAIConfig.randomBotEvenStartZones)
         {
-            evenPool = LeastPopulatedZoneCombos(validForAccount, m_startZoneCounts);
-            if (!evenPool.empty())
-                pool = &evenPool;
+            zonePool = LeastPopulatedZoneCombos(*pool, m_startZoneCounts);
+            if (!zonePool.empty())
+                pool = &zonePool;
         }
         auto pr = (*pool)[urand(0, uint32(pool->size() - 1))];
         uint8 race = pr.first;
         uint8 cls = pr.second;
+        // Gender before the name: issue #1003 names follow race and gender.
+        uint8 gender = urand(0, 1) ? GENDER_FEMALE : GENDER_MALE;
+        BotAppearanceCounts look{};
+        if (!BotAppearanceCountsFor(race, gender, look))
+            continue;
+
+        std::string norm = PickBotCharacterName(race, cls, gender);
+        if (norm.empty())
+            continue;
 
         CharacterCreateInfo info;
         info.name = norm;
         info.race = race;
         info.class_ = cls;
-        info.gender = urand(0, 1) ? GENDER_FEMALE : GENDER_MALE;
-        info.skin = uint8(urand(0, 7));
-        info.face = uint8(urand(0, 7));
-        info.hairStyle = uint8(urand(0, 7));
-        info.hairColor = uint8(urand(0, 7));
-        info.facialHair = uint8(urand(0, 7));
+        info.gender = gender;
+        info.skin = uint8(urand(0, look.skin - 1));
+        info.face = uint8(urand(0, look.face - 1));
+        info.hairStyle = uint8(urand(0, look.hairStyle - 1));
+        info.hairColor = uint8(urand(0, look.hairColor - 1));
+        info.facialHair = uint8(urand(0, look.facialHair - 1));
         info.outfitId = 0;
         info.challengeMask = 0;
 
@@ -604,26 +647,40 @@ RandomBotService::AutoCreateCharResult RandomBotService::TryCreateCharacterOnAcc
                 if (zone >= 0 && zone < int(kStartZoneCount))
                     ++m_startZoneCounts[zone];
             }
+            // Synchronous (direct) writes, like the creation seam itself
+            // (CharacterCreation::CreateCharacter commits the character with
+            // SaveToDB(false, true, false) before it returns): the bot's headless
+            // session starts reading `characters` and `character_homebind` right
+            // after this. Queued PExecute could land after that read, so the login
+            // found no homebind row, Player::_LoadHomeBind inserted one itself and
+            // the late REPLACE then hit the primary key ("[1062] Duplicate entry
+            // ... character_homebind", 25 pool goblins/high elves, live
+            // 2026-10-21 09:54-09:56).
             if (race == RACE_GOBLIN)
             {
-                CharacterDatabase.PExecute(
+                CharacterDatabase.DirectPExecute(
                     "UPDATE characters SET map = 1, zone = 14, position_x = -618.518, position_y = -4251.67, position_z = 38.718, orientation = 0 WHERE guid = '%u'",
                     outcome.guid.GetCounter());
-                CharacterDatabase.PExecute(
+                CharacterDatabase.DirectPExecute(
                     "REPLACE INTO character_homebind (guid, map, zone, position_x, position_y, position_z) VALUES ('%u', 1, 14, -618.518, -4251.67, 38.718)",
                     outcome.guid.GetCounter());
             }
             else if (race == RACE_HIGH_ELF)
             {
-                CharacterDatabase.PExecute(
+                CharacterDatabase.DirectPExecute(
                     "UPDATE characters SET map = 0, zone = 12, position_x = -8949.95, position_y = -132.493, position_z = 83.5312, orientation = 0 WHERE guid = '%u'",
                     outcome.guid.GetCounter());
-                CharacterDatabase.PExecute(
+                CharacterDatabase.DirectPExecute(
                     "REPLACE INTO character_homebind (guid, map, zone, position_x, position_y, position_z) VALUES ('%u', 0, 12, -8949.95, -132.493, 83.5312)",
                     outcome.guid.GetCounter());
             }
 
-            m_candidates.push_back({accountId, outcome.guid});
+            Candidate created;
+            created.accountId = accountId;
+            created.characterGuid = outcome.guid;
+            created.race = race;
+            created.team = Player::TeamForRace(race);
+            m_candidates.push_back(created);
             m_ageMs.push_back(0);
             m_strategyAgeMs.push_back(0);
             m_randomizeAgeMs.push_back(0);
@@ -1058,6 +1115,20 @@ void RandomBotService::OnHumanLogout()
         --m_humanSessions;
 }
 
+void RandomBotService::ForgetDeliberateLogout(ObjectGuid guid)
+{
+    for (size_t i = 0; i < m_candidates.size(); ++i)
+    {
+        if (m_candidates[i].characterGuid != guid)
+            continue;
+        // Counted as a full minute online, so the logout pass never reads it
+        // as a quick one, whichever pass sees the record go.
+        if (i < m_ageMs.size() && m_ageMs[i] < 60000)
+            m_ageMs[i] = 60000;
+        return;
+    }
+}
+
 void RandomBotService::RemoveExpiredBots(uint32_t diff)
 {
     for (size_t i = 0; i < m_candidates.size(); ++i)
@@ -1114,6 +1185,14 @@ void RandomBotService::RemoveExpiredBots(uint32_t diff)
             m_ageMs[i] = 0;
             continue;
         }
+        // Issue #968: claimed guild bots are kept like pinned/hired ones; the
+        // random reap must never log them off mid-party. In-memory map
+        // lookup, no DB per tick.
+        if (ClaimLifecycle::Instance().IsClaimed(candidate.characterGuid.GetCounter()))
+        {
+            m_ageMs[i] = 0;
+            continue;
+        }
         // A dungeon crew is not logged out under its run.
         if (BotActivityLeaseManager::Instance().GetActivity(candidate.characterGuid.GetCounter()) == BotActivity::Dungeon)
             continue;
@@ -1151,6 +1230,16 @@ void RandomBotService::RemoveExpiredBots(uint32_t diff)
                     continue;
                 }
             }
+        }
+
+        // Issue #968: a bot grouped with a real player (invited party, no
+        // Dungeon lease) is never reaped mid-run. Age is left alone so it
+        // logs out normally once it leaves the player.
+        if (::Player* masterPlayer = ObjectAccessor::FindPlayer(candidate.characterGuid))
+        {
+            if (::PlayerbotAI* masterAi = PlayerbotAIStorage::Instance().GetAI(masterPlayer))
+                if (masterAi->HasRealPlayerMaster())
+                    continue;
         }
 
         if (!sPlayerbotAIConfig.randomBotTimedLogout || !sPlayerbotAIConfig.maxRandomBotInWorldTime)
@@ -1257,7 +1346,8 @@ void RandomBotService::LadderBuildBuckets(std::vector<std::vector<size_t>>& buck
 
 // The band with the largest shortfall that still has offline characters; once every band is
 // covered, the highest level across the bands (the overflow goes to the leaders). Inside a
-// band the highest level, at equal level the faction with fewer bots online. A level-60
+// band the highest level, at equal level the faction furthest below its configured share
+// (RandomBotFactionRatio; 50 keeps today's minority tiebreak). A level-60
 // character is only taken while its band is short (hard cap). Returns the index or -1.
 int RandomBotService::LadderPickFromBuckets(std::vector<std::vector<size_t>>& buckets, std::vector<uint32_t> const& onlinePerBand, uint32_t onlineAlliance, uint32_t onlineHorde) const
 {
@@ -1285,7 +1375,24 @@ int RandomBotService::LadderPickFromBuckets(std::vector<std::vector<size_t>>& bu
         return -1;
     std::vector<size_t>& bucket = buckets[bestBand];
     size_t pos = 0;
-    uint32_t preferred = onlineHorde < onlineAlliance ? HORDE : (onlineAlliance < onlineHorde ? ALLIANCE : 0);
+    uint32_t preferred = 0;
+    uint32 ratio = sPlayerbotAIConfig.randomBotFactionRatio;
+    if (ratio == 50)
+        preferred = onlineHorde < onlineAlliance ? HORDE : (onlineAlliance < onlineHorde ? ALLIANCE : 0);
+    else
+    {
+        // Soft preference only: log in the faction furthest below its
+        // configured share of the current online mix. No forced logouts, no
+        // deletions; the mix drifts toward the ratio as bots rotate.
+        uint32_t online = onlineAlliance + onlineHorde;
+        if (online)
+        {
+            if (onlineAlliance * 100 < ratio * online)
+                preferred = ALLIANCE;
+            else if (onlineHorde * 100 < (100 - ratio) * online)
+                preferred = HORDE;
+        }
+    }
     if (preferred)
         for (size_t k = 0; k < bucket.size() && k < 64 && m_candidates[bucket[k]].level == bestLevel; ++k)
             if (m_candidates[bucket[k]].team == preferred)
@@ -1346,7 +1453,9 @@ void RandomBotService::MaintainOnlinePool()
         if (BotManager::Instance().IsRandomBot(candidate.characterGuid))
             ++online;
 
-    if (online >= m_targetCount || m_candidates.empty())
+    // Issue #872: each active alt-bot holds one pool slot.
+    uint32 const target = PoolTargetWithAlts(m_targetCount, AltBotService::Instance().ActiveCount());
+    if (online >= target || m_candidates.empty())
         return;
 
     uint32 perInterval = sPlayerbotAIConfig.randomBotsMaxLoginsPerInterval;
@@ -1360,7 +1469,7 @@ void RandomBotService::MaintainOnlinePool()
     {
         for (uint32 pinnedGuid : m_pinnedGuids)
         {
-            if (online >= m_targetCount || added >= perInterval)
+            if (online >= target || added >= perInterval)
                 break;
 
             Candidate const* pinnedCandidate = nullptr;
@@ -1426,7 +1535,7 @@ void RandomBotService::MaintainOnlinePool()
         for (auto const& bucket : buckets)
             eligible += static_cast<uint32_t>(bucket.size());
         size_t ladderAttempts = 0, maxAttempts = static_cast<size_t>(perInterval) * 4;
-        while (online < m_targetCount && added < perInterval && ladderAttempts < maxAttempts)
+        while (online < target && added < perInterval && ladderAttempts < maxAttempts)
         {
             ++ladderAttempts;
             int picked = LadderPickFromBuckets(buckets, onlinePerBand, onlineAlliance, onlineHorde);
@@ -1475,18 +1584,18 @@ void RandomBotService::MaintainOnlinePool()
             }
         }
         ++m_nextCandidate; // equals take turns across passes
-        if (online < m_targetCount && nowMs - m_ladderPassLogMs >= 60000)
+        if (online < target && nowMs - m_ladderPassLogMs >= 60000)
         {
             m_ladderPassLogMs = nowMs;
             TB_LOG_BASIC("TortoiseBots: level ladder pass: online %u/%u, added %u, offline eligible %u, skipped: session %u, lease %u, add refused %u, held %u, tracked %u, stale holds %u",
-                online, m_targetCount, added, eligible, sessionBusy, leaseBusy, addFailed,
+                online, target, added, eligible, sessionBusy, leaseBusy, addFailed,
                 skips.held, skips.tracked, skips.staleHold);
         }
         return;
     }
 
     size_t attempts = 0;
-    while (online < m_targetCount && added < perInterval && attempts < m_candidates.size())
+    while (online < target && added < perInterval && attempts < m_candidates.size())
     {
         size_t index = m_nextCandidate++ % m_candidates.size();
         ++attempts;
@@ -1564,6 +1673,8 @@ void RandomBotService::Update(uint32_t diff)
     if (sPlayerbotAIConfig.levelLadder)
         LadderLog(elapsed);
 
+    ++m_servicePass;
+    uint32 const processEvery = std::max<uint32>(1, kProcessBotIntervalMs / std::max<uint32>(1, cadence));
     for (size_t i = 0; i < m_candidates.size(); ++i)
     {
         Candidate const& candidate = m_candidates[i];
@@ -1580,9 +1691,11 @@ void RandomBotService::Update(uint32_t diff)
         if (BotActivityLeaseManager::Instance().GetActivity(player->GetGUIDLow()) == BotActivity::Dungeon)
             continue;
 
-        // Recovery/expired-value work stays on the world thread and is bounded
-        // by the configured service cadence rather than a second AI loop.
-        sRandomBotFacade.ProcessBot(player);
+        // Expired-value cleanup stays on the world thread. Each bot gets it
+        // about once a minute, spread over the passes: every pass for the
+        // whole pool cost ~10% of the world thread at 2000 bots.
+        if ((i + m_servicePass) % processEvery == 0)
+            sRandomBotFacade.ProcessBot(player);
 
         m_strategyAgeMs[i] += elapsed;
         uint32 strategyInterval = sPlayerbotAIConfig.minRandomBotChangeStrategyTime;
@@ -1592,6 +1705,42 @@ void RandomBotService::Update(uint32_t diff)
         {
             sRandomBotFacade.ChangeStrategy(player);
             m_strategyAgeMs[i] = 0;
+        }
+
+        // Seek-role upkeep: an ineligible holder (grouped with a real player,
+        // owned, hired) loses the role on the next pass, not at the next
+        // re-roll; eligible bots re-roll about every WorldPvpSeekRerollMinutes
+        // with jitter, never while in combat.
+        if (PlayerbotAI* seekAi = PlayerbotAIStorage::Instance().GetAI(player))
+        {
+            uint32 const nowMs = WorldTimer::getMSTime();
+            if (seekAi->worldPvpCampGuidLow_ && seekAi->worldPvpCampStartMs_ &&
+                WorldPvpCampExpired(seekAi->worldPvpCampStartMs_, nowMs))
+            {
+                seekAi->worldPvpIgnoreGuidLow_ = seekAi->worldPvpCampGuidLow_;
+                seekAi->worldPvpIgnoreStartMs_ = nowMs;
+                seekAi->worldPvpCampGuidLow_ = 0;
+                seekAi->worldPvpCampStartMs_ = 0;
+            }
+            bool const holdsSeek = seekAi->HasStrategy("world pvp", BotState::BOT_STATE_NON_COMBAT) ||
+                seekAi->HasStrategy("world pvp", BotState::BOT_STATE_COMBAT);
+            if (holdsSeek && !AiFactory::IsWorldPvpSeekEligible(player, seekAi))
+            {
+                AiFactory::RollWorldPvpSeek(player, seekAi);
+            }
+            else
+            {
+                uint32 const baseMin = sPlayerbotAIConfig.worldPvpSeekRerollMinutes;
+                if (baseMin && !seekAi->worldPvpSeekNextMs_)
+                    seekAi->worldPvpSeekNextMs_ = seekAi->worldPvpSeekRollMs_ +
+                        baseMin * 60 * 1000 + urand(0, 5 * 60 * 1000);
+                if (baseMin && seekAi->worldPvpSeekNextMs_ && nowMs >= seekAi->worldPvpSeekNextMs_ &&
+                    WorldPvpSeekRerollDue(seekAi->worldPvpSeekRollMs_, nowMs, baseMin, player->IsInCombat()))
+                {
+                    AiFactory::RollWorldPvpSeek(player, seekAi);
+                    seekAi->worldPvpSeekNextMs_ = nowMs + baseMin * 60 * 1000 + urand(0, 5 * 60 * 1000);
+                }
+            }
         }
 
         m_randomizeAgeMs[i] += elapsed;
@@ -1608,7 +1757,8 @@ void RandomBotService::Update(uint32_t diff)
             uint32 timerGuidLow = player->GetGUIDLow();
             bool freshTimerBot = TortoiseBots::NeedsInitialGearSeeding(
                 player->GetTotalPlayedTime(), sRandomBotFacade.GetValue(timerGuidLow, "seeded"));
-            if (player->GetLevel() >= 5 && freshTimerBot)
+            bool const claimedTimerBot = ClaimLifecycle::Instance().IsClaimed(timerGuidLow);
+            if (player->GetLevel() >= 5 && freshTimerBot && !claimedTimerBot)
             {
                 sRandomBotFacade.UpdateGearSpells(player);
                 sRandomBotFacade.SetValue(timerGuidLow, "seeded", 1);

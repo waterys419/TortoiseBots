@@ -75,12 +75,24 @@
 #include "WorldBuffTravelActions.h"
 
 #include "OnyxiasLairDungeonActions.h"
+#include "BossTacticsActions.h"
 #include "MoltenCoreDungeonActions.h"
 #include "BlackwingLairDungeonActions.h"
 #include "NaxxramasDungeonActions.h"
 #include "EmeraldSanctumDungeonActions.h"
 #include "LowerKarazhanDungeonActions.h"
+#include "ClassicRaidDungeonActions.h"
 #include "KarazhanCryptDungeonActions.h"
+#include "GluthDungeonActions.h"
+#include "ThaddiusDungeonActions.h"
+#include "KelthuzadDungeonActions.h"
+#include "GrobbulusDungeonActions.h"
+#include "LoathebDungeonActions.h"
+#include "RazuviousDungeonActions.h"
+#include "SapphironDungeonActions.h"
+#include "HeiganDungeonActions.h"
+#include "AnubrekhanDungeonActions.h"
+#include "RuinsOfAhnqirajDungeonActions.h"
 
 namespace ai
 {
@@ -107,11 +119,13 @@ namespace ai
             creators["move to travel target"] = [](PlayerbotAI* ai) { return new MoveToTravelTargetAction(ai); };
             creators["move out of collision"] = [](PlayerbotAI* ai) { return new MoveOutOfCollisionAction(ai); };
             creators["move random"] = [](PlayerbotAI* ai) { return new MoveRandomAction(ai); };
+            creators["idle wander"] = [](PlayerbotAI* ai) { return new IdleWanderAction(ai); };
             creators["attack"] = [](PlayerbotAI* ai) { return new MeleeAction(ai); };
             creators["melee"] = [](PlayerbotAI* ai) { return new MeleeAction(ai); };
             creators["switch to melee"] = [](PlayerbotAI* ai) { return new SwitchToMeleeAction(ai); };
             creators["switch to ranged"] = [](PlayerbotAI* ai) { return new SwitchToRangedAction(ai); };
             creators["reach spell"] = [](PlayerbotAI* ai) { return new ReachSpellAction(ai); };
+            creators["reach cc"] = [](PlayerbotAI* ai) { return new ReachCcAction(ai); };
             creators["reach melee"] = [](PlayerbotAI* ai) { return new ReachMeleeAction(ai); };
             creators["reach pull"] = [](PlayerbotAI* ai) { return new ReachPullAction(ai); };
             creators["reach party member to heal"] = [](PlayerbotAI* ai) { return new ReachPartyMemberToHealAction(ai); };
@@ -119,6 +133,7 @@ namespace ai
             creators["reach party member for totem"] = [](PlayerbotAI* ai) { return new ReachPartyMemberForTotemAction(ai); };
             creators["flee"] = [](PlayerbotAI* ai) { return new FleeAction(ai); };
             creators["flee with pet"] = [](PlayerbotAI* ai) { return new FleeWithPetAction(ai); };
+            creators["avoid aoe"] = [](PlayerbotAI* ai) { return new AvoidAoeAction(ai); };
             creators["wait for attack keep safe distance"] = [](PlayerbotAI* ai) { return new WaitForAttackKeepSafeDistanceAction(ai); };
             creators["shoot"] = [](PlayerbotAI* ai) { return new CastShootAction(ai); };
             creators["whipper root tuber"] = [](PlayerbotAI* ai) { return new UseWhipperRootTuberAction(ai); };
@@ -138,6 +153,7 @@ namespace ai
             creators["release loot"] = [](PlayerbotAI* ai) { return new ReleaseLootAction(ai); };
             creators["auto loot roll"] = [](PlayerbotAI* ai) { return new AutoLootRollAction(ai); };
             creators["follow"] = [](PlayerbotAI* ai) { return new FollowAction(ai); };
+            creators["formation station"] = [](PlayerbotAI* ai) { return new FormationStationAction(ai); };
             creators["stop follow"] = [](PlayerbotAI* ai) { return new StopFollowAction(ai); };
             creators["flee to master"] = [](PlayerbotAI* ai) { return new FleeToMasterAction(ai); };
             creators["runaway"] = [](PlayerbotAI* ai) { return new RunAwayAction(ai); };
@@ -147,12 +163,17 @@ namespace ai
             creators["attack least hp target"] = [](PlayerbotAI* ai) { return new AttackLeastHpTargetAction(ai); };
             creators["attack enemy player"] = [](PlayerbotAI* ai) { return new AttackEnemyPlayerAction(ai); };
             creators["pull my target"] = [](PlayerbotAI* ai) { return new PullMyTargetAction(ai); };
+            creators["pullback my target"] = [](PlayerbotAI* ai) { return new PullbackMyTargetAction(ai); };
             creators["pull rti target"] = [](PlayerbotAI* ai) { return new PullRTITargetAction(ai); };
             creators["pull nearest target"] = [](PlayerbotAI* ai) { return new PullNearestTargetAction(ai); };
             creators["pull start"] = [](PlayerbotAI* ai) { return new PullStartAction(ai); };
             creators["pull action"] = [](PlayerbotAI* ai) { return new PullAction(ai); };
             creators["return to pull position"] = [](PlayerbotAI* ai) { return new ReturnToPullPositionAction(ai); };
             creators["pull end"] = [](PlayerbotAI* ai) { return new PullEndAction(ai); };
+            // mod-playerbots `end pull` escape hatch (LD-9): abort a stuck pull
+            // via the same bookkeeping as the state machine's own pull end.
+            // Guarded subclass (review PR #603): no-op unless a pull started.
+            creators["end pull"] = [](PlayerbotAI* ai) { return new EndPullAction(ai); };
             creators["release pull hold"] = [](PlayerbotAI* ai) { return new ReleasePullHoldAction(ai); };
             creators["emote"] = [](PlayerbotAI* ai) { return new EmoteAction(ai); };
             creators["talk"] = [](PlayerbotAI* ai) { return new TalkAction(ai); };
@@ -166,7 +187,9 @@ namespace ai
             creators["return to stay position"] = [](PlayerbotAI* ai) { return new ReturnToStayPositionAction(ai); };
             creators["move out of enemy contact"] = [](PlayerbotAI* ai) { return new MoveOutOfEnemyContactAction(ai); };
             creators["set facing"] = [](PlayerbotAI* ai) { return new SetFacingTargetAction(ai); };
+            creators["tank face away"] = [](PlayerbotAI* ai) { return new TankFaceAwayAction(ai); };
             creators["set behind"] = [](PlayerbotAI* ai) { return new SetBehindTargetAction(ai); };
+            creators["rear flank"] = [](PlayerbotAI* ai) { return new RearFlankAction(ai); };
             creators["attack duel opponent"] = [](PlayerbotAI* ai) { return new AttackDuelOpponentAction(ai); };
             creators["select new target"] = [](PlayerbotAI* ai) { return new SelectNewTargetAction(ai); };
             creators["check mail"] = [](PlayerbotAI* ai) { return new CheckMailAction(ai); };
@@ -246,6 +269,7 @@ namespace ai
             creators["use bandage"] = [](PlayerbotAI* ai) { return new UseBandageAction(ai); };
             creators["rocket boots"] = [](PlayerbotAI* ai) { return new UseRocketBootsAction(ai); };
             creators["fire protection potion"] = [](PlayerbotAI* ai) { return new UseFireProtectionPotionAction(ai); };
+            creators["boss protection potion"] = [](PlayerbotAI* ai) { return new UseBossProtectionPotionAction(ai); };
             creators["free action potion"] = [](PlayerbotAI* ai) { return new UseFreeActionPotionAction(ai); };
             creators["use consumable"] = [](PlayerbotAI* ai) { return new UseConsumableAction(ai); };
             creators["anti-venom"] = [](PlayerbotAI* ai) { return new UseAntiVenomAction(ai); };
@@ -256,6 +280,7 @@ namespace ai
             creators["bg move to objective"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "move to objective"); };
             creators["bg select objective"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "select objective"); };
             creators["bg check objective"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "check objective"); };
+            creators["bg reset objective force"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "reset objective force"); };
             creators["bg attack fc"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "attack fc"); };
             creators["bg protect fc"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "protect fc"); };
             creators["bg use buff"] = [](PlayerbotAI* ai) { return new BGTactics(ai, "use buff"); };
@@ -322,9 +347,15 @@ namespace ai
             creators["arcane torrent"] = [](PlayerbotAI* ai) { return new CastArcaneTorrentAction(ai); };
 
             creators["use id"] = [](PlayerbotAI* ai) { return new UseItemIdAction(ai); };
+            creators["commander use"] = [](PlayerbotAI* ai) { return new CommanderUseAction(ai); };
             creators["move to"] = [](PlayerbotAI* ai) { return new MoveToAction(ai); };
 
             // Dungeon Actions
+            creators["enable boss tactics strategy"] = [](PlayerbotAI* ai) { return new BossTacticsEnableStrategyAction(ai); };
+            creators["disable boss tactics strategy"] = [](PlayerbotAI* ai) { return new BossTacticsDisableStrategyAction(ai); };
+            creators["boss tactics interrupt"] = [](PlayerbotAI* ai) { return new BossTacticsInterruptAction(ai); };
+            creators["boss tactics kill first"] = [](PlayerbotAI* ai) { return new BossTacticsKillFirstAction(ai); };
+            creators["boss tactics step behind"] = [](PlayerbotAI* ai) { return new BossTacticsStepBehindAction(ai); };
             creators["enable onyxia's lair strategy"] = [](PlayerbotAI* ai) { return new OnyxiasLairEnableDungeonStrategyAction(ai); };
             creators["disable onyxia's lair strategy"] = [](PlayerbotAI* ai) { return new OnyxiasLairDisableDungeonStrategyAction(ai); };
             creators["enable molten core strategy"] = [](PlayerbotAI* ai) { return new MoltenCoreEnableDungeonStrategyAction(ai); };
@@ -333,6 +364,15 @@ namespace ai
             creators["disable blackwing lair strategy"] = [](PlayerbotAI* ai) { return new BlackwingLairDisableDungeonStrategyAction(ai); };
             creators["enable naxxramas strategy"] = [](PlayerbotAI* ai) { return new NaxxramasEnableDungeonStrategyAction(ai); };
             creators["disable naxxramas strategy"] = [](PlayerbotAI* ai) { return new NaxxramasDisableDungeonStrategyAction(ai); };
+            creators["enable zul'gurub strategy"] = [](PlayerbotAI* ai) { return new ZulgurubEnableDungeonStrategyAction(ai); };
+            creators["disable zul'gurub strategy"] = [](PlayerbotAI* ai) { return new ZulgurubDisableDungeonStrategyAction(ai); };
+            creators["enable ruins of ahn'qiraj strategy"] = [](PlayerbotAI* ai) { return new RuinsOfAhnqirajEnableDungeonStrategyAction(ai); };
+            creators["disable ruins of ahn'qiraj strategy"] = [](PlayerbotAI* ai) { return new RuinsOfAhnqirajDisableDungeonStrategyAction(ai); };
+            creators["enable ahn'qiraj temple strategy"] = [](PlayerbotAI* ai) { return new AhnqirajTempleEnableDungeonStrategyAction(ai); };
+            creators["disable ahn'qiraj temple strategy"] = [](PlayerbotAI* ai) { return new AhnqirajTempleDisableDungeonStrategyAction(ai); };
+            creators["enable ossirian fight strategy"] = [](PlayerbotAI* ai) { return new OssirianEnableFightStrategyAction(ai); };
+            creators["disable ossirian fight strategy"] = [](PlayerbotAI* ai) { return new OssirianDisableFightStrategyAction(ai); };
+            creators["use ossirian crystal"] = [](PlayerbotAI* ai) { return new UseOssirianCrystalAction(ai); };
             creators["enable emerald sanctum strategy"] = [](PlayerbotAI* ai) { return new EmeraldSanctumEnableDungeonStrategyAction(ai); };
             creators["disable emerald sanctum strategy"] = [](PlayerbotAI* ai) { return new EmeraldSanctumDisableDungeonStrategyAction(ai); };
             creators["enable lower karazhan strategy"] = [](PlayerbotAI* ai) { return new LowerKarazhanEnableDungeonStrategyAction(ai); };
@@ -343,15 +383,38 @@ namespace ai
             // Dungeon Boss Actions
             creators["enable onyxia fight strategy"] = [](PlayerbotAI* ai) { return new OnyxiaEnableFightStrategyAction(ai); };
             creators["disable onyxia fight strategy"] = [](PlayerbotAI* ai) { return new OnyxiaDisableFightStrategyAction(ai); };
+            creators["onyxia breath safe zone"] = [](PlayerbotAI* ai) { return new OnyxiaBreathSafeZoneAction(ai); };
+            creators["onyxia kill whelps"] = [](PlayerbotAI* ai) { return new OnyxiaKillWhelpsAction(ai); };
+            creators["onyxia avoid eggs"] = [](PlayerbotAI* ai) { return new OnyxiaAvoidEggsAction(ai); };
 
             creators["enable magmadar fight strategy"] = [](PlayerbotAI* ai) { return new MagmadarEnableFightStrategyAction(ai); };
             creators["disable magmadar fight strategy"] = [](PlayerbotAI* ai) { return new MagmadarDisableFightStrategyAction(ai); };
             creators["move away from magmadar"] = [](PlayerbotAI* ai) { return new MagmadarMoveAwayAction(ai); };
 
+            creators["enable garr fight strategy"] = [](PlayerbotAI* ai) { return new GarrEnableFightStrategyAction(ai); };
+            creators["disable garr fight strategy"] = [](PlayerbotAI* ai) { return new GarrDisableFightStrategyAction(ai); };
+            creators["enable shazzrah fight strategy"] = [](PlayerbotAI* ai) { return new ShazzrahEnableFightStrategyAction(ai); };
+            creators["disable shazzrah fight strategy"] = [](PlayerbotAI* ai) { return new ShazzrahDisableFightStrategyAction(ai); };
+            creators["move away from shazzrah"] = [](PlayerbotAI* ai) { return new ShazzrahMoveAwayAction(ai); };
+            creators["enable golemagg fight strategy"] = [](PlayerbotAI* ai) { return new GolemaggEnableFightStrategyAction(ai); };
+            creators["disable golemagg fight strategy"] = [](PlayerbotAI* ai) { return new GolemaggDisableFightStrategyAction(ai); };
+            creators["back off golemagg"] = [](PlayerbotAI* ai) { return new GolemaggBackOffAction(ai); };
+            creators["golemagg healer position"] = [](PlayerbotAI* ai) { return new GolemaggHealerPositionAction(ai); };
+            creators["golemagg tank hold"] = [](PlayerbotAI* ai) { return new GolemaggTankHoldAction(ai); };
+            creators["enable geddon fight strategy"] = [](PlayerbotAI* ai) { return new GeddonEnableFightStrategyAction(ai); };
+            creators["disable geddon fight strategy"] = [](PlayerbotAI* ai) { return new GeddonDisableFightStrategyAction(ai); };
+            creators["move away from living bomb"] = [](PlayerbotAI* ai) { return new GeddonMoveAwayFromLivingBombAction(ai); };
+            creators["move away from geddon"] = [](PlayerbotAI* ai) { return new GeddonMoveAwayAction(ai); };
+
             creators["move away from hazard"] = [](PlayerbotAI* ai) { return new MoveAwayFromHazard(ai); };
             creators["raid bomb runout"] = [](PlayerbotAI* ai) { return new RaidBombRunoutAction(ai); };
+            creators["four horsemen rotate"] = [](PlayerbotAI* ai) { return new FourHorsemenRotateAction(ai); };
+            creators["vael adrenaline flee"] = [](PlayerbotAI* ai) { return new VaelBurningAdrenalineFleeAction(ai); };
             creators["dragon flank"] = [](PlayerbotAI* ai) { return new DragonFlankAction(ai); };
             creators["raid spread"] = [](PlayerbotAI* ai) { return new RaidSpreadAction(ai); };
+            creators["swap fire resistance aura"] = [](PlayerbotAI* ai) { return new SwapFireResistanceAuraAction(ai); };
+            creators["swap shadow resistance aura"] = [](PlayerbotAI* ai) { return new SwapShadowResistanceAuraAction(ai); };
+            creators["restore spec aura"] = [](PlayerbotAI* ai) { return new RestoreSpecAuraAction(ai); };
             creators["dragon tank face away"] = [](PlayerbotAI* ai) { return new DragonTankFaceAwayAction(ai); };
             creators["move to mc rune"] = [](PlayerbotAI* ai) { return new MoveToMCRuneAction(ai); };
             creators["douse mc rune aqual"] = [](PlayerbotAI* ai) { return new DouseMCRuneActionAqual(ai); };
@@ -361,8 +424,59 @@ namespace ai
             creators["stealth for suppression device"] = [](PlayerbotAI* ai) { return new StealthForSuppressionDeviceAction(ai); };
             creators["disarm suppression device"] = [](PlayerbotAI* ai) { return new DisarmSuppressionDeviceAction(ai); };
 
+            creators["enable chromaggus fight strategy"] = [](PlayerbotAI* ai) { return new ChromaggusEnableFightStrategyAction(ai); };
+            creators["disable chromaggus fight strategy"] = [](PlayerbotAI* ai) { return new ChromaggusDisableFightStrategyAction(ai); };
+            creators["use hourglass sand"] = [](PlayerbotAI* ai) { return new UseHourglassSandAction(ai); };
+            creators["enable razorgore fight strategy"] = [](PlayerbotAI* ai) { return new RazorgoreEnableFightStrategyAction(ai); };
+            creators["disable razorgore fight strategy"] = [](PlayerbotAI* ai) { return new RazorgoreDisableFightStrategyAction(ai); };
+            creators["escape razorgore cone"] = [](PlayerbotAI* ai) { return new RazorgoreEscapeConeAction(ai); };
+            creators["back off razorgore"] = [](PlayerbotAI* ai) { return new RazorgoreBackOffAction(ai); };
+            creators["razorgore engage"] = [](PlayerbotAI* ai) { return new RazorgoreEngageAction(ai); };
+            creators["enable broodlord fight strategy"] = [](PlayerbotAI* ai) { return new BroodlordEnableFightStrategyAction(ai); };
+            creators["disable broodlord fight strategy"] = [](PlayerbotAI* ai) { return new BroodlordDisableFightStrategyAction(ai); };
+            creators["move away from broodlord"] = [](PlayerbotAI* ai) { return new BroodlordMoveAwayAction(ai); };
+            creators["enable nefarian fight strategy"] = [](PlayerbotAI* ai) { return new NefarianEnableFightStrategyAction(ai); };
+            creators["disable nefarian fight strategy"] = [](PlayerbotAI* ai) { return new NefarianDisableFightStrategyAction(ai); };
+            creators["enable vael fight strategy"] = [](PlayerbotAI* ai) { return new VaelEnableFightStrategyAction(ai); };
+            creators["disable vael fight strategy"] = [](PlayerbotAI* ai) { return new VaelDisableFightStrategyAction(ai); };
+
             creators["enable four horseman fight strategy"] = [](PlayerbotAI* ai) { return new FourHorsemanEnableFightStrategyAction(ai); };
             creators["disable four horseman fight strategy"] = [](PlayerbotAI* ai) { return new FourHorsemanDisableFightStrategyAction(ai); };
+            creators["enable gluth fight strategy"] = [](PlayerbotAI* ai) { return new GluthEnableFightStrategyAction(ai); };
+            creators["disable gluth fight strategy"] = [](PlayerbotAI* ai) { return new GluthDisableFightStrategyAction(ai); };
+            creators["gluth choose target"] = [](PlayerbotAI* ai) { return new GluthChooseTargetAction(ai); };
+            creators["gluth taunt swap"] = [](PlayerbotAI* ai) { return new GluthTauntSwapAction(ai); };
+            creators["enable thaddius fight strategy"] = [](PlayerbotAI* ai) { return new ThaddiusEnableFightStrategyAction(ai); };
+            creators["disable thaddius fight strategy"] = [](PlayerbotAI* ai) { return new ThaddiusDisableFightStrategyAction(ai); };
+            creators["thaddius attack nearest pet"] = [](PlayerbotAI* ai) { return new ThaddiusAttackNearestPetAction(ai); };
+            creators["thaddius move to platform"] = [](PlayerbotAI* ai) { return new ThaddiusMoveToPlatformAction(ai); };
+            creators["thaddius move polarity"] = [](PlayerbotAI* ai) { return new ThaddiusMovePolarityAction(ai); };
+            creators["enable kel'thuzad fight strategy"] = [](PlayerbotAI* ai) { return new KelthuzadEnableFightStrategyAction(ai); };
+            creators["disable kel'thuzad fight strategy"] = [](PlayerbotAI* ai) { return new KelthuzadDisableFightStrategyAction(ai); };
+            creators["kel'thuzad choose target"] = [](PlayerbotAI* ai) { return new KelthuzadChooseTargetAction(ai); };
+            creators["kel'thuzad position"] = [](PlayerbotAI* ai) { return new KelthuzadPositionAction(ai); };
+            creators["enable grobbulus fight strategy"] = [](PlayerbotAI* ai) { return new GrobbulusEnableFightStrategyAction(ai); };
+            creators["disable grobbulus fight strategy"] = [](PlayerbotAI* ai) { return new GrobbulusDisableFightStrategyAction(ai); };
+            creators["grobbulus go behind"] = [](PlayerbotAI* ai) { return new GrobbulusGoBehindAction(ai); };
+            creators["enable loatheb fight strategy"] = [](PlayerbotAI* ai) { return new LoathebEnableFightStrategyAction(ai); };
+            creators["disable loatheb fight strategy"] = [](PlayerbotAI* ai) { return new LoathebDisableFightStrategyAction(ai); };
+            creators["loatheb choose target"] = [](PlayerbotAI* ai) { return new LoathebChooseTargetAction(ai); };
+            creators["loatheb position"] = [](PlayerbotAI* ai) { return new LoathebPositionAction(ai); };
+            creators["enable razuvious fight strategy"] = [](PlayerbotAI* ai) { return new RazuviousEnableFightStrategyAction(ai); };
+            creators["disable razuvious fight strategy"] = [](PlayerbotAI* ai) { return new RazuviousDisableFightStrategyAction(ai); };
+            creators["razuvious mind control"] = [](PlayerbotAI* ai) { return new RazuviousMindControlAction(ai); };
+            creators["enable sapphiron fight strategy"] = [](PlayerbotAI* ai) { return new SapphironEnableFightStrategyAction(ai); };
+            creators["disable sapphiron fight strategy"] = [](PlayerbotAI* ai) { return new SapphironDisableFightStrategyAction(ai); };
+            creators["sapphiron hide"] = [](PlayerbotAI* ai) { return new SapphironHideAction(ai); };
+            creators["sapphiron avoid blizzard"] = [](PlayerbotAI* ai) { return new SapphironAvoidBlizzardAction(ai); };
+            creators["enable heigan fight strategy"] = [](PlayerbotAI* ai) { return new HeiganEnableFightStrategyAction(ai); };
+            creators["disable heigan fight strategy"] = [](PlayerbotAI* ai) { return new HeiganDisableFightStrategyAction(ai); };
+            creators["heigan dance move"] = [](PlayerbotAI* ai) { return new HeiganDanceMoveAction(ai); };
+            creators["heigan hold platform"] = [](PlayerbotAI* ai) { return new HeiganHoldPlatformAction(ai); };
+            creators["enable anub'rekhan fight strategy"] = [](PlayerbotAI* ai) { return new AnubrekhanEnableFightStrategyAction(ai); };
+            creators["disable anub'rekhan fight strategy"] = [](PlayerbotAI* ai) { return new AnubrekhanDisableFightStrategyAction(ai); };
+            creators["anub'rekhan choose target"] = [](PlayerbotAI* ai) { return new AnubrekhanChooseTargetAction(ai); };
+            creators["anub'rekhan to center"] = [](PlayerbotAI* ai) { return new AnubrekhanToCenterAction(ai); };
             creators["move away from void zone"] = [](PlayerbotAI* ai) { return new FourHorsemanMoveAwayFromVoidZoneAction(ai); };
             creators["enable solnius fight strategy"] = [](PlayerbotAI* ai) { return new SolniusEnableFightStrategyAction(ai); };
             creators["disable solnius fight strategy"] = [](PlayerbotAI* ai) { return new SolniusDisableFightStrategyAction(ai); };

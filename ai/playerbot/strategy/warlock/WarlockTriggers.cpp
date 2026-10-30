@@ -2,8 +2,14 @@
 #include "playerbot/playerbot.h"
 #include "WarlockTriggers.h"
 #include "WarlockActions.h"
+#include "WarlockPetTaunt.h"
 #include "playerbot/strategy/values/PossibleAttackTargetsValue.h"
-#include "../../../runtime/WarlockPetPolicy.h"
+#include "../../../runtime/policy/pet/VoidwalkerPolicy.h"
+#include "../../../runtime/policy/pet/HealthFunnelPolicy.h"
+#include "../../../runtime/policy/pet/WarlockPetPolicy.h"
+#include "../../../runtime/policy/class/WarlockTapPolicy.h"
+#include "../../../runtime/policy/class/WarlockStonePolicy.h"
+#include "../../../../runtime/policy/class/WarlockSoulstonePolicy.h"
 
 using namespace ai;
 
@@ -17,9 +23,56 @@ bool DemonArmorTrigger::IsActive()
 			   !ai->HasAura("demon armor", target);
 }
 
+namespace
+{
+// Held off-hand stone in the bags that can go into the off-hand right now
+// (runtime/WarlockStonePolicy.h). Turtle's bag-consumable Spellstone and
+// Firestone share the vanilla names but cannot be equipped; matching on the
+// name alone made the equip action fail on every tick.
+bool HasHoldableStoneToEquip(Player* bot, std::list<Item*> const& stones)
+{
+    TortoiseBots::WarlockStoneSlotFacts slots;
+    slots.offHandEmpty = !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+    Item* mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+    slots.hasMainHand = mainHand != nullptr;
+    slots.mainHandInventoryType = mainHand ? mainHand->GetProto()->InventoryType : 0;
+    for (Item* stone : stones)
+    {
+        if (stone && !stone->IsEquipped() &&
+            TortoiseBots::CanHoldWarlockStone(stone->GetProto()->InventoryType, slots))
+            return true;
+    }
+    return false;
+}
+}
+
 bool SpellstoneTrigger::IsActive()
 {
-    return BuffTrigger::IsActive() && AI_VALUE2(uint32, "item count", getName()) > 0;
+    // Off-hand held item like firestone (not a weapon temp-enchant: the
+    // stone's on-use spell targets the caster). Never displace worn gear,
+    // and a two-handed main-hand leaves nowhere to put it.
+    if (AI_VALUE2(uint32, "item count", getName()) == 0)
+        return false;
+    return HasHoldableStoneToEquip(bot, AI_VALUE2(std::list<Item*>, "inventory items", getName()));
+}
+
+bool FirestoneTrigger::IsActive()
+{
+    // Same gates as the spellstone: never displace worn gear, and a
+    // two-handed main-hand leaves nowhere to put it.
+    if (AI_VALUE2(uint32, "item count", getName()) == 0)
+        return false;
+    return HasHoldableStoneToEquip(bot, AI_VALUE2(std::list<Item*>, "inventory items", getName()));
+}
+
+bool UnendingBreathTrigger::IsActive()
+{
+    return AI_VALUE2(bool, "swimming", "self target") && BuffTrigger::IsActive();
+}
+
+bool UnendingBreathOnPartyTrigger::IsActive()
+{
+    return AI_VALUE2(bool, "swimming", "self target") && BuffOnPartyTrigger::IsActive();
 }
 
 bool InfernoTrigger::IsActive()
@@ -34,7 +87,7 @@ bool CorruptionTrigger::IsActive()
     if (AI_VALUE2(uint8, "health", "current target") <= 20)
         return false;
     Unit* target = GetTarget();
-    return target && !ai->HasAura("corruption", target) && !HasMaxDebuffs();
+    return target && !ai->HasAura("corruption", target, false, true) && !HasMaxDebuffs();
 }
 
 bool SiphonLifeTrigger::IsActive()
@@ -56,22 +109,44 @@ bool CorruptionOnAttackerTrigger::IsActive()
     return DebuffOnAttackerTrigger::IsActive();
 }
 
+// Out-of-combat tap discipline (review pr-593): the OOC rows beat food/drink
+// on relevance (9 > 6), so an ungated tap stands the bot up mid-meal and
+// ping-pongs sit/stand/tap. Between pulls the bot eats first, then taps:
+// while a food or drink aura is up both tap bands stay quiet via the
+// policy isEating flag (combat passes in-combat, flag ignored there).
+static bool WarlockTapEating(PlayerbotAI* ai)
+{
+    Player* bot = ai->GetBot();
+    return ai->HasAura("food", bot) || ai->HasAura("drink", bot);
+}
+
+static void FillWarlockTapInputs(PlayerbotAI* ai, TortoiseBots::WarlockTapInputs& inputs)
+{
+    inputs.knowsLifeTap = ai->HasSpell("life tap");
+    AiObjectContext* context = ai->GetAiObjectContext();
+    inputs.manaPct = AI_VALUE2(uint8, "mana", "self target");
+    inputs.healthPct = AI_VALUE2(uint8, "health", "self target");
+    inputs.mediumMana = (uint8)sPlayerbotAIConfig.mediumMana;
+    inputs.lowHealth = (uint8)sPlayerbotAIConfig.lowHealth;
+    inputs.isEating = !ai->GetBot()->IsInCombat() && WarlockTapEating(ai);
+}
+
 bool LifeTapTrigger::IsActive()
 {
-	if (!ai->HasSpell("life tap"))
-		return false;
+    // Tap early (medium-mana line, default 40) instead of at 15%: a warlock
+    // that waits until nearly empty spends the rest of the fight wanding.
+    // The health floor below keeps the tap safe; the relevance bump in
+    // WarlockStrategy puts it above the dot upkeep it feeds.
+    TortoiseBots::WarlockTapInputs inputs;
+    FillWarlockTapInputs(ai, inputs);
+    return TortoiseBots::DecideWarlockTap(inputs, ai->GetBot()->IsInCombat()) == TortoiseBots::WarlockTapDecision::TapUrgent;
+}
 
-	const uint32 mana = AI_VALUE2(uint8, "mana", "self target");
-	if (mana <= sPlayerbotAIConfig.lowMana)
-	{
-		const uint32 health = AI_VALUE2(uint8, "health", "self target");
-		if (health > sPlayerbotAIConfig.lowHealth)
-		{
-			return true;
-		}
-	}
-
-	return false;
+bool LifeTapTopUpTrigger::IsActive()
+{
+    TortoiseBots::WarlockTapInputs inputs;
+    FillWarlockTapInputs(ai, inputs);
+    return TortoiseBots::DecideWarlockTap(inputs, ai->GetBot()->IsInCombat()) == TortoiseBots::WarlockTapDecision::TapTopUp;
 }
 
 bool DrainSoulTrigger::IsActive()
@@ -107,7 +182,8 @@ bool NoCurseTrigger::IsActive()
 		!ai->HasSpell("curse of shadow") &&
 		!ai->HasSpell("curse of the elements") &&
 		!ai->HasSpell("curse of weakness") &&
-		!ai->HasSpell("curse of tongues"))
+		!ai->HasSpell("curse of tongues") &&
+		!ai->HasSpell("curse of exhaustion"))
 		return false;
 
 	Unit* target = GetTarget();
@@ -119,10 +195,41 @@ bool NoCurseTrigger::IsActive()
 			   !ai->HasAura("curse of shadow", target, false, true) &&
 			   !ai->HasAura("curse of the elements", target, false, true) &&
 			   !ai->HasAura("curse of weakness", target, false, true) &&
-			   !ai->HasAura("curse of tongues", target, false, true);
+			   !ai->HasAura("curse of tongues", target, false, true) &&
+			   !ai->HasAura("curse of exhaustion", target, false, true);
 	}
+    return false;
+}
 
-	return false;
+namespace
+{
+// True while any curse sits on the target, anyone-sees (checkIsOwner=false):
+// one curse per target in this core, so a groupmate's curse covers the slot.
+// The caster's OWN curse: the core keeps one curse per warlock per target,
+// so a second warlock may add a different curse beside the first one.
+bool HasMyCurse(PlayerbotAI* ai, Unit* target)
+{
+    static const char* const curses[] = {
+        "curse of agony", "curse of doom", "curse of recklessness", "curse of shadow",
+        "curse of the elements", "curse of weakness", "curse of tongues", "curse of exhaustion"
+    };
+    if (!target)
+        return false;
+    for (const char* curse : curses)
+        if (ai->HasAura(curse, target, false, true))
+            return true;
+    return false;
+}
+}  // namespace
+
+bool CurseOfRecklessnessRaidTrigger::IsActive()
+{
+    return DebuffTrigger::IsActive() && !HasMyCurse(ai, GetTarget());
+}
+
+bool CurseOfShadowRaidTrigger::IsActive()
+{
+    return DebuffTrigger::IsActive() && !HasMyCurse(ai, GetTarget());
 }
 
 bool NoCurseOnAttackerTrigger::IsActive()
@@ -133,7 +240,8 @@ bool NoCurseOnAttackerTrigger::IsActive()
 		!ai->HasSpell("curse of shadow") &&
 		!ai->HasSpell("curse of the elements") &&
 		!ai->HasSpell("curse of weakness") &&
-		!ai->HasSpell("curse of tongues"))
+		!ai->HasSpell("curse of tongues") &&
+		!ai->HasSpell("curse of exhaustion"))
 		return false;
 
     std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "possible attack targets");
@@ -149,7 +257,8 @@ bool NoCurseOnAttackerTrigger::IsActive()
 				!ai->HasAura("curse of shadow", attacker, false, true) &&
 				!ai->HasAura("curse of the elements", attacker, false, true) &&
 				!ai->HasAura("curse of weakness", attacker, false, true) &&
-				!ai->HasAura("curse of tongues", attacker, false, true))
+				!ai->HasAura("curse of tongues", attacker, false, true) &&
+				!ai->HasAura("curse of exhaustion", attacker, false, true))
 			{
 				return true;
 			}
@@ -162,7 +271,7 @@ bool NoCurseOnAttackerTrigger::IsActive()
 // Fear runs the mob into other packs, so unlike the other CC triggers it never
 // auto-picks a target: it only fires on this bot's assigned raid mark
 // (mod-playerbots RtiCcTrigger semantics), and never replaces another CC.
-bool FearTrigger::IsActive()
+bool FearTrigger::CcTargetPending()
 {
     Unit* rtiCcTarget = AI_VALUE(Unit*, "rti cc target");
     if (!rtiCcTarget || AI_VALUE2(Unit*, "cc target", getName()) != rtiCcTarget)
@@ -172,7 +281,7 @@ bool FearTrigger::IsActive()
         PossibleAttackTargetsValue::HasUnBreakableCC(rtiCcTarget, bot))
         return false;
 
-    return HasCcTargetTrigger::IsActive();
+    return HasCcTargetTrigger::CcTargetPending();
 }
 
 bool FearPvpTrigger::IsActive()
@@ -262,10 +371,84 @@ bool NoSpecificPetTrigger::IsActive()
     return true;
 }
 
+namespace
+{
+// Spec of a warlock bot from the class strategy the engine already holds
+// (a map lookup, no talent walk). Unknown when none is enabled yet.
+TortoiseBots::WarlockSpec WarlockSpecOf(PlayerbotAI* ai)
+{
+    if (ai->HasStrategy("affliction", BotState::BOT_STATE_NON_COMBAT))
+        return TortoiseBots::WarlockSpec::Affliction;
+    if (ai->HasStrategy("demonology", BotState::BOT_STATE_NON_COMBAT))
+        return TortoiseBots::WarlockSpec::Demonology;
+    if (ai->HasStrategy("destruction", BotState::BOT_STATE_NON_COMBAT))
+        return TortoiseBots::WarlockSpec::Destruction;
+    return TortoiseBots::WarlockSpec::Unknown;
+}
+
+// One spec-pet decision for the four SpecPetTrigger rows. Cheap exits first;
+// the group tank read is shared per interval, and the shard read only runs
+// once a summon or swap is actually wanted.
+TortoiseBots::WarlockSpecPetDecision DecideSpecPet(PlayerbotAI* ai, Player* bot)
+{
+    using TortoiseBots::WarlockSpecPetDecision;
+    if (!sPlayerbotAIConfig.warlockPetBySpec)
+        return WarlockSpecPetDecision::LeaveAlone;
+    // A pet the player ordered ("pet imp" ... "pet felhunter" strategies) wins.
+    static char const* const manualPets[] = { "pet imp", "pet voidwalker", "pet succubus", "pet felhunter" };
+    for (char const* manual : manualPets)
+        if (ai->HasStrategy(manual, BotState::BOT_STATE_NON_COMBAT))
+            return WarlockSpecPetDecision::LeaveAlone;
+
+    TortoiseBots::WarlockSpecPetInputs inputs;
+    inputs.spec = WarlockSpecOf(ai);
+    if (inputs.spec == TortoiseBots::WarlockSpec::Unknown)
+        return WarlockSpecPetDecision::LeaveAlone;
+    // Mounted (travelling): no swap and no summon until the bot dismounts.
+    if (ai->GetAiObjectContext()->GetValue<bool>("mounted", "self target")->Get())
+        return WarlockSpecPetDecision::LeaveAlone;
+
+    Unit* pet = ai->GetAiObjectContext()->GetValue<Unit*>("pet target")->Get();
+    inputs.hasPet = pet != nullptr;
+    inputs.currentPetEntry = pet ? pet->GetEntry() : 0;
+    // Pool bots only may swap a live pet; a player-owned bot keeps what it has.
+    inputs.canSwapLivePet = !ai->HasRealPlayerMaster();
+    if (inputs.hasPet && !inputs.canSwapLivePet)
+        return WarlockSpecPetDecision::LeaveAlone;
+
+    inputs.knowsVoidwalker = bot->HasSpell(TortoiseBots::WARLOCK_VOIDWALKER_SUMMON_SPELL);
+    inputs.knowsSuccubus = bot->HasSpell(TortoiseBots::WARLOCK_SUCCUBUS_SUMMON_SPELL);
+    inputs.knowsFelhunter = bot->HasSpell(TortoiseBots::WARLOCK_FELHUNTER_SUMMON_SPELL);
+    // The tank rule needs a group; a solo bot is its own tank and never walks one.
+    inputs.petIsGroupTank = bot->GetGroup() && ai->GetAiObjectContext()->GetValue<bool>("spec pet tank")->Get();
+    // The live pet already is the choice (or may not be swapped): stop before the bag read.
+    if (TortoiseBots::WarlockSpecPetWanted(inputs) == TortoiseBots::WarlockPetKind::None)
+        return WarlockSpecPetDecision::LeaveAlone;
+
+    inputs.hasSoulShard = bot->GetItemCount(TortoiseBots::WARLOCK_SOUL_SHARD_ITEM) > 0;
+    return TortoiseBots::DecideWarlockSpecPet(inputs);
+}
+} // namespace
+
+bool SpecPetTrigger::IsActive()
+{
+    return DecideSpecPet(ai, bot) == wanted;
+}
+
+bool SpecPetTankValue::Calculate()
+{
+    Group* group = bot->GetGroup();
+    return group && group->GetMembersCount() > 1 && WarlockPetTauntAllowed(ai, bot);
+}
+
 bool WrongPetTrigger::IsActive()
 {
     // Pool bots only: a real-player master picks the demon themselves.
     if (ai->HasRealPlayerMaster())
+        return false;
+    // With the spec-pet toggle on, the SpecPetTrigger rows own the choice
+    // (they also cover the Imp -> Voidwalker step for a spec that wants it).
+    if (sPlayerbotAIConfig.warlockPetBySpec && WarlockSpecOf(ai) != TortoiseBots::WarlockSpec::Unknown)
         return false;
     // Below the Voidwalker trainer tier (697, baseLevel 10) the Imp is the
     // only demon available; above it the solo default is the Voidwalker.
@@ -290,30 +473,22 @@ bool WrongPetTrigger::IsActive()
 
 uint32 SoulstoneTrigger::GetItemId()
 {
-    uint32 itemId = 0;
-    const uint32 level = bot->GetLevel();
-    if (level >= 18 && level < 30)
-    {
-        itemId = 5232;
-    }
-    else if (level >= 30 && level < 40)
-    {
-        itemId = 16892;
-    }
-    else if (level >= 40 && level < 50)
-    {
-        itemId = 16893;
-    }
-    else if (level >= 50 && level < 60)
-    {
-        itemId = 16895;
-    }
-    else if (level >= 60)
-    {
-        itemId = 16896;
-    }
+    return TortoiseBots::PickSoulstoneItem(bot->GetLevel(), [this](uint32 itemId) { return bot->GetItemCount(itemId); });
+}
 
-    return itemId;
+bool HasSoulstoneTrigger::IsActive()
+{
+    if (!WarlockConjuredItemTrigger::IsActive())
+        return false;
+
+    // Create Soulstone consumes a Soul Shard: shardless, stay quiet instead of
+    // queueing a cast that fails isPossible every time the trigger fires.
+    TortoiseBots::SoulstoneCreateFacts facts;
+    facts.level = bot->GetLevel();
+    facts.soulShards = bot->GetItemCount(TortoiseBots::WARLOCK_SOUL_SHARD_ITEM);
+    facts.soulstonesHeld = 0; // the count check above already found none
+    facts.inCombat = bot->IsInCombat();
+    return TortoiseBots::ShouldCreateSoulstone(facts);
 }
 
 bool RainOfFireChannelCheckTrigger::IsActive()
@@ -397,4 +572,111 @@ bool PowerOverwhelmingTrigger::IsActive()
 
     Unit* target = GetTarget();
     return target && target->IsAlive();
+}
+
+// PET-8a: cheap-first — pet presence and entry before the attacker count;
+// the PET-3 permission comes from the shared helper (group walk only while
+// grouped). Spell knowledge/cooldown stay in the action's isPossible.
+bool SufferingTrigger::IsActive()
+{
+    Unit* pet = AI_VALUE(Unit*, "pet target");
+    if (!pet)
+        return false;
+    TortoiseBots::SufferingGateInputs gate;
+    gate.hasPet = true;
+    gate.currentPetEntry = pet->GetEntry();
+    if (gate.currentPetEntry != TortoiseBots::WARLOCK_VOIDWALKER_ENTRY)
+        return false;
+    // Pack on the pet, not the owner: a tanking Voidwalker holds the mobs
+    // while the warlock stands free, so the owner's attacker set is empty
+    // exactly when Suffering is most needed.
+    gate.attackerCount = static_cast<uint8_t>(pet->GetAttackers().size());
+    if (gate.attackerCount < 3)
+        return false;
+    gate.petTauntAllowed = ai::WarlockPetTauntAllowed(ai, bot);
+    return TortoiseBots::CanCastSuffering(gate);
+}
+
+// PET-8c: cheap-first scalar reads; the channel breaks on damage so combat
+// vetoes, and mounted vetoes (can't channel while mounted anyway).
+bool ConsumeShadowsTrigger::IsActive()
+{
+    Unit* pet = AI_VALUE(Unit*, "pet target");
+    if (!pet)
+        return false;
+    TortoiseBots::ConsumeShadowsGateInputs gate;
+    gate.hasPet = true;
+    gate.currentPetEntry = pet->GetEntry();
+    if (gate.currentPetEntry != TortoiseBots::WARLOCK_VOIDWALKER_ENTRY)
+        return false;
+    gate.petAlive = pet->IsAlive();
+    if (!gate.petAlive)
+        return false;
+    if (bot->IsInCombat())
+        return false;
+    gate.petHealth = AI_VALUE2(uint8, "health", "pet target");
+    if (gate.petHealth >= 70)
+        return false;
+    gate.mounted = AI_VALUE2(bool, "mounted", "self target");
+    gate.ownerInCombat = false;
+    return TortoiseBots::CanCastConsumeShadows(gate);
+}
+
+// PET-6: cheap-first — pet presence, then the policy gate on scalar health
+// reads. Spell knowledge/cooldown/range stay in the action's isPossible.
+bool HealthFunnelTrigger::IsActive()
+{
+    Unit* pet = AI_VALUE(Unit*, "pet target");
+    if (!pet)
+        return false;
+    TortoiseBots::HealthFunnelGateInputs gate;
+    gate.hasPet = true;
+    gate.petAlive = pet->IsAlive();
+    if (!gate.petAlive)
+        return false;
+    gate.petHealth = AI_VALUE2(uint8, "health", "pet target");
+    if (gate.petHealth >= 50)
+        return false;
+    gate.ownerHealth = AI_VALUE2(uint8, "health", "self target");
+    gate.ownerInCombat = bot->IsInCombat();
+    return TortoiseBots::CanCastHealthFunnel(gate);
+}
+
+bool WarlockWandBlocksNukeTrigger::IsActive()
+{
+    if (!IsWanding())
+        return false;
+
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target || !target->IsAlive())
+        return false;
+
+    // The raid strategy wands on purpose while the warlock holds aggro
+    // ("has aggro" -> shoot, WarlockRaidStrategy); leave that wand alone.
+    bool const keepWandForThreat = RaidAggroWand();
+    if (keepWandForThreat)
+        return false;
+
+    // Below 5% mana the "no mana" -> shoot row (WarlockStrategy) wands on purpose.
+    bool const noManaRowActive = NoManaRowActive();
+    if (noManaRowActive)
+        return false;
+
+    // Near the tank's threat the "threat" multiplier vetoes Shadow Bolt:
+    // stopping the wand then leaves the warlock idle (or restarts the wand
+    // from the "has aggro" row a swing later), never casting.
+    bool const nukeThreatVetoed = ThreatVetoesNuke();
+    if (nukeThreatVetoed)
+        return false;
+
+    // Shadow Bolt is every spec's filler (default combat action), known
+    // from level 1, with no cooldown of its own: NOT_READY is the GCD.
+    WandState const state{
+        true,
+        ProbeSpell("shadow bolt", target),
+        keepWandForThreat,
+        noManaRowActive,
+        WandSpellProbe::Blocked,
+        nukeThreatVetoed};
+    return ShouldStopWandToCast(state);
 }

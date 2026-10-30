@@ -1,8 +1,11 @@
 #include "TravelNode.h"
 #include "playerbot/TravelMgr.h"
-#include "playerbot/TravelRoutePolicy.h"
+#include "playerbot/policy/travel/TravelRoutePolicy.h"
+#include "playerbot/DungeonFollowHoldPolicy.h"
 
 #include <iomanip>
+#include <optional>
+#include <unordered_map>
 #include <regex>
 
 #include "ObjectMgr.h"
@@ -13,6 +16,7 @@
 #include "strategy/values/BudgetValues.h"
 #include "strategy/values/LastMovementValue.h"
 #include "playerbot/ServerFacade.h"
+#include "playerbot/RandomBotFacade.h"
 #include "Maps/MoveMap.h"
 #include "strategy/values/HazardsValue.h"
 
@@ -104,8 +108,78 @@ void TravelNodePath::calculateCost(bool distanceOnly)
     }
 }
 
+TravelCostContext::TravelCostContext(Unit* unit)
+{
+    bot = dynamic_cast<Player*>(unit);
+    if (!bot)
+        return;
+
+    ai = PlayerbotAIStorage::Instance().GetAI(bot);
+    mapId = bot->GetMapId();
+    instanceId = bot->GetInstanceId();
+    level = bot->GetLevel();
+    isAlliance = PlayerbotAI::friendToAlliance(bot->GetFactionTemplateEntry());
+    taxiCheater = bot->IsTaxiCheater();
+    speed = bot->GetSpeed(MOVE_RUN);
+    swimSpeed = bot->GetSpeed(MOVE_SWIM);
+
+    if (bot->HasSpell(1066))
+        swimSpeed *= 1.5;
+
+    now = time(0);
+}
+
+bool TravelCostContext::hasRealPlayerMaster()
+{
+    if (realPlayerMaster < 0)
+        realPlayerMaster = ai && ai->HasRealPlayerMaster() ? 1 : 0;
+
+    return realPlayerMaster == 1;
+}
+
+bool TravelCostContext::canUseAreaTrigger(uint32 triggerId)
+{
+    auto const cached = areaTriggerUsable.find(triggerId);
+    if (cached != areaTriggerUsable.end())
+        return cached->second;
+
+    bool usable = true;
+
+    AreaTriggerEntry const* atEntry = sAreaTriggerStore.LookupEntry(triggerId);
+    AreaTriggerTeleport const* at = sObjectMgr.GetAreaTriggerTeleport(triggerId);
+    if (atEntry && at && atEntry->mapid == mapId)
+    {
+        Map* map = WorldPosition(atEntry->mapid, atEntry->box_x, atEntry->box_y, atEntry->box_z).GetMap(instanceId);
+        if (map && at->requiredCondition && !sObjectMgr.IsConditionSatisfied(at->requiredCondition, bot, map, nullptr, (ConditionSource)CONDITION_FROM_AREATRIGGER_TELEPORT))
+            usable = false;
+    }
+
+    if (usable && ai)
+    {
+        // Closed by AreaTriggerAction after the server refused to teleport this bot.
+        if (ai->GetAiObjectContext()->GetValue<time_t>("manual time", "area trigger refused::" + std::to_string(triggerId))->Get() > now)
+            usable = false;
+
+        // The Deeprun Tram is crossed by riding the train, which bots
+        // cannot board: a bot routed through it stood on the platform
+        // for good (13 of 2000 pool bots, live 2026-10-09). Masterless
+        // bots walk or fly between Stormwind and Ironforge instead.
+        if (usable && at && at->destination.mapId == MAP_DEEPRUN_TRAM && !hasRealPlayerMaster())
+            usable = false;
+    }
+
+    areaTriggerUsable.emplace(triggerId, usable);
+    return usable;
+}
+
 //The cost to travel this path.
 float TravelNodePath::getCost(Unit* unit, uint32 cGold)
+{
+    TravelCostContext context(unit);
+    return getCost(context, cGold);
+}
+
+float TravelNodePath::getCost(TravelCostContext& context, uint32 cGold)
 {
     float modifier = 1.0f; //Global modifier
     float timeCost = 0.1f;
@@ -113,22 +187,14 @@ float TravelNodePath::getCost(Unit* unit, uint32 cGold)
     float speed = 8.0f; //default run speed
     float swimSpeed = 4.0f; //default swim speed.
 
-    Player* bot = dynamic_cast<Player*>(unit);
+    Player* bot = context.bot;
     if (bot)
     {
         //Check if we can use this area trigger.
         if (getPathType() == TravelNodePathType::areaTrigger && pathObject)
         {
-            uint32 triggerId = getPathObject();
-            AreaTriggerEntry const* atEntry = sAreaTriggerStore.LookupEntry(pathObject);
-            AreaTriggerTeleport const* at = sObjectMgr.GetAreaTriggerTeleport(pathObject);
-            if (atEntry && at && atEntry->mapid == bot->GetMapId())
-            {
-                Map* map = WorldPosition(atEntry->mapid, atEntry->box_x, atEntry->box_y, atEntry->box_z).GetMap(bot->GetInstanceId());
-                if (map)
-                    if (at && at->requiredCondition && !sObjectMgr.IsConditionSatisfied(at->requiredCondition, bot, map, nullptr, (ConditionSource)CONDITION_FROM_AREATRIGGER_TELEPORT))
-                        return -1;
-            }
+            if (!context.canUseAreaTrigger(getPathObject()))
+                return -1;
         }
 
         if (getPathType() == TravelNodePathType::staticPortal && pathObject)
@@ -175,31 +241,12 @@ float TravelNodePath::getCost(Unit* unit, uint32 cGold)
             }
         }
 
-        speed = bot->GetSpeed(MOVE_RUN);
-        swimSpeed = bot->GetSpeed(MOVE_SWIM);
-
-        if (bot->HasSpell(1066))
-            swimSpeed *= 1.5;
-
-        uint32 level = bot->GetLevel();
-        bool isAlliance = PlayerbotAI::friendToAlliance(bot->GetFactionTemplateEntry());
-
-        int factionAnnoyance = 0;
+        speed = context.speed;
+        swimSpeed = context.swimSpeed;
 
         if (maxLevelCreature.size() > 0)
-        {
-            int mobAnnoyance = (maxLevelCreature[0] - level) - 10; //Mobs 10 levels below do not bother us.
-
-            if (isAlliance)
-                factionAnnoyance = (maxLevelCreature[2] - level) - 10;              //Opposite faction below 10 do not bother us.
-            else if (!isAlliance)
-                factionAnnoyance = (maxLevelCreature[1] - level) - 10;
-
-            if (mobAnnoyance > 0)
-                modifier += 0.1 * mobAnnoyance;     //For each level the whole path takes 10% longer.
-            if (factionAnnoyance > 0)
-                modifier += 0.3 * factionAnnoyance; //For each level the whole path takes 30% longer.
-        }
+            modifier = GetCreatureLevelRouteModifier(context.level, context.isAlliance,
+                maxLevelCreature[0], maxLevelCreature[1], maxLevelCreature[2]);
     }
     else if (getPathType() == TravelNodePathType::flightPath)
         return -1;
@@ -1059,6 +1106,16 @@ bool TravelPath::UpcommingSpecialMovement(WorldPosition startPos, float maxDist,
         return true;
     }
 
+    //We are at the cast point of a hearthstone/teleport pair: keep it as the front so
+    //HandleSpecialMovement sees the landing point next. Cutting to nextP here left the
+    //landing point first and every tick declined the leg (live: mages stepping 50 yd per
+    //10 s toward the far side of an 11,000 yd teleport route).
+    if (startP->type == PathNodeType::NODE_TELEPORT && nextP->type == PathNodeType::NODE_TELEPORT && startP->entry == nextP->entry)
+    {
+        cutTo(*startP, false);
+        return true;
+    }
+
     //We are using a hearthstone
     if (nextP->type == PathNodeType::NODE_TELEPORT)
     {
@@ -1112,7 +1169,7 @@ bool TravelPath::UpcommingSpecialMovement(WorldPosition startPos, float maxDist,
     return false;
 }
 
-void TravelPath::ClipPath(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets)
+void TravelPath::ClipPath(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets, PackHoldResult* packHold)
 {
     auto startP = getNextPoint(mover, 0.0f, false);
 
@@ -1197,10 +1254,114 @@ void TravelPath::ClipPath(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets)
         prevP = p;
     }
 
-    if (endP == fullPath.end())
+    if (endP != fullPath.end())
+        fullPath.erase(std::next(endP), fullPath.end());
+
+    if (packHold)
+        ClipBeforePack(ai, mover, ignoreEnemyTargets, *packHold);
+}
+
+// Dungeon "hold before a pack" follow (AiPlayerbot.DungeonFollowHoldBeforePacks):
+// end the route just outside the aggro radius (Creature::GetAttackDistance) of the
+// first unpulled hostile creature it passes. The melee-reach clip above only stops
+// a bot once it is already in the pack. Reads the cached "possible targets" list
+// (recalculated at most once a second by its own cache; the pull and step-out code
+// read the same list), so this adds no grid search of its own.
+void TravelPath::ClipBeforePack(PlayerbotAI* ai, Unit* mover, bool ignoreEnemyTargets, PackHoldResult& packHold)
+{
+    bool const reuseTargets = packHold.reuseTargets;
+    packHold = PackHoldResult();
+    packHold.reuseTargets = reuseTargets;
+
+    if (fullPath.empty() || ignoreEnemyTargets || !mover->IsAlive())
         return;
 
-    fullPath.erase(std::next(endP), fullPath.end());
+    if (ai->IsStateActive(BotState::BOT_STATE_COMBAT) || mover->IsInCombat())
+        return;
+
+    AiObjectContext* context = ai->GetAiObjectContext();
+    // Standing at a hold point the resume check only needs the cached GUIDs
+    // (dead, gone or pulled shows on the units themselves); refresh the list
+    // only while walking, where a new pack can come into sight.
+    std::list<ObjectGuid> nearby = reuseTargets ? AI_VALUE_LAZY(std::list<ObjectGuid>, "possible targets")
+                                                : AI_VALUE(std::list<ObjectGuid>, "possible targets");
+    if (nearby.empty())
+        return;
+
+    std::vector<FollowHoldPack> packs;
+    std::vector<ObjectGuid> packGuids;
+    for (ObjectGuid const& guid : nearby)
+    {
+        if (!guid.IsCreature())
+            continue;
+
+        Unit* unit = ai->GetUnit(guid);
+        Creature* creature = unit ? unit->ToCreature() : nullptr;
+        if (!creature || !creature->IsAlive())
+            continue;
+
+        // Already fighting someone else (a pet, an escort, another member: the
+        // gate keeps the bot and its leader out of combat). Not held for: in a
+        // dungeon such a creature also pulls a passer-by, but that fight is
+        // already on and the bot joining it is acceptable.
+        if (creature->IsInCombat() || creature->GetVictim())
+            continue;
+
+        if (!creature->IsHostileTo(mover) || !creature->CanInitiateAttack())
+            continue;
+
+        float const radius = creature->GetAttackDistance(mover);
+        if (radius <= 0.0f)
+            continue;
+
+        // Core vertical gate: GetDistanceZ(who) > CREATURE_Z_ATTACK_RANGE, where
+        // GetDistanceZ subtracts both bounding radii, so the band is 3 yd plus both.
+        float const zRange = creature->CanFly() ? 0.0f :
+            kDungeonFollowHoldZRangeYd + creature->GetObjectBoundingRadius() + mover->GetObjectBoundingRadius();
+        packs.push_back(FollowHoldPack{ creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ(),
+            radius, zRange });
+        packGuids.push_back(guid);
+    }
+
+    if (packs.empty())
+        return;
+
+    // route[0] is where the bot stands; route[k] is fullPath[k - 1]. Only the
+    // walkable part counts (the clip above already ends the route at the first
+    // special node).
+    std::vector<FollowHoldPoint> route;
+    route.reserve(fullPath.size() + 1);
+    route.push_back(FollowHoldPoint{ mover->GetPositionX(), mover->GetPositionY(), mover->GetPositionZ() });
+    for (PathNodePoint const& p : fullPath)
+    {
+        if (!p.IsWalkable())
+            break;
+        route.push_back(FollowHoldPoint{ p.point.getX(), p.point.getY(), p.point.getZ() });
+    }
+
+    FollowHoldResult const hold = FindFollowHoldPoint(route.data(), route.size(), packs.data(), packs.size(),
+        kDungeonFollowHoldMarginYd);
+    if (!hold.hold)
+        return;
+
+    WorldPosition const holdPoint(mover->GetMapId(), hold.point.x, hold.point.y, hold.point.z);
+
+    packHold.hold = true;
+    packHold.pack = packGuids[hold.pack];
+    packHold.point = holdPoint;
+
+    // Keep the points before the hold segment, then end on the hold point.
+    // Already standing on it: leave nothing to walk.
+    fullPath.erase(fullPath.begin() + hold.segment, fullPath.end());
+    if (hold.segment == 0 && WorldPosition(mover).distance(holdPoint) < 1.0f)
+        return;
+
+    // The hold point can coincide with the last kept waypoint (the route turns
+    // into the radius right there); a repeated point is not a step.
+    if (!fullPath.empty() && fullPath.back().point.distance(holdPoint) < 0.5f)
+        return;
+
+    fullPath.push_back(PathNodePoint{ holdPoint, PathNodeType::NODE_PATH, 0 });
 }
 
 std::ostringstream TravelPath::print()
@@ -1219,9 +1380,9 @@ std::ostringstream TravelPath::print()
 float TravelNodeRoute::getTotalDistance()
 {
     float totalLength = 0;
-    for (uint32 i = 0; i < nodes.size() - 2; i++)
+    for (size_t i = 1; i < nodes.size(); i++)
     {
-        totalLength += nodes[i]->linkDistanceTo(nodes[i + 1]);
+        totalLength += nodes[i - 1]->linkDistanceTo(nodes[i]);
     }
 
     return totalLength;
@@ -1540,10 +1701,23 @@ TravelNodeRoute TravelNodeMap::getRoute(TravelNode* start, TravelNode* goal, Uni
 
     std::vector<TravelNode*> portNodes;
 
-    Player* bot = dynamic_cast<Player*>(unit);
+    // Everything the edge costs need to know about the bot, resolved once for
+    // the whole search instead of on every edge.
+    TravelCostContext costContext(unit);
+    Player* bot = costContext.bot;
+
+    // Parties share the route preference of their leader.
+    uint32 routeSeed = 0;
     if (bot)
     {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
+        routeSeed = bot->GetGUIDLow();
+        if (Group* group = bot->GetGroup())
+            routeSeed = group->GetLeaderGuid().GetCounter();
+    }
+
+    if (bot)
+    {
+        PlayerbotAI* ai = costContext.ai;
         if (ai)
         {
             AiObjectContext* context = ai->GetAiObjectContext();
@@ -1695,17 +1869,13 @@ TravelNodeRoute TravelNodeMap::getRoute(TravelNode* start, TravelNode* goal, Uni
         {
             TravelNode* linkNode = link.first;
 
-            float linkCost = link.second->GetCost(unit, currentNode->currentGold);
+            float linkCost = link.second->getCost(costContext, currentNode->currentGold);
 
             if (linkCost <= 0)
                 continue;
 
             if (bot)
             {
-                uint32 routeSeed = bot->GetGUIDLow();
-                if (Group* group = bot->GetGroup())
-                    routeSeed = group->GetLeaderGuid().GetCounter();
-
                 WorldPosition const* from = currentNode->dataNode->getPosition();
                 WorldPosition const* to = linkNode->getPosition();
                 linkCost *= GetStableRouteCostMultiplier(routeSeed,
@@ -1730,7 +1900,7 @@ TravelNodeRoute TravelNodeMap::getRoute(TravelNode* start, TravelNode* goal, Uni
             childNode->m_h = h;
             childNode->parent = currentNode;
 
-            if (bot && !bot->IsTaxiCheater())
+            if (bot && !costContext.taxiCheater)
                 childNode->currentGold = currentNode->currentGold - link.second->GetPrice();
 
             if (childNode->close)
@@ -1751,6 +1921,44 @@ TravelNodeRoute TravelNodeMap::getRoute(TravelNode* start, TravelNode* goal, Uni
     return TravelNodeRoute();
 }
 
+// How close a walk leg to/from the node route must end to count as reaching it.
+static float const TRAVEL_WALK_LEG_REACH_YD = 5.0f;
+
+bool LeaveDeeprunTram(PlayerbotAI* ai, Player* bot, WorldPosition const& goal)
+{
+    if (bot->GetMapId() != MAP_DEEPRUN_TRAM || ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot) ||
+        bot->IsInCombat() || !bot->IsAlive() || bot->IsBeingTeleported())
+        return false;
+
+    // The station exits are the tram map's own area triggers leading back to
+    // Stormwind and Ironforge: a bot routed in before tram links were refused
+    // (TravelNodePath::getCost) has no other way out.
+    AreaTriggerTeleport const* best = nullptr;
+    float bestDistance = 0.0f;
+    for (uint32 i = 0; i < sAreaTriggerStore.GetNumRows(); i++)
+    {
+        AreaTriggerEntry const* atEntry = sAreaTriggerStore.LookupEntry(i);
+        if (!atEntry || atEntry->mapid != MAP_DEEPRUN_TRAM)
+            continue;
+        AreaTriggerTeleport const* at = sObjectMgr.GetAreaTriggerTeleport(i);
+        if (!at || at->destination.mapId == MAP_DEEPRUN_TRAM)
+            continue;
+        WorldPosition const exit(at->destination.mapId, at->destination.x, at->destination.y, at->destination.z);
+        float const distance = goal.GetMapId() == exit.GetMapId() ? exit.distance(goal) : 0.0f;
+        if (!best || distance < bestDistance)
+        {
+            best = at;
+            bestDistance = distance;
+        }
+    }
+
+    if (!best || !bot->TeleportTo(best->destination.mapId, best->destination.x, best->destination.y, best->destination.z, best->destination.o))
+        return false;
+
+    sPlayerbotAIConfig.logEvent(ai, "TramExitTeleport", std::to_string(best->destination.mapId), std::to_string((int32)bestDistance));
+    return true;
+}
+
 TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition endPos, std::vector<WorldPosition>& startPath, std::vector<WorldPosition>& endPath, Unit* unit)
 {
     if (m_nodes.empty())
@@ -1766,6 +1974,7 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
 
     if (startNodes.empty() || endNodes.empty())
     {
+        LastRouteFail() = startNodes.empty() ? "nostartnode" : "noendnode";
         sLog.outDetail("TortoiseBots: Travel route unreachable from (map %u, %.1f, %.1f, %.1f) to (map %u, %.1f, %.1f, %.1f): %s",
             startPos.getMapId(), startPos.getX(), startPos.getY(), startPos.getZ(),
             endPos.getMapId(), endPos.getX(), endPos.getY(), endPos.getZ(),
@@ -1784,7 +1993,35 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
 
     uint64 uid = urand(0, UINT32_MAX) * urand(0, UINT32_MAX);
 
+    // setAtWaterSurface() reads terrain (and loads the grid when it was never
+    // touched), and the same few positions are asked again for every start/end
+    // combination below. The answer only depends on the position, so each
+    // one is computed on its first use and reused for the rest of this call.
+    // The leg checks keep their order and short-circuit: a position that
+    // the original code did not ask about is still not asked about.
+    struct WaterSurface
+    {
+        bool moved;
+        WorldPosition position;
+    };
+    auto const toWaterSurface = [](WorldPosition const& position)
+    {
+        WaterSurface surface{ false, position };
+        surface.moved = surface.position.setAtWaterSurface();
+        return surface;
+    };
+    std::unordered_map<TravelNode*, WaterSurface> nodeSurfaces;
+    auto const nodeSurface = [&](TravelNode* node) -> WaterSurface const&
+    {
+        auto found = nodeSurfaces.find(node);
+        if (found == nodeSurfaces.end())
+            found = nodeSurfaces.emplace(node, toWaterSurface(*node->getPosition())).first;
+        return found->second;
+    };
+    std::optional<WaterSurface> startPosSurface, endPosSurface;
+
     std::vector<TravelNode*> badStartNodes, badEndNodes;
+    uint32 noRouteCombos = 0;
 
     //Cycle over the combinations of these 5 nodes.
     for (auto& endNode : endNodes)
@@ -1798,7 +2035,7 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
             WorldPosition startNodePosition = *startNode->getPosition();
             WorldPosition endNodePosition = *endNode->getPosition();
 
-            float maxStartDistance = startNode->IsTransport() ? 20.0f : 1.0f;
+            float maxStartDistance = startNode->IsTransport() ? 20.0f : TRAVEL_WALK_LEG_REACH_YD;
 
             TravelNodeRoute route = getRoute(startNode, endNode, unit);
 
@@ -1806,7 +2043,10 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
                 return route;
 
             if (route.isEmpty())
+            {
+                ++noRouteCombos;
                 continue;
+            }
 
             if (endPath.empty())
             {
@@ -1814,16 +2054,30 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
                 {
                     endPath = endNodePosition.GetPathTo(endPos, unit);
 
-                    bool hasPath = endPos.isPathTo(endPath, 1.0f);
+                    // 5 yd, not 1: a target a step off the mesh (npc in a doorway,
+                    // on a bridge) refused the whole route. 395 of 453 nopath
+                    // failures were these walk legs (live 2026-10-09); arrival is
+                    // judged by interaction range anyway.
+                    bool hasPath = endPos.isPathTo(endPath, TRAVEL_WALK_LEG_REACH_YD);
 
                     if (!hasPath)
                     {
-                        WorldPosition surfaceNode = endNodePosition;
+                        WaterSurface const& endNodeSurface = nodeSurface(endNode);
+                        WorldPosition surfaceNode = endNodeSurface.position;
                         WorldPosition surfaceEnd = endPos;
-                        if (surfaceNode.setAtWaterSurface() || surfaceEnd.setAtWaterSurface())
+                        bool moved = endNodeSurface.moved;
+                        if (!moved)
+                        {
+                            if (!endPosSurface)
+                                endPosSurface = toWaterSurface(endPos);
+                            surfaceEnd = endPosSurface->position;
+                            moved = endPosSurface->moved;
+                        }
+
+                        if (moved)
                         {
                             endPath = surfaceNode.GetPathTo(surfaceEnd, unit);
-                            hasPath = surfaceEnd.isPathTo(endPath, 1.0f);
+                            hasPath = surfaceEnd.isPathTo(endPath, TRAVEL_WALK_LEG_REACH_YD);
                         }
                     }
 
@@ -1851,9 +2105,19 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
 
             if (!hasPath)
             {
-                WorldPosition surfaceStart = startPos;
+                if (!startPosSurface)
+                    startPosSurface = toWaterSurface(startPos);
+                WorldPosition surfaceStart = startPosSurface->position;
                 WorldPosition surfaceNode = startNodePosition;
-                if (surfaceStart.setAtWaterSurface() || surfaceNode.setAtWaterSurface())
+                bool moved = startPosSurface->moved;
+                if (!moved)
+                {
+                    WaterSurface const& startNodeSurface = nodeSurface(startNode);
+                    surfaceNode = startNodeSurface.position;
+                    moved = startNodeSurface.moved;
+                }
+
+                if (moved)
                 {
                     newStartPath = surfaceStart.GetPathTo(surfaceNode, unit);
                     hasPath = surfaceNode.isPathTo(newStartPath, maxStartDistance);
@@ -1924,6 +2188,15 @@ TravelNodeRoute TravelNodeMap::getRoute(WorldPosition startPos, WorldPosition en
         }
     }
 
+    // Dominant cause over the tried combinations: node graph split, the last
+    // walk from an end node to the target, or the first walk to a start node.
+    if (!badEndNodes.empty() && badEndNodes.size() == endNodes.size())
+        LastRouteFail() = "endwalk";
+    else if (noRouteCombos && badStartNodes.empty())
+        LastRouteFail() = "nolink";
+    else
+        LastRouteFail() = "startwalk";
+
     sLog.outDetail("TortoiseBots: Travel route unreachable from (map %u, %.1f, %.1f, %.1f) to (map %u, %.1f, %.1f, %.1f): no navigable node combination",
         startPos.getMapId(), startPos.getX(), startPos.getY(), startPos.getZ(),
         endPos.getMapId(), endPos.getX(), endPos.getY(), endPos.getZ());
@@ -1935,6 +2208,7 @@ TravelPath TravelNodeMap::getFullPath(WorldPosition startPos, WorldPosition endP
 {
     TravelPath movePath;
     std::vector<WorldPosition> beginPath, endPath;
+    LastRouteFail().clear();
 
     beginPath = endPos.GetPathFromPath({ startPos }, unit, 40);
 

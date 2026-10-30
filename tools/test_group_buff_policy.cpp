@@ -66,6 +66,45 @@ static void TestPortedConstants()
     CHECK(kBuffRefreshMinMaxDurationMs == 5 * 60 * 1000);
 }
 
+// Mana floor: pool bots wait for 40% (70% charge buffs); a bot with a real
+// player master buffs on the master's schedule, so the floor drops to
+// 20% (40% charge). Heals keep their own reserve via HealerManaPolicy.
+static void TestManaFloor()
+{
+    CHECK(BuffManaFloor(false, false) == 40);
+    CHECK(BuffManaFloor(true, false) == 70);
+    CHECK(BuffManaFloor(false, true) == 20);
+    CHECK(BuffManaFloor(true, true) == 40);
+    CHECK(kBuffMinManaPercent == 40);
+    CHECK(kChargeBuffMinManaPercent == 70);
+    CHECK(kHiredBuffMinManaPercent == 20);
+    CHECK(kHiredChargeBuffMinManaPercent == 40);
+}
+
+// Upkeep rules hold unless the bot is really fighting (flag AND combat
+// engine): the non-combat engine with the flag still on keeps the floor.
+static void TestUpkeepRulesApply()
+{
+    CHECK(UpkeepBuffRulesApply(false, false));
+    CHECK(UpkeepBuffRulesApply(true, false));
+    CHECK(UpkeepBuffRulesApply(false, true));
+    CHECK(!UpkeepBuffRulesApply(true, true));
+}
+
+// The floor holds for the mana left after the cast. Uldaman priest, 3051 max,
+// 20% hired floor: Fortitude (240) at 698 would leave 458 (15%) - refused;
+// at 930 it leaves 690 (22.6%) - allowed. Zero max (no mana bar) never vetoes.
+static void TestManaStaysAboveFloor()
+{
+    CHECK(!ManaStaysAboveFloor(698, 3051, 240, 20));
+    CHECK(ManaStaysAboveFloor(930, 3051, 240, 20));
+    CHECK(ManaStaysAboveFloor(1000, 1000, 0, 100));
+    CHECK(!ManaStaysAboveFloor(100, 1000, 200, 0));
+    CHECK(ManaStaysAboveFloor(600, 1000, 200, 40));
+    CHECK(!ManaStaysAboveFloor(599, 1000, 200, 40));
+    CHECK(ManaStaysAboveFloor(0, 0, 50, 40));
+}
+
 // Variant map: the five 1.12 group buffs, blessings excluded.
 static void TestVariantMap()
 {
@@ -114,6 +153,9 @@ int main()
 {
     TestRefreshWindow();
     TestPortedConstants();
+    TestManaFloor();
+    TestUpkeepRulesApply();
+    TestManaStaysAboveFloor();
     TestVariantMap();
     TestUpgradePairScope();
     TestUpgradeQuorum();

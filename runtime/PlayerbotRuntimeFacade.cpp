@@ -5,8 +5,11 @@
 
 #include "../ai/playerbot/RandomBotFacade.h"
 #include "runtime/BotActivityLease.h"
+#include "runtime/policy/ah/AhReadModelPolicy.h"
+#include "NamedLocationIndex.h"
 
 #include "../ai/playerbot/PlayerbotAI.h"
+#include "../ai/playerbot/AiFactory.h"
 #include "../ai/playerbot/PlayerbotAIConfig.h"
 #include "../ai/playerbot/PlayerbotFactory.h"
 #include "../ai/playerbot/BotState.h"
@@ -242,36 +245,62 @@ bool RandomBotFacade::ProcessBot(Player* player)
     if (!player || !IsRandomBot(player) || !player->IsInWorld() || player->IsBeingTeleported())
         return false;
     // A dungeon crew (another module holds the Dungeon activity lease) is left alone:
-    // no graveyard repop, no expired-value sweep. This runs from the bot's own AI
+    // no expired-value sweep. This runs from the bot's own AI
     // ("random bot update") as well as from the service loop, so the guard sits here.
     if (TortoiseBots::BotActivityLeaseManager::Instance().GetActivity(player->GetGUIDLow()) == TortoiseBots::BotActivity::Dungeon)
         return false;
 
+    // Dead bots are left to their own AI and BotManager::SweepDeadBots. A
+    // graveyard repop here, once a second, re-armed the near teleport of every
+    // ghost already standing on its graveyard; with a large budgeted pool each
+    // AI visit found the bot mid-teleport and only acked it, so ~700 ghosts
+    // never ran their corpse run.
     if (!player->IsAlive())
-    {
-        Revive(player);
         return true;
-    }
 
     if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(player))
         ai->GetAiObjectContext()->ClearExpiredValues();
     return true;
 }
 
+// Named locations (ai_playerbot_named_location): read once at startup into a sealed index,
+// see runtime/NamedLocationIndex.h. Lookups never touch the database.
+static TortoiseBots::NamedLocationIndex sNamedLocations;
+
 bool RandomBotFacade::GetNamedLocation(std::string const& name, WorldLocation& location)
 {
-    std::string escaped = name;
-    WorldDatabase.escape_string(escaped);
-    auto result = WorldDatabase.PQuery(
-        "SELECT map_id, position_x, position_y, position_z, orientation "
-        "FROM ai_playerbot_named_location WHERE name = '%s' LIMIT 1", escaped.c_str());
-    if (!result)
+    TortoiseBots::NamedLocationPoint point;
+    if (!sNamedLocations.Find(name, point))
         return false;
 
-    Field* fields = result->Fetch();
-    location = WorldLocation(fields[0].GetUInt32(), fields[1].GetFloat(), fields[2].GetFloat(),
-        fields[3].GetFloat(), fields[4].GetFloat());
+    location = WorldLocation(point.mapId, point.x, point.y, point.z, point.orientation);
     return true;
+}
+
+void RandomBotFacade::LoadNamedLocationCache()
+{
+    if (sNamedLocations.Sealed())
+        return;
+
+    // One pass over the table. The index is sealed afterwards, even when the table is empty.
+    auto result = WorldDatabase.Query("SELECT `name`, `map_id`, `position_x`, `position_y`, `position_z`, `orientation` FROM `ai_playerbot_named_location`");
+    if (result)
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            TortoiseBots::NamedLocationPoint point;
+            point.mapId = fields[1].GetUInt32();
+            point.x = fields[2].GetFloat();
+            point.y = fields[3].GetFloat();
+            point.z = fields[4].GetFloat();
+            point.orientation = fields[5].GetFloat();
+            sNamedLocations.Add(fields[0].GetCppString(), point);
+        } while (result->NextRow());
+    }
+
+    sNamedLocations.Seal();
+    TB_LOG_BASIC("TortoiseBots: named locations loaded: %u", static_cast<uint32>(sNamedLocations.Size()));
 }
 
 void RandomBotFacade::LoadBattleMastersCache()
@@ -332,31 +361,25 @@ void RandomBotFacade::LoadAuctionPrices()
 
             // Bounded per-item listings: keep up to 64 lowest-unit-price entries
             // per item template so memory and appraisal sorting stay bounded.
-            constexpr size_t kMaxAuctionsPerItem = 64;
+            // The replace-the-dearest rule is the shared AhReadModelPolicy.
             auto& listings = ahMirror[entry->itemTemplate];
-            if (listings.size() < kMaxAuctionsPerItem)
+            if (listings.size() < ai::kMaxAuctionsPerItem)
             {
                 listings.push_back(*entry);
             }
             else
             {
                 float currentUnitPrice = float(entry->buyout) / float(item->GetCount());
-                size_t maxIdx = 0;
-                float maxUnitPrice = 0.0f;
-                for (size_t idx = 0; idx < listings.size(); ++idx)
-                {
-                    Item const* existingItem = sAuctionMgr.GetAItem(listings[idx].itemGuidLow);
-                    uint32 existingCount = existingItem ? existingItem->GetCount() : 1;
-                    float existingUnitPrice = float(listings[idx].buyout) / float(existingCount);
-                    if (existingUnitPrice > maxUnitPrice)
+                size_t replaceIdx = ai::AhListingReplaceIndex(listings, currentUnitPrice,
+                    [](AuctionEntry const& existing)
                     {
-                        maxUnitPrice = existingUnitPrice;
-                        maxIdx = idx;
-                    }
-                }
-                if (currentUnitPrice < maxUnitPrice)
+                        Item const* existingItem = sAuctionMgr.GetAItem(existing.itemGuidLow);
+                        uint32 existingCount = existingItem ? existingItem->GetCount() : 1;
+                        return float(existing.buyout) / float(existingCount);
+                    });
+                if (replaceIdx != ai::kAhNoListingIndex)
                 {
-                    listings[maxIdx] = *entry;
+                    listings[replaceIdx] = *entry;
                 }
             }
         }
@@ -401,8 +424,7 @@ std::vector<AuctionEntry> RandomBotFacade::GetAhPrices(uint32 itemId, uint32 hou
         }
 
         uint32 team = entry.auctionHouseEntry ? AuctionHouseMgr::GetAuctionHouseTeam(entry.auctionHouseEntry) : 0;
-        // team == 0 is neutral AH (accessible to all factions)
-        if (team == 0 || team == houseFaction || houseFaction == 0)
+        if (ai::AhListingVisibleForFaction(twoSide, team, houseFaction))
         {
             result.push_back(entry);
         }
@@ -453,15 +475,29 @@ void RandomBotFacade::ChangeStrategy(Player* player)
 
     if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(player))
     {
+        // Same rules as AddDefaultCombatStrategies: the string's -threat must
+        // not strip the party back-off from a bot grouped with a real master
+        // (only a back-off the bot already runs is kept, so a player's
+        // ".bot behavior <Name> threat off" survives the re-apply), and its
+        // "+dps assist" must not swap a tank's sibling "tank assist" out.
+        bool const keepThreat = ai->HasStrategy("threat", BotState::BOT_STATE_COMBAT) &&
+            AiFactory::KeepsPartyThreatBackoff(player, ai);
+        bool const tankAssist = ai->HasStrategy("tank assist", BotState::BOT_STATE_COMBAT);
         ai->ChangeStrategy(sPlayerbotAIConfig.randomBotCombatStrategies, BotState::BOT_STATE_COMBAT);
-        ai->ChangeStrategy(sPlayerbotAIConfig.randomBotNonCombatStrategies, BotState::BOT_STATE_NON_COMBAT);
+        if (keepThreat && !ai->HasStrategy("threat", BotState::BOT_STATE_COMBAT))
+            ai->ChangeStrategy("+threat", BotState::BOT_STATE_COMBAT);
+        if (tankAssist && !ai->HasStrategy("tank assist", BotState::BOT_STATE_COMBAT) &&
+            ai->HasStrategy("dps assist", BotState::BOT_STATE_COMBAT))
+            ai->ChangeStrategy("+tank assist", BotState::BOT_STATE_COMBAT);
+        // A hire never regains the autonomy kit on the timed re-apply: the
+        // ledger strip holds for the life of the hire, while owned alts and
+        // pool bots keep today's behaviour.
+        // Nor does a bot a remote commander has bound: it moves only on orders.
+        ai->ChangeStrategy(AiFactory::CommandedSafeNonCombatStrategies(player, AiFactory::HireSafeNonCombatStrategies(ai,
+            AiFactory::RealMasterSafeNonCombatStrategies(ai,
+            AiFactory::InstanceSafeNonCombatStrategies(player, sPlayerbotAIConfig.randomBotNonCombatStrategies)))),
+            BotState::BOT_STATE_NON_COMBAT);
     }
-}
-
-void RandomBotFacade::Revive(Player* player)
-{
-    if (player && player->IsInWorld() && !player->IsAlive())
-        player->RepopAtGraveyard();
 }
 
 void RandomBotFacade::PrintTeleportCache()

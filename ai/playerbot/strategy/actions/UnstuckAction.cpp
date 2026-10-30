@@ -2,10 +2,10 @@
 
 #include "playerbot/playerbot.h"
 #include "UnstuckAction.h"
-#include "playerbot/LongStuckRescuePolicy.h"
-#include "playerbot/GraveyardTeleportPolicy.h"
+#include "playerbot/policy/travel/LongStuckRescuePolicy.h"
+#include "playerbot/policy/travel/GraveyardTeleportPolicy.h"
 #include "playerbot/TravelRepickPolicy.h"
-#include "playerbot/CombatStuckPolicy.h"
+#include "playerbot/policy/combat/CombatStuckPolicy.h"
 #include "playerbot/TravelMgr.h"
 #include "runtime/BotManager.h"
 
@@ -278,6 +278,7 @@ bool UnstuckAction::Execute(Event& event)
     if (source.find("move stuck") != std::string::npos)
     {
         ai->TellDebug(master, "Unstuck: Move stuck detected, resetting.", "debug unstuck");
+        SET_AI_VALUE2(time_t, "manual time", "move stuck reset at", time(0));
 
         // The reset below nulls the travel target (PlayerbotAI::Reset(true)).
         // A sticky need - e.g. an unvisited class trainer - then re-requests the
@@ -293,8 +294,13 @@ bool UnstuckAction::Execute(Event& event)
         // so other purposes (vendor/repair/quest/grind) keep working and the
         // long-stuck hearth/repop path can fire. Fresh targets and real
         // progress reset the streak.
+        // Only a trip still under way is kept: a target in its work or cooldown
+        // state means the bot already arrived, and restoring it restarted the
+        // five-minute work clock, so the bot stood at the npc for another round.
         TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target");
         bool const keepTravel = travelTarget && travelTarget->IsActive() &&
+            (travelTarget->GetStatus() == TravelStatus::TRAVEL_STATUS_READY ||
+             travelTarget->GetStatus() == TravelStatus::TRAVEL_STATUS_TRAVEL) &&
             travelTarget->GetDestination() && travelTarget->getPosition() &&
             typeid(*travelTarget->GetDestination()) != typeid(NullTravelDestination);
         int32 stuckKeeps = AI_VALUE2(int32, "manual int", "stuck keep count");
@@ -302,6 +308,21 @@ bool UnstuckAction::Execute(Event& event)
         if (!keepTravel)
         {
             SET_AI_VALUE2(int32, "manual int", "stuck keep count", 0);
+            // Targetless and still for 5+ min: every purpose search already
+            // came back empty and parked, and the quest errand's 10-min park
+            // is the longest pole (grind/gather re-search every ~1 min). The
+            // wait proved nothing new will arrive, so cap the quest park at
+            // the 1-min rhythm the other purposes use: the next pool visit
+            // may re-search instead of standing out the full ten minutes.
+            // Permission to search only: the search gates (sieve, kind
+            // blacklist, route, danger) still refuse unreachable spots, so
+            // no wedged destination can be re-armed from here. Live
+            // night2 pool: 52/145 frozen bots targetless with all searches
+            // emptying, quest parked 10 min while grind re-tried every 1.
+            time_t const questParkUntil = AI_VALUE2(time_t, "manual time", "no travel purpose until::quest");
+            time_t const now = time(0);
+            if (questParkUntil > now + MINUTE)
+                SET_AI_VALUE2(time_t, "manual time", "no travel purpose until::quest", now + MINUTE);
             return ai->DoSpecificAction("reset", event, true);
         }
         if (stuckKeeps >= 3 && WorldPosition(bot).sqDistance(stuckAnchor) < 30.0f * 30.0f)

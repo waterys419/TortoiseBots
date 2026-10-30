@@ -1,13 +1,21 @@
 name: Generate Changelog & Release
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - 'CHANGELOG.md'
-      - 'VERSION'
-      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      bump:
+        type: choice
+        description: 'Release increment type'
+        options:
+          - 'patch (bug fixes, tidy up, small tweaks: 1.0.X)'
+          - 'minor (new features, new commands, gameplay updates: 1.X.0)'
+          - 'major (breaking architectural or schema changes: X.0.0)'
+          - 'custom (specify custom version below)'
+        default: 'patch (bug fixes, tidy up, small tweaks: 1.0.X)'
+      custom_version:
+        description: 'Custom version (used if custom selected, e.g. 1.0.0)'
+        required: false
+        default: '1.0.0'
 
 permissions:
   contents: write
@@ -20,11 +28,16 @@ concurrency:
 jobs:
   changelog:
     runs-on: ubuntu-latest
+    if: github.actor == 'Sagiroth' || github.actor == 'sagiroth'
+    environment: release
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Deploy key (release environment, main only): the main ruleset
+          # lets it push the changelog commit and tags; GITHUB_TOKEN cannot.
+          ssh-key: ${{ secrets.CHANGELOG_DEPLOY_KEY }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,14 +46,73 @@ jobs:
 
       - name: Compute build version
         id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          CUSTOM_VER: ${{ inputs.custom_version }}
         run: |
-          python3 tools/generate_changelog.py \
-            --out-version VERSION \
-            --out-build-number /tmp/build_number.txt \
-            --dry-run
-          echo "build_version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
-          echo "build_number=$(cat /tmp/build_number.txt)" >> "$GITHUB_OUTPUT"
-          echo "release_tag=v$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          python3 - << 'EOF'
+          import os, re, subprocess
+
+          bump = os.environ.get("BUMP", "")
+          custom_ver = os.environ.get("CUSTOM_VER", "").strip().lstrip("v")
+
+          def parse_semver(t):
+              m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", t.strip())
+              return tuple(map(int, m.groups())) if m else None
+
+          latest_semver = None
+          try:
+              out = subprocess.check_output(["git", "tag", "-l"], text=True)
+              tags = out.splitlines()
+              semver_tags = []
+              for t in tags:
+                  parsed = parse_semver(t)
+                  if parsed:
+                      semver_tags.append(parsed)
+              if semver_tags:
+                  semver_tags.sort()
+                  latest_semver = semver_tags[-1]
+          except Exception:
+              pass
+
+          if not latest_semver and os.path.exists("VERSION"):
+              try:
+                  with open("VERSION", "r") as f:
+                      parsed = parse_semver(f.read().strip())
+                      if parsed:
+                          latest_semver = parsed
+              except Exception:
+                  pass
+
+          if bump.startswith("custom") or not latest_semver:
+              if custom_ver and parse_semver(custom_ver):
+                  target_ver = custom_ver
+              elif not latest_semver:
+                  target_ver = custom_ver if custom_ver else "1.0.0"
+              else:
+                  target_ver = f"{latest_semver[0]}.{latest_semver[1]}.{latest_semver[2]}"
+          else:
+              maj, min_, pat = latest_semver
+              if bump.startswith("patch"):
+                  target_ver = f"{maj}.{min_}.{pat + 1}"
+              elif bump.startswith("minor"):
+                  target_ver = f"{maj}.{min_ + 1}.0"
+              elif bump.startswith("major"):
+                  target_ver = f"{maj + 1}.0.0"
+              else:
+                  target_ver = f"{maj}.{min_}.{pat + 1}"
+
+          print(f"Computed release version: {target_ver} (from previous: {latest_semver}, bump: {bump})")
+          with open("VERSION", "w") as f:
+              f.write(target_ver + "\n")
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a") as f:
+                  f.write(f"build_version={target_ver}\n")
+                  f.write(f"release_tag=v{target_ver}\n")
+                  f.write(f"release_date={subprocess.check_output(['date', '-u', '+%Y-%m-%d'], text=True).strip()}\n")
+          EOF
 
       - name: Generate Changelog & Notes
         id: generate
@@ -50,52 +122,93 @@ jobs:
           OPENCODE_ENDPOINT: ${{ secrets.OPENCODE_ENDPOINT }}
           OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
         run: |
-          python3 tools/generate_changelog.py --write --out-notes /tmp/release_notes.md --out-delta /tmp/discord_notes.md
+          python3 tools/generate_changelog.py \
+            --write \
+            --out-notes /tmp/release_notes.md \
+            --out-delta /tmp/discord_notes.md \
+            --tag "${{ steps.version.outputs.release_tag }}" \
+            --date "${{ steps.version.outputs.release_tag }} (${{ steps.version.outputs.release_date }})"
 
       - name: Commit CHANGELOG.md and VERSION
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md VERSION
-          git commit -m "docs: update CHANGELOG.md for ${{ steps.version.outputs.release_tag }} [skip ci]" || echo "Nothing to commit"
-          # Commit first: pulling with the stamped files still unstaged fails.
+          git commit -m "docs: release ${{ steps.version.outputs.release_tag }} [skip ci]" || echo "Nothing to commit"
           git pull --rebase origin main
           git push origin main
-          git tag "${{ steps.version.outputs.build_version }}"
-          git push origin "${{ steps.version.outputs.build_version }}"
+          git tag -f "${{ steps.version.outputs.release_tag }}"
+          git push -f origin "${{ steps.version.outputs.release_tag }}"
 
       - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # No new PRs (e.g. a re-run): no notes were written, only move the tag.
+          NOTES_ARGS=()
           if [ -f /tmp/release_notes.md ]; then
-            if gh release view "${{ steps.version.outputs.release_tag }}" --json tagName >/dev/null 2>&1; then
-              echo "Release ${{ steps.version.outputs.release_tag }} already exists. Updating release notes..."
-              gh release edit "${{ steps.version.outputs.release_tag }}" \
-                --title "TortoiseBots $(date -u +%Y-%m-%d) (builds v1–v${{ steps.version.outputs.build_number }})" \
-                --notes-file /tmp/release_notes.md
-            else
-              echo "Creating new release ${{ steps.version.outputs.release_tag }}..."
-              gh release create "${{ steps.version.outputs.release_tag }}" \
-                --title "TortoiseBots $(date -u +%Y-%m-%d) (builds v1–v${{ steps.version.outputs.build_number }})" \
-                --notes-file /tmp/release_notes.md \
-                --target main
-            fi
+            NOTES_ARGS=(--notes-file /tmp/release_notes.md)
+          else
+            NOTES_ARGS=(--notes "Release ${{ steps.version.outputs.release_tag }}")
           fi
-          # Move the daily tag to this build: re-point it locally first (the
-          # checkout holds the old tag, or none on a new day), then force-push.
-          git tag -f "${{ steps.version.outputs.release_tag }}" HEAD
-          git push -f origin "${{ steps.version.outputs.release_tag }}"
 
-      - name: Post Changelog to Discord Thread
-        if: steps.generate.outputs.has_changes == 'true'
+          if gh release view "${{ steps.version.outputs.release_tag }}" --json tagName >/dev/null 2>&1; then
+            echo "Release ${{ steps.version.outputs.release_tag }} already exists. Updating release notes..."
+            gh release edit "${{ steps.version.outputs.release_tag }}" \
+              --title "TortoiseBots ${{ steps.version.outputs.release_tag }}" \
+              "${NOTES_ARGS[@]}" \
+              --latest
+          else
+            echo "Creating new release ${{ steps.version.outputs.release_tag }}..."
+            gh release create "${{ steps.version.outputs.release_tag }}" \
+              --title "TortoiseBots ${{ steps.version.outputs.release_tag }}" \
+              "${NOTES_ARGS[@]}" \
+              --target main \
+              --latest
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build & Attach Dashboard Binaries
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: tools/observability
+        run: |
+          go vet ./...
+          go test ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o tortoise-observability-linux-amd64 ./cmd/server
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o tortoise-observability-windows-amd64.exe ./cmd/server
+          sha256sum tortoise-observability-linux-amd64 tortoise-observability-windows-amd64.exe > tortoise-observability-sha256.txt
+          gh release upload "${{ steps.version.outputs.release_tag }}" \
+            tortoise-observability-linux-amd64 \
+            tortoise-observability-windows-amd64.exe \
+            tortoise-observability-sha256.txt \
+            --clobber
+
+      - name: Post Full Changelog to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # The full list of this release's changes goes to the changelog
+          # thread (the short announcement below goes to the release thread).
+          python3 tools/post_discord_changelog.py \
+            --notes /tmp/discord_notes.md \
+            --title "TortoiseBots ${{ steps.version.outputs.release_tag }}" \
+            --tag "${{ steps.version.outputs.release_tag }}" \
+            --thread-id "${{ vars.DISCORD_CHANGELOG_THREAD_ID || secrets.DISCORD_CHANGELOG_THREAD_ID || '1559276000293158953' }}" \
+            --username "TortoiseBots Releases"
+
+      - name: Post Release Announcement to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python3 tools/post_discord_changelog.py \
             --notes /tmp/discord_notes.md \
-            --title "TortoiseBots build ${{ steps.version.outputs.build_version }}" \
+            --title "TortoiseBots ${{ steps.version.outputs.release_tag }}" \
             --tag "${{ steps.version.outputs.release_tag }}" \
-            --thread-id "1542647578548772954" \
-            --username "TortoiseBots Changelog"
+            --thread-id "${{ vars.DISCORD_RELEASE_THREAD_ID || secrets.DISCORD_RELEASE_THREAD_ID || '1560007927828586586' }}" \
+            --username "TortoiseBots Releases" \
+            --changelog-thread-id "${{ vars.DISCORD_CHANGELOG_THREAD_ID || secrets.DISCORD_CHANGELOG_THREAD_ID || '1559276000293158953' }}" \
+            --short

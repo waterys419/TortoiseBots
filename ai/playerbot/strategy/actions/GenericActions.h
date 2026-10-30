@@ -5,6 +5,7 @@
 #include "ChooseTargetActions.h"
 #include "MovementActions.h"
 #include "RemoveAuraAction.h"
+#include "../../../runtime/policy/pet/StoredPetLookupPolicy.h"
 
 namespace ai
 {
@@ -148,6 +149,12 @@ namespace ai
         InitializePetAction(PlayerbotAI* ai) : Action(ai, "initialize pet") {}
         bool Execute(Event& event) override;
         bool isUseful() override;
+
+    private:
+        // Per-bot throttle for the synchronous character_pet lookup in
+        // isUseful (issue #1178); the context keeps this action for the
+        // bot's session, so the cache lives as long as the bot.
+        TortoiseBots::StoredPetLookupCache storedPetLookup;
     };
 
     class SetPetAction : public Action
@@ -160,7 +167,7 @@ namespace ai
     // Autonomous pet upkeep (E01): ported from mod-playerbots TogglePetSpellAutoCastAction /
     // SetPetStanceAction so the queued "toggle pet spell" / "set pet stance" nodes in the
     // live pet strategies resolve. The toggle sweep walks pet->m_petSpells and applies
-    // runtime/PetUpkeepPolicy.h (non-passive, minus the Prowl/Cower/Spell-Lock/Devour denylist);
+    // runtime/PetUpkeepPolicy.h (non-passive, minus the Prowl/Cower/Spell-Lock/Devour/Sacrifice denylist);
     // the stance action pins REACT_DEFENSIVE on the pet plus every guardian (except totems),
     // matching PlayerbotFactory::InitPet and AttackAction::CanPetAttack's passive gate.
     class TogglePetSpellAutoCastAction : public Action
@@ -170,6 +177,11 @@ namespace ai
         bool Execute(Event& event) override;
         bool isPossible() override;
     };
+
+    // PET-3: live input gathering for runtime/PetTauntPolicy.h. True while
+    // the pet may taunt: solo, or grouped with no member filling the tank
+    // role. Cheap-first: ungrouped bots skip the member walk entirely.
+    bool IsPetTauntAllowed(PlayerbotAI* ai, Player* bot);
 
     class SetPetStanceAction : public Action
     {

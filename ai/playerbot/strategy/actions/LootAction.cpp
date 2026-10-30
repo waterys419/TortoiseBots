@@ -1,7 +1,10 @@
 
 #include "playerbot/playerbot.h"
-#include "SkinningLootPolicy.h"
+#include "../../policy/loot/SkinningLootPolicy.h"
+#include "../../policy/loot/LootWindowPolicy.h"
+#include "../../policy/loot/LootHistoryPolicy.h"
 #include "LootAction.h"
+#include "playerbot/CastKeepsRunningPolicy.h"
 
 #include "playerbot/LootObjectStack.h"
 #include "playerbot/PlayerbotAIConfig.h"
@@ -11,14 +14,23 @@
 #include "playerbot/strategy/values/LootValues.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 #include "playerbot/ServerFacade.h"
-#include "playerbot/QuestLogPolicy.h"
+#include "playerbot/policy/quest/QuestLogPolicy.h"
 #include "playerbot/strategy/values/SharedValueContext.h"
+#include "../../../../runtime/RemoteCommanderTasks.h"
+#include "../../../../runtime/CommandedGroupQuery.h"
 
 
 using namespace ai;
 
 bool LootAction::Execute(Event& event)
 {
+    // The gather cast clears the loot target when it starts, so without this
+    // the chain re-selected the node mid-cast and "open loot" re-fired into
+    // the cast gate every tick, burning the three open attempts before the
+    // running cast finished (#1062).
+    if (ai::LootChainBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true)))
+        return false;
+
     if (!AI_VALUE(bool, "has available loot"))
         return false;
 
@@ -67,14 +79,85 @@ enum ProfessionSpells
 
 bool OpenLootAction::Execute(Event& event)
 {
+    // mod-playerbots parity (OpenLootAction::Execute): never re-issue the
+    // gather cast while one is running. The failure count below must not see
+    // this tick either, or the three-strike abandon wedged the node before
+    // the running cast finished (#1062).
+    if (ai::LootChainBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true)))
+        return false;
+
     LootObject lootObject = AI_VALUE(LootObject, "loot target");
+    // DoLoot re-validates the object (Refresh), which empties lootObject.guid when it is
+    // no longer lootable; keep the guid the attempt was made on.
+    ObjectGuid const lootGuid = lootObject.guid;
+
+    // A bot in a commanded group opens a game object only on the commander's
+    // order (that order watches the object): a chest it picked before the bind
+    // is dropped, not opened. The stack offers no other one (OrderByDistance).
+    if (lootGuid.IsGameObject())
+    {
+        uint32 onlyItem = 0;
+        bool const ordered = TortoiseBots::RemoteCommander::LootOrders().Watching(
+            bot->GetObjectGuid().GetRawValue(), lootGuid.GetRawValue(), onlyItem);
+        if (!TortoiseBots::RemoteCommander::OwnLootTakesObject(true,
+                !ordered && TortoiseBots::BotCommands::IsInCommandedGroup(bot), ordered))
+        {
+            context->GetValue<LootObject>("loot target")->Set(LootObject());
+            return false;
+        }
+    }
+
+    stoppedForCast = false;
+    // The duration is a member: a corpse open set it to lootDelay, and a cast
+    // must not inherit that (or any earlier value) as its sleep.
+    SetDuration(sPlayerbotAIConfig.reactDelay);
     bool result = DoLoot(lootObject);
+
+    // A cast on the object (gather, skin, open) sleeps through its cast time,
+    // like any cast action; waking after 1 s let "update follow" walk the bot
+    // off the node and the core cancelled the cast (#1062).
+    {
+        Spell* cast = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        uint32 const castMs = (result && cast && cast->getState() == SPELL_STATE_PREPARING && cast->GetCastTime() > 0)
+            ? ai->GetSpellCastDuration(cast) : 0;
+        SetDuration(ai::DecideOpenLootDuration(result, castMs, GetDuration()));
+    }
+    LootObjectStack* lootStack = AI_VALUE(LootObjectStack*, "available loot");
+
+    // Bounded give-up: count every open attempt per object on the stack's failure memory
+    // (the same one "move to loot" uses for unreachable corpses). A failed DoLoot
+    // ("not now": failed cast, contended game object, no opening spell) is an attempt,
+    // and so is a "successful" one: for a skin/herb/ore/lock open, success only means the
+    // cast started, and a CMSG_LOOT only means the request was sent. When that cast never
+    // completes or the server refuses the window, the object stays gatherable, the next
+    // "add gathering loot"/"add all loot" sweep re-queues it, and the bot cycled
+    // open -> add -> select -> open on the spot for minutes (live: 11 of 108 standstill runs
+    // of 3+ min, no loot and no skill-up). StoreLootAction forgets the count once a window
+    // pays out, so only opens that never yield anything add up; after three the object is
+    // abandoned for 120 s and the bot moves on. Player-ordered looting only issues the
+    // action once per order, so a counter that needs repeated attempts can never veto a
+    // fresh order.
+    // A stop before the cast (DoLoot, StopForObjectCast) is no attempt: the
+    // cast comes on the next tick.
+    if (!lootGuid.IsEmpty() && lootStack && !stoppedForCast)
+        lootStack->NoteApproachFailure(lootGuid);
+
     if (result)
     {
-        AI_VALUE(LootObjectStack*, "available loot")->Remove(lootObject.guid);
+        if (lootStack)
+            lootStack->Remove(lootGuid);
+        context->GetValue<LootObject>("loot target")->Set(LootObject());
+        return true;
+    }
+
+    if (!lootGuid.IsEmpty() && lootStack && lootStack->IsAbandoned(lootGuid))
+    {
+        sLog.outDebug("[BOT LOOT] %s: giving up on guid=%lu after repeated failed opens",
+            bot->GetName(), lootGuid.GetRawValue());
+        lootStack->Remove(lootGuid);
         context->GetValue<LootObject>("loot target")->Set(LootObject());
     }
-    return result;
+    return false;
 }
 
 bool OpenLootAction::DoLoot(LootObject& lootObject)
@@ -123,6 +206,11 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     // them) and left skinners casting Skinning on an unlooted corpse every tick forever.
     if (creature && creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
     {
+        // Dismount in the open step (mod-playerbots LootAction.cpp): "loot available"
+        // selects loot while mounted, so this is where a mounted bot gets off.
+        if (bot->IsMounted())
+            ai->Unmount();
+
         if (!lootObject.IsLootPossible(bot)) //Clear loot if bot can't loot it.
         {
             sLog.outDebug("[BOT LOOT] %s: IsLootPossible=false on lootable corpse, clearing (corpse stays lootable -> may re-add)",
@@ -177,9 +265,27 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
         }
     }
 
+    // Dismount for a game-object node like the corpse path above: a bot that
+    // rode to its node would otherwise burn its approach failures on casts
+    // that never start, the node is abandoned, and the travel action
+    // re-walks the same last yards.
+
+    if (bot->IsMounted())
+        ai->Unmount();
+
     GameObject* go = ai->GetGameObject(lootObject.guid);
     if (go && (go->getLootState() == GO_ACTIVATED || go->GetGoState() == GO_STATE_ACTIVE))
         return false;
+
+    // The cast on the object (Opening, Mining, Herb Gathering, a key) breaks on
+    // the first step, and a bot that just walked here may still be on its last
+    // yards. Stop it and cast on a later tick, once it stands still.
+    if (ai->StopForObjectCast())
+    {
+        stoppedForCast = true;
+        sLog.outDebug("[BOT LOOT] %s: still moving, stopped before the cast on guid=%lu", bot->GetName(), lootObject.guid.GetRawValue());
+        return false;
+    }
 
     if (lootObject.skillId == SKILL_MINING)
         return ai->HasSkill(SKILL_MINING) ? ai->CastSpell(MINING, bot) : false;
@@ -346,6 +452,68 @@ static uint32 GetNodeGatherSkill(GameObject* go)
     return SKILL_NONE;
 }
 
+// Where one loot window came from, for the history row: the corpse, chest or
+// gathering node name the addon shows. The object's live name wins (it carries
+// any rename), the template name is the fallback once the object is gone. A
+// skin keeps its corpse: the GatherLoot row already says it was skinned.
+static void DescribeLootSource(PlayerbotAI* ai, ObjectGuid guid, uint32 gatherSkill,
+    std::string& type, std::string& name)
+{
+    type = "other";
+    name.clear();
+
+    if (guid.IsCreature())
+    {
+        type = "corpse";
+        if (Creature* creature = ai->GetCreature(guid))
+            name = creature->GetName();
+        if (name.empty())
+            if (CreatureInfo const* info = sObjectMgr.GetCreatureTemplate(guid.GetEntry()))
+                name = info->name;
+        return;
+    }
+
+    GameObjectInfo const* goInfo = nullptr;
+    if (GameObject* go = ai->GetGameObject(guid))
+        goInfo = go->GetGOInfo();
+    if (!goInfo)
+        goInfo = sObjectMgr.GetGameObjectInfo(guid.GetEntry());
+
+    if (goInfo && goInfo->type == GAMEOBJECT_TYPE_CHEST)
+        type = "chest";
+    else if (gatherSkill != SKILL_NONE)
+        type = "gathering";
+    else if (guid.IsGameObject())
+        type = "object";
+
+    if (goInfo)
+        name = goInfo->name;
+}
+
+// Live copy of a stored item row for the owner's addon: the same TBM:LOOT line
+// the .bot lootlog reply sends, pushed as the bot loots. Only bots in the
+// owner's party, since that is who the addon shows them to.
+static void NotifyOwnerOfLoot(PlayerbotAI* ai, Player* bot, std::string item, uint32 itemId,
+    std::string const& sourceType, std::string source, uint32 quality)
+{
+    Player* owner = ai->GetMaster();
+    if (!owner || !owner->GetGroup() || owner->GetGroup() != bot->GetGroup())
+        return;
+
+    std::string timestamp = sPlayerbotAIConfig.GetTimestampStr() + "+00";
+    std::string botName = bot->GetName();
+    std::string qualityText = std::to_string(quality);
+    std::string head = "TBM:LOOT|" + timestamp + "|" + botName + "|StoreLootAction|" + std::to_string(itemId) + "|";
+    size_t fixedBytes = head.size() + 1 + sourceType.size() + 1 + 1 + qualityText.size();
+    ai::LootHistoryPolicy::FitLootWireLine(item, source, fixedBytes);
+    for (std::string* field : { &item, &source })
+        for (char& character : *field)
+            if (character == '|' || character == '\r' || character == '\n')
+                character = ' ';
+
+    PlayerbotChatHandler(owner).sysmessage(head + item + "|" + sourceType + "|" + source + "|" + qualityText);
+}
+
 bool StoreLootAction::Execute(Event& event)
 {
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
@@ -380,9 +548,20 @@ bool StoreLootAction::Execute(Event& event)
         sLog.outDebug("[BOT LOOT] %s: loot REJECTED guid=%lu error=%u (%s)",
             bot->GetName(), guid.GetRawValue(), lootError, errName);
 
-        // Drop the corpse so the bot stops retrying a loot the server won't grant.
-        AI_VALUE(LootObjectStack*, "available loot")->Remove(guid);
+        // Drop the corpse so the bot stops retrying a loot the server won't grant. Abandon it
+        // rather than just unqueue it: the core still shows it lootable, so "add all loot"
+        // re-queued it on the next sweep and the refused open repeated on the same spot. A
+        // player's explicit loot order is only unqueued, so the order is never silently
+        // vetoed by a transient refusal (TOO_FAR, a scripted mob not yet lootable).
+        LootObjectStack* lootStack = AI_VALUE(LootObjectStack*, "available loot");
+        if (DecideAfterLootWindow(true, false, lootStack->TakePlayerOrder(guid)) == LootWindowVerdict::Abandon)
+            lootStack->Abandon(guid);
+        else
+            lootStack->Remove(guid);
         RESET_AI_VALUE(LootObject, "loot target");
+        // A remote commander's loot order waits for this window: tell it the server refused.
+        TortoiseBots::RemoteCommander::LootOrders().NoteWindowEnd(bot->GetObjectGuid().GetRawValue(),
+            guid.GetRawValue(), true);
         return false;
     }
 
@@ -395,7 +574,8 @@ bool StoreLootAction::Execute(Event& event)
     // loot_type cannot identify a skin (#403): the core rewrites LOOT_SKINNING to LOOT_PICKPOCKETING
     // for the 1.12 client (Player::SendLoot), so every skin arrives as LOOT_PICKPOCKETING. The
     // server-side Loot still carries the real type (loot->loot_type), which is what marks a skin.
-    // A node window is ordinary loot on a game object, so its skill comes from the object's lock.
+    // A node window (herb, ore, opened chest) also arrives as LOOT_SKINNING (EffectOpenLock), so a
+    // game object's skill comes from its lock, never from the loot type.
     bot->SetLootGuid(guid);
 
     Loot* loot = sLootMgr.GetLoot(bot);
@@ -410,6 +590,8 @@ bool StoreLootAction::Execute(Event& event)
         bot->GetSession()->HandleLootReleaseOpcode(release);
         AI_VALUE(LootObjectStack*, "available loot")->Remove(guid);
         RESET_AI_VALUE(LootObject, "loot target");
+        TortoiseBots::RemoteCommander::LootOrders().NoteWindowEnd(bot->GetObjectGuid().GetRawValue(),
+            guid.GetRawValue(), true);
         return false;
     }
 
@@ -421,17 +603,32 @@ bool StoreLootAction::Execute(Event& event)
 
     uint32 itemsTaken = 0;
 
-    if (gold > 0)
+    // A remote commander's loot order on this very object (cmd loot / cmd open): an explicit
+    // order takes its item (or everything the group rules give this bot) without the strategy's
+    // loot filter, and the window reports what it took.
+    uint64 const botRaw = bot->GetObjectGuid().GetRawValue();
+    uint32 orderedItem = 0;
+    bool const commanderOrder = TortoiseBots::RemoteCommander::LootOrders().Watching(botRaw, guid.GetRawValue(), orderedItem);
+
+    std::string lootSourceType;
+    std::string lootSourceName;
+    DescribeLootSource(ai, guid, gatherSkill, lootSourceType, lootSourceName);
+
+    // An order for one item leaves the money on the corpse.
+    if (gold > 0 && !(commanderOrder && orderedItem))
     {
         WorldPacket packet(CMSG_LOOT_MONEY, 0);
         bot->GetSession()->HandleLootMoneyOpcode(packet);
+        if (commanderOrder)
+            TortoiseBots::RemoteCommander::LootOrders().NoteCopper(botRaw, guid.GetRawValue(), gold);
 
         // Money taken before the item loop, so gold-only corpses (most low-level
         // kills) used to leave no trace: income was unmeasurable and a bot that
         // opened a corpse but took only money looked identical to one that never
         // opened it. Log the copper amount so bot_events.csv can correlate kills
         // with looting.
-        sPlayerbotAIConfig.logEvent(ai, "LootMoney", std::to_string(gold), std::to_string(guid.GetEntry()));
+        sPlayerbotAIConfig.logEvent(ai, "LootMoney", std::to_string(gold), std::to_string(guid.GetEntry()),
+            lootSourceType, lootSourceName);
     }
 
     for (uint8 i = 0; i < items; ++i)
@@ -460,7 +657,15 @@ bool StoreLootAction::Execute(Event& event)
 			continue;
 		}
 
-        if (!ai::IsSkinningLoot((uint32)internalLootType) && !IsLootAllowed(itemQualifier, ai))
+        if (commanderOrder)
+        {
+            if (!TortoiseBots::RemoteCommander::LootItemWanted(orderedItem, itemid))
+                continue;
+            ItemPrototype const* orderedProto = sObjectMgr.GetItemPrototype(itemid);
+            if (!orderedProto || (orderedProto->MaxCount > 0 && bot->HasItemCount(itemid, orderedProto->MaxCount, true)))
+                continue;
+        }
+        else if (!ai::IsSkinningLoot((uint32)internalLootType) && !IsLootAllowed(itemQualifier, ai))
         {
             sLog.outDebug("[BOT LOOT] %s: skip item=%u (IsLootAllowed=false)", bot->GetName(), itemid);
             continue;
@@ -498,8 +703,17 @@ bool StoreLootAction::Execute(Event& event)
 
         WorldPacket packet(CMSG_AUTOSTORE_LOOT_ITEM, 1);
         packet << itemindex;
+        uint32 const countBefore = commanderOrder ? bot->GetItemCount(itemid) : 0;
         bot->GetSession()->HandleAutostoreLootItemOpcode(packet);
         ++itemsTaken;
+        if (commanderOrder)
+        {
+            // Only what really reached the bags counts (the core refuses a full bag or a unique item).
+            uint32 const countAfter = bot->GetItemCount(itemid);
+            if (countAfter > countBefore)
+                TortoiseBots::RemoteCommander::LootOrders().NoteItem(botRaw, guid.GetRawValue(), itemid,
+                    std::min(itemcount, countAfter - countBefore));
+        }
         sLog.outDebug("[BOT LOOT] %s: take item=%u x%u", bot->GetName(), itemid, itemcount);
 
         if (proto->Quality > ITEM_QUALITY_NORMAL && !urand(0, 50) && ai->HasStrategy("emote", BotState::BOT_STATE_NON_COMBAT)) ai->PlayEmote(TEXTEMOTE_CHEER);
@@ -512,7 +726,9 @@ bool StoreLootAction::Execute(Event& event)
             ai->TellPlayerNoFacing(requester, BOT_TEXT2("loot_command", args), PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, false);
         }
 
-        sPlayerbotAIConfig.logEvent(ai, "StoreLootAction", proto->Name1, std::to_string(proto->ItemId));
+        sPlayerbotAIConfig.logEvent(ai, "StoreLootAction", proto->Name1, std::to_string(proto->ItemId),
+            lootSourceType, lootSourceName, std::to_string(proto->Quality));
+        NotifyOwnerOfLoot(ai, bot, proto->Name1, proto->ItemId, lootSourceType, lootSourceName, proto->Quality);
 
         if (gatherSkill != SKILL_NONE)
             sPlayerbotAIConfig.logEvent(ai, "GatherLoot", std::to_string(gatherSkill), std::to_string(proto->ItemId));
@@ -520,7 +736,29 @@ bool StoreLootAction::Execute(Event& event)
         BroadcastHelper::BroadcastLootingItem(ai, bot, proto, itemQualifier);
     }
 
-    AI_VALUE(LootObjectStack*, "available loot")->Remove(guid);
+    // The open paid out: forget the attempts OpenLootAction counted on this object, so a
+    // multi-use ore vein or a loot-then-skin corpse is never cut short. A window that gave
+    // this bot nothing (every item under a roll, view-only, unwanted, or no bag room) leaves
+    // the corpse lootable for the core: abandon it so the next "add all loot" sweep does not
+    // re-queue it and re-open the same empty window. A player's explicit order is only
+    // unqueued and keeps its open count (LootWindowPolicy).
+    LootObjectStack* lootStack = AI_VALUE(LootObjectStack*, "available loot");
+    bool const playerOrdered = lootStack->TakePlayerOrder(guid);
+    switch (DecideAfterLootWindow(false, itemsTaken || gold, playerOrdered))
+    {
+    case LootWindowVerdict::ForgetFailures:
+        lootStack->ForgetFailures(guid);
+        break;
+    case LootWindowVerdict::Abandon:
+        sLog.outDebug("[BOT LOOT] %s: abandoning guid=%lu (window gave nothing)",
+            bot->GetName(), guid.GetRawValue());
+        lootStack->Abandon(guid);
+        break;
+    case LootWindowVerdict::KeepCount:
+        break;
+    }
+
+    lootStack->Remove(guid);
     RESET_AI_VALUE(LootObject, "loot target");
     RESET_AI_VALUE2(bool, "should loot object", std::to_string(guid.GetRawValue()));
 
@@ -533,6 +771,9 @@ bool StoreLootAction::Execute(Event& event)
     bot->GetSession()->HandleLootReleaseOpcode(packet);
 
     ai->AccelerateRespawn(guid);
+
+    if (commanderOrder)
+        TortoiseBots::RemoteCommander::LootOrders().NoteWindowEnd(botRaw, guid.GetRawValue(), false);
 
     return true;
 }

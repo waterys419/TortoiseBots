@@ -1,5 +1,6 @@
 
 #include "playerbot/GroupMembers.h"
+#include "playerbot/TaxiRouteGuard.h"
 #include "playerbot/playerbot.h"
 #include "MoveToTravelTargetAction.h"
 #include "ChooseTravelTargetAction.h"
@@ -12,9 +13,12 @@
 #include "Maps/PathFinder.h"
 #include "playerbot/TravelMgr.h"
 #include "playerbot/TravelRepickPolicy.h"
-#include "playerbot/FlightErrandPolicy.h"
+#include "playerbot/policy/travel/FlightErrandPolicy.h"
+#include "playerbot/policy/travel/UndercityLiftPolicy.h"
 #include "playerbot/strategy/values/BudgetValues.h"
 #include "playerbot/strategy/values/FreeMoveValues.h"
+#include "runtime/HireLifecycle.h"
+#include "runtime/AltBotService.h"
 #include <cstdlib>
 #include <iomanip>
 
@@ -39,6 +43,14 @@ static constexpr time_t AUTO_HAND_IN_AGE = 90;                // seconds since t
 static constexpr time_t AUTO_HAND_IN_PATH_CHECK = 60;         // seconds between navmesh probes for one taker
 static constexpr int32 AUTO_HAND_IN_EPISODE = 10 * MINUTE;    // no failed move for this long ends the episode
 static constexpr int32 AUTO_HAND_IN_PARK = 30 * MINUTE;       // the quest's hand-in travel park, set when it fires
+
+// No-displacement watchdog: a move that reports success while the bot stands
+// still (spline into geometry, collapsed shortcut) must fill the same failure
+// budget a refused move does. Same anchor + window as the "move to loot"
+// watchdog (MovementActions.cpp): a walking bot covers this in about a
+// second, so only a bot that truly stands still ever trips it.
+static constexpr float TRAVEL_NO_PROGRESS_RADIUS = 2.0f;  // yards
+static constexpr time_t TRAVEL_NO_PROGRESS_TIMEOUT = 5;   // seconds
 
 // The hand-in destination a travel target is currently carrying, when it is a
 // taker trip a pool bot could hand in. nullptr for every other purpose.
@@ -261,6 +273,31 @@ bool MoveToTravelTargetAction::CheckServiceArrival(TravelTarget* target, std::st
     return false;
 }
 
+// Land on the navmesh, not on the npc's own spot: npcs on upper floors and
+// balconies the mmaps never meshed (Stormwind trainers) left the bot above
+// the mesh, where every path probe fails and the bot stood until rescued.
+// Narrowest height window first, and the landing must walk back to the npc:
+// with one 60 yd window the nearest poly under a Stormwind trainer was the
+// mesh beneath the city, and 94 of 174 rescues (live 2026-10-09) landed
+// there and failed every move again.
+static bool FindRescueLanding(Player* bot, WorldPosition const& location, WorldPosition& landing)
+{
+    if (!location.isMmapLoaded(bot->GetInstanceId()))
+        return false;
+    for (float const height : { 5.0f, 15.0f, 30.0f, 60.0f })
+    {
+        WorldPosition candidate = location;
+        if (!candidate.ClosestCorrectPoint(30.0f, height, bot->GetInstanceId()))
+            continue;
+        if (location.isPathTo(candidate.GetPathTo(location, bot), 10.0f, 10.0f))
+        {
+            landing = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rescue for a service trip at the drop threshold (IsMaxRetry): teleport to
 // the exact destination point instead of dropping + parking. Same
 // unwatched-either-end rule as the passive walk hop in MoveTo2, same map
@@ -277,12 +314,12 @@ bool MoveToTravelTargetAction::TryRescueServiceTrip(TravelTarget* target, std::s
     if (target->IsForced())
         return false;
 
-    WorldPosition const location = *target->getPosition();
+    WorldPosition location = *target->getPosition();
     if (location.GetMapId() != bot->GetMapId())
         return false;
     if (!bot->IsAlive() || bot->IsInCombat() || bot->IsTaxiFlying() || bot->IsBeingTeleported())
         return false;
-    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsRandomBot(bot))
+    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot))
         return false;
     WorldPosition const botPos(bot);
     if (ai->HasPlayerNearby(botPos, sPlayerbotAIConfig.reactDistance) || ai->HasPlayerNearby(location, sPlayerbotAIConfig.reactDistance))
@@ -292,6 +329,11 @@ bool MoveToTravelTargetAction::TryRescueServiceTrip(TravelTarget* target, std::s
     time_t const now = time(0);
     if (AI_VALUE2(time_t, "manual time", "service trip rescue") + SERVICE_TRIP_RESCUE_COOLDOWN_SEC > now)
         return false;
+
+    WorldPosition landing;
+    if (!FindRescueLanding(bot, location, landing))
+        return false;
+    location = landing;
 
     if (!bot->TeleportTo(location.GetMapId(), location.getX(), location.getY(), location.getZ(),
         WorldPosition(bot).GetAngleTo(location)))
@@ -304,12 +346,119 @@ bool MoveToTravelTargetAction::TryRescueServiceTrip(TravelTarget* target, std::s
     return true;
 }
 
+// Stuck-travel teleport (AiPlayerbot.StuckTravelTeleport, default on),
+// after mod-playerbots NewRpgBaseAction::MoveFarTo: a trip that has made no
+// progress until the drop threshold (IsMaxRetry: six failed or no-progress
+// moves) teleports to its destination instead of dropping. It closes the
+// open-sea standstill: a pool bot swimming at sea level has no walkable mesh
+// in reach, so the step, the mesh hop and the trap rescues all refuse, and
+// every re-pick fails the same way until the long-stuck rescue (live
+// 2026-10-11: 15 runs of 3+ min at z -2, about 102 bot-min). Masterless pool
+// bots only (never a real master, an owned or a hired bot), same map, nobody
+// watching either end, once per STUCK_TRAVEL_RESCUE_COOLDOWN_SEC per bot.
+// Lands on the mesh next to the destination like the service rescue, or on
+// the nearest route node within STUCK_TRAVEL_NODE_RANGE_YD of it.
+static constexpr time_t STUCK_TRAVEL_RESCUE_COOLDOWN_SEC = 10 * MINUTE;
+static constexpr float STUCK_TRAVEL_NODE_RANGE_YD = 200.0f;
+
+bool MoveToTravelTargetAction::TryRescueStuckTravel(TravelTarget* target, std::string const& purpose)
+{
+    if (!sPlayerbotAIConfig.stuckTravelTeleport)
+        return false;
+    if (!target->IsMaxRetry(true) || target->IsForced())
+        return false;
+
+    WorldPosition const location = *target->getPosition();
+    if (location.GetMapId() != bot->GetMapId())
+        return false;
+    if (!bot->IsAlive() || bot->IsInCombat() || bot->InBattleGround() || bot->IsTaxiFlying() ||
+        bot->IsBeingTeleported() || bot->GetTransport())
+        return false;
+    // Issue #872: an alt-bot gets the pool's same-map stuck recovery (C22).
+    if (ai->HasRealPlayerMaster() ||
+        (!TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()) &&
+         (ai->IsOwnedBot() || !sRandomBotFacade.IsRandomBot(bot))) ||
+        TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()))
+        return false;
+
+    WorldPosition const botPos(bot);
+    if (ai->HasPlayerNearby(botPos, sPlayerbotAIConfig.reactDistance) || ai->HasPlayerNearby(location, sPlayerbotAIConfig.reactDistance))
+        return false;
+
+    AiObjectContext* context = ai->GetAiObjectContext();
+    time_t const now = time(0);
+    if (AI_VALUE2(time_t, "manual time", "stuck travel rescue") + STUCK_TRAVEL_RESCUE_COOLDOWN_SEC > now)
+        return false;
+
+    WorldPosition landing;
+    std::string landedOn = "mesh";
+    if (!FindRescueLanding(bot, location, landing))
+    {
+        bool found = false;
+        for (TravelNode* node : sTravelNodeMap.getNodes(location, STUCK_TRAVEL_NODE_RANGE_YD))
+        {
+            if (node->IsTransport())
+                continue;
+            landing = *node->getPosition();
+            found = true;
+            break;
+        }
+        if (!found || ai->HasPlayerNearby(landing, sPlayerbotAIConfig.reactDistance))
+            return false;
+        landedOn = "node";
+    }
+
+    if (!bot->TeleportTo(landing.GetMapId(), landing.getX(), landing.getY(), landing.getZ(), botPos.GetAngleTo(landing)))
+        return false;
+
+    SET_AI_VALUE2(time_t, "manual time", "stuck travel rescue", now);
+    target->SetRetry(true, 0);
+    noProgressArmed = false;
+    sPlayerbotAIConfig.logEvent(ai, "StuckTravelTeleport", purpose,
+        std::to_string((int32)botPos.distance(landing)) + ":" + landedOn + ":" +
+        std::to_string((int32)botPos.getZ()) + ">" + std::to_string((int32)location.getZ()));
+    return true;
+}
+
 // Called once per target on its first failed move (retry 2) with the navmesh
 // verdict. Bots with a real master, in a battleground or in combat are left
 // alone, like the other rescues. A rescue that does not move the bot still
 // resets the streak, so the next try needs three fresh failures. The
 // streak lives in the facade value store, like "stuck keep count".
-bool MoveToTravelTargetAction::TryRescueNoPathTrap(bool noPath, std::string const& purpose)
+// Off-graph trap (no route node in walking reach, e.g. Lapidis Isle): hearth
+// and repop keep the bot on the island when its graveyard is there (live
+// 2026-10-09: every repop landed at the island graveyard and the bot walked
+// back to the shore). A masterless pool bot nobody watches goes to the nearest
+// route node instead, from where every route works.
+bool MoveToTravelTargetAction::TeleportToNearestRouteNode()
+{
+    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot) || bot->IsBeingTeleported() || bot->IsTaxiFlying())
+        return false;
+    WorldPosition const botPos(bot);
+    if (ai->HasPlayerNearby(botPos, sPlayerbotAIConfig.reactDistance))
+        return false;
+
+    for (TravelNode* node : sTravelNodeMap.getNodes(botPos))
+    {
+        if (node->IsTransport())
+            continue;
+        WorldPosition const nodePos = *node->getPosition();
+        // A node within 300 yd means a mesh pocket on a mapped continent
+        // (Stormwind floors, live 2026-10-09: 88-127 yd), not an island: the
+        // regular hearth/repop rescue handles those without a teleport.
+        if (nodePos.distance(botPos) < 300.0f)
+            return false;
+        if (ai->HasPlayerNearby(nodePos, sPlayerbotAIConfig.reactDistance))
+            return false;
+        if (!bot->TeleportTo(nodePos.GetMapId(), nodePos.getX(), nodePos.getY(), nodePos.getZ(), botPos.GetAngleTo(nodePos)))
+            return false;
+        sPlayerbotAIConfig.logEvent(ai, "OffGraphTeleport", node->getName(), std::to_string((int32)nodePos.distance(botPos)));
+        return true;
+    }
+    return false;
+}
+
+bool MoveToTravelTargetAction::TryRescueNoPathTrap(bool noPath, bool offGraph, std::string const& purpose)
 {
     if (ai->HasRealPlayerMaster() || bot->InBattleGround() || bot->IsInCombat() || !bot->IsAlive())
         return false;
@@ -322,8 +471,10 @@ bool MoveToTravelTargetAction::TryRescueNoPathTrap(bool noPath, std::string cons
     time_t const since = AI_VALUE2(time_t, "manual time", "nopath trap since");
 
     bool const nearAnchor = anchor.isValid() && botPos.GetMapId() == anchor.GetMapId() &&
-        botPos.sqDistance(anchor) <= NOPATH_TRAP_RADIUS_YD * NOPATH_TRAP_RADIUS_YD;
-    int32 const next = NoPathTrapStreak(streak, noPath, nearAnchor, now - since > NOPATH_TRAP_WINDOW_SECONDS);
+        botPos.sqDistance2d(anchor) <= NOPATH_TRAP_RADIUS_YD * NOPATH_TRAP_RADIUS_YD;
+    bool const sameFloor = !anchor.isValid() ||
+        fabs(botPos.getZ() - anchor.getZ()) <= NOPATH_TRAP_FLOOR_Z_YD;
+    int32 const next = NoPathTrapStreak(streak, noPath, nearAnchor, now - since > NOPATH_TRAP_WINDOW_SECONDS, sameFloor);
     if (noPath && next == 1)
     {
         SET_AI_VALUE2(WorldPosition, "custom position", "nopath trap anchor", botPos);
@@ -335,8 +486,54 @@ bool MoveToTravelTargetAction::TryRescueNoPathTrap(bool noPath, std::string cons
 
     SET_AI_VALUE2(int32, "manual int", "nopath trap streak", 0);
     sPlayerbotAIConfig.logEvent(ai, "NoPathTrapRescue", purpose, std::to_string(next));
+    if (offGraph && TeleportToNearestRouteNode())
+    {
+        if (TravelTarget* travelTarget = AI_VALUE(TravelTarget*, "travel target"))
+            sTravelMgr.SetNullTravelTarget(travelTarget);
+        return true;
+    }
     Event rescueEvent("travel nopath trapped");
     return ai->DoSpecificAction("unstuck", rescueEvent, true);
+}
+
+bool MoveToTravelTargetAction::TravelMoveMadeNoProgress()
+{
+    time_t const now = time(0);
+    LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
+
+    // A scheduled teleport-hop wait stands still by design: the bot jumped
+    // forward and the next move goes out once the hop's travel time passes.
+    if (lastMove.nextTeleport > now)
+        return false;
+
+    // A transport leg (boat/dock wait) stands still by design.
+    for (PathNodePoint const& point : lastMove.lastPath.GetPath())
+        if (point.type == PathNodeType::NODE_TRANSPORT)
+            return false;
+
+    float const x = bot->GetPositionX();
+    float const y = bot->GetPositionY();
+    float const dx = x - noProgressX;
+    float const dy = y - noProgressY;
+    bool const anchored = noProgressArmed &&
+        dx * dx + dy * dy <= TRAVEL_NO_PROGRESS_RADIUS * TRAVEL_NO_PROGRESS_RADIUS;
+    if (!anchored)
+    {
+        noProgressArmed = true;
+        noProgressX = x;
+        noProgressY = y;
+        noProgressSince = now;
+        return false;
+    }
+
+    if (now - noProgressSince < TRAVEL_NO_PROGRESS_TIMEOUT)
+        return false;
+
+    // Stood inside the radius for the whole window while moves kept
+    // reporting success: count it and start a new window, so a continued
+    // stand keeps filling the failure budget below.
+    noProgressSince = now;
+    return true;
 }
 
 // Flight plan: decided ONCE per travel target (item 5) in
@@ -375,7 +572,7 @@ void ai::DecideFlightPlanForTarget(PlayerbotAI* ai, Player* bot, TravelTarget co
     ClearFlightPlan(ai);
     if (!ai || !bot || !target || !target->getPosition())
         return;
-    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsRandomBot(bot))
+    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot))
         return;
     if (!bot->IsAlive())
         return;
@@ -446,7 +643,7 @@ static bool TryBoardFlightToTarget(PlayerbotAI* ai, Player* bot, TravelTarget* t
     WorldPosition const& botLocation, WorldPosition const& location)
 {
     AiObjectContext* context = ai->GetAiObjectContext();
-    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsRandomBot(bot))
+    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot))
         return false;
     if (!bot->IsAlive() || bot->IsInCombat())
         return false;
@@ -469,6 +666,11 @@ static bool TryBoardFlightToTarget(PlayerbotAI* ai, Player* bot, TravelTarget* t
         return false;
     }
     if (!bot->GetTaxi().IsTaximaskNodeKnown(fromNode) || !bot->GetTaxi().IsTaximaskNodeKnown(toNode))
+    {
+        ClearFlightPlan(ai);
+        return false;
+    }
+    if (!ai::BotTaxiRouteAllowed({ fromNode, toNode }))
     {
         ClearFlightPlan(ai);
         return false;
@@ -510,6 +712,115 @@ static bool TryBoardFlightToTarget(PlayerbotAI* ai, Player* bot, TravelTarget* t
     return true;
 }
 
+// A pool bot whose travel move found no route used to stand and drop the
+// target (44% of move failures were nopath, live 2026-10-09). Two cheap steps
+// instead, like mod-playerbots NewRpgBaseAction::MoveFarTo:
+//  - standing off the walkable mesh (water, under a city, a balcony): hop to
+//    the nearest walkable spot within 15 yd;
+//  - otherwise walk to a reachable point in the cone toward the target that
+//    ends at least 5 yd closer, and try again from there. Every step must
+//    close the gap, so the walk cannot loop.
+bool MoveToTravelTargetAction::TryStepTowardTarget(WorldPosition const& location)
+{
+    if (ai->HasRealPlayerMaster() || !sRandomBotFacade.IsFreeBot(bot) || bot->InBattleGround() ||
+        bot->IsInCombat() || !bot->IsAlive() || bot->IsTaxiFlying() || bot->GetTransport() ||
+        location.GetMapId() != bot->GetMapId())
+        return false;
+
+    WorldPosition const botPos(bot);
+    if (!botPos.isMmapLoaded(bot->GetInstanceId()))
+        return false;
+
+    WorldPosition onMesh = botPos;
+    if (!onMesh.ClosestCorrectPoint(2.0f, 3.0f, bot->GetInstanceId()))
+    {
+        WorldPosition hop = botPos;
+        if (hop.ClosestCorrectPoint(15.0f, 10.0f, bot->GetInstanceId()) && !ai->HasPlayerNearby(botPos, sPlayerbotAIConfig.reactDistance) &&
+            bot->TeleportTo(hop.GetMapId(), hop.getX(), hop.getY(), hop.getZ(), bot->GetOrientation()))
+        {
+            sPlayerbotAIConfig.logEvent(ai, "TravelMeshHop", std::to_string((int32)botPos.distance(hop)), "");
+            return true;
+        }
+        return false;
+    }
+
+    float const gap = botPos.distance(location);
+    float const baseAngle = botPos.getAngleTo(location);
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        float const angle = baseAngle + (rand_norm_f() - 0.5f) * M_PI_F;
+        float const reach = std::min(gap, 40.0f + rand_norm_f() * 40.0f);
+        WorldPosition stone(bot->GetMapId(), botPos.getX() + cos(angle) * reach, botPos.getY() + sin(angle) * reach, botPos.getZ());
+        if (!stone.ClosestCorrectPoint(10.0f, 30.0f, bot->GetInstanceId()))
+            continue;
+        std::vector<WorldPosition> path = botPos.GetPathTo(stone, bot);
+        if (path.size() < 2)
+            continue;
+        WorldPosition const end = path.back();
+        if (end.distance(location) + 5.0f >= gap)
+            continue;
+
+        bot->GetMotionMaster()->MovePoint(end.GetMapId(), end.getX(), end.getY(), end.getZ(), MOVE_RUN_MODE | MOVE_PATHFINDING);
+        WaitForReach(botPos.distance(end));
+        // WaitForReach caps at a few seconds; the walk itself may take longer.
+        SET_AI_VALUE2(time_t, "manual time", "travel step until", time(0) + 2 + (time_t)(botPos.distance(end) / 7.0f));
+        sPlayerbotAIConfig.logEvent(ai, "TravelStepToward", std::to_string((int32)gap), std::to_string((int32)end.distance(location)));
+        return true;
+    }
+    return false;
+}
+
+// Undercity lifts (UndercityLiftPolicy.h): a pool bot between the ruins and
+// the city below with its destination on the other level rides a teleport
+// instead of the elevator it never boards. Same guards as the service rescue:
+// masterless random pool bot, not hired, nobody watching either end, and one
+// lift per bot per ten minutes.
+bool MoveToTravelTargetAction::TryUndercityLift(WorldPosition const& location)
+{
+    ai::UndercityLift const lift = ai::UndercityLiftFor(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+        location.GetMapId(), location.getX(), location.getY(), location.getZ());
+    if (lift == ai::UndercityLift::None)
+        return false;
+    if (!bot->IsAlive() || bot->IsInCombat() || bot->IsTaxiFlying() || bot->IsBeingTeleported() || bot->GetTransport())
+        return false;
+    // Issue #872: an alt-bot gets the pool's same-map stuck recovery (C22).
+    if (ai->HasRealPlayerMaster() ||
+        (!TortoiseBots::AltBotService::Instance().IsAutonomous(bot->GetObjectGuid()) &&
+         (ai->IsOwnedBot() || !sRandomBotFacade.IsRandomBot(bot))) ||
+        TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid()))
+        return false;
+
+    // Once per ten minutes: a route that walks through the city (sewer canals
+    // in, lift out) would otherwise be lifted back up every tick (live: one
+    // bot lifted 33 times in 7 minutes).
+    AiObjectContext* context = ai->GetAiObjectContext();
+    time_t const now = time(0);
+    if (AI_VALUE2(time_t, "manual time", "undercity lift") + 10 * MINUTE > now)
+        return false;
+
+    WorldPosition landing;
+    if (lift == ai::UndercityLift::Down)
+    {
+        if (!FindRescueLanding(bot, location, landing))
+            return false;
+    }
+    else
+        landing = WorldPosition(ai::kUndercityMapId, ai::kUndercityUpX, ai::kUndercityUpY, ai::kUndercityUpZ);
+
+    WorldPosition const botPos(bot);
+    if (ai->HasPlayerNearby(botPos, sPlayerbotAIConfig.reactDistance) || ai->HasPlayerNearby(landing, sPlayerbotAIConfig.reactDistance))
+        return false;
+
+    if (!bot->TeleportTo(landing.GetMapId(), landing.getX(), landing.getY(), landing.getZ(), botPos.GetAngleTo(landing)))
+        return false;
+
+    SET_AI_VALUE2(time_t, "manual time", "undercity lift", now);
+    noProgressArmed = false;
+    sPlayerbotAIConfig.logEvent(ai, "UndercityLift", lift == ai::UndercityLift::Down ? "down" : "up",
+        std::to_string((int32)landing.distance(location)));
+    return true;
+}
+
 bool MoveToTravelTargetAction::Execute(Event& event)
 {
     TravelTarget* target = AI_VALUE(TravelTarget*, "travel target");
@@ -527,6 +838,12 @@ bool MoveToTravelTargetAction::Execute(Event& event)
 
     WorldPosition botLocation(bot);
     WorldPosition location = *target->getPosition();
+
+    if (LeaveDeeprunTram(ai, bot, location))
+        return true;
+
+    if (TryUndercityLift(location))
+        return true;
 
     // Decide-once flight plan (items 4-5): when the stored plan names a
     // flight, steer to the flight master as the intermediate move target
@@ -644,6 +961,11 @@ bool MoveToTravelTargetAction::Execute(Event& event)
                 }
             }
 
+            // Waiting for a group member stands still by design: disarm the
+            // no-displacement watchdog so the first tick after the wait does
+            // not read the wait itself as a stuck move.
+            noProgressArmed = false;
+
             return true;
         }
     }
@@ -681,6 +1003,20 @@ bool MoveToTravelTargetAction::Execute(Event& event)
         x += dx;
         y += dy;
 
+        // Land the walk point on the mesh, not inside the counter or above
+        // the floor: the NPC's own z can sit above unmeshed space
+        // (Stormwind upper floors). A snapped point keeps the stable x/y
+        // approach; a failed snap keeps the raw point, exactly as before.
+        WorldPosition walkPoint(mapId, x, y, z);
+        if (walkPoint.isMmapLoaded(bot->GetInstanceId()) &&
+            walkPoint.ClosestCorrectPoint(maxDistance, maxDistance, bot->GetInstanceId()) &&
+            fabs(walkPoint.getZ() - z) <= maxDistance)
+        {
+            x = walkPoint.getX();
+            y = walkPoint.getY();
+            z = walkPoint.getZ();
+        }
+
         if (ai->HasStrategy("debug move", BotState::BOT_STATE_NON_COMBAT))
         {
             std::ostringstream out;
@@ -700,9 +1036,32 @@ bool MoveToTravelTargetAction::Execute(Event& event)
         }
     }
 
+    // A step toward the target (TryStepTowardTarget) is still walking: let it finish
+    // instead of clearing it with a move that already found no route.
+    if (bot->IsMoving() && AI_VALUE2(time_t, "manual time", "travel step until") > time(0))
+        return true;
+
+    TravelNodeMap::LastRouteFail().clear();
     bool canMove = MoveTo(mapId, x, y, z, false, false);
 
-    if (!canMove)
+    // A move that reports success while the bot does not displace (a spline
+    // launched into geometry, a collapsed shortcut) fills the failure budget
+    // like a refused move: each phantom success used to decay it instead, so
+    // the 6-fail drop below never fired and the bot stood until the TRAVEL
+    // timeout. The drop, the purpose park and the kind blacklist then engage
+    // exactly as for a refused move; nothing is re-armed.
+    bool const noProgress = canMove && TravelMoveMadeNoProgress();
+
+    // A pool bot's hand-in trip keeps its move budget while it is getting
+    // closer: 5 yd nearer the taker than ever before on this trip clears the
+    // failures so far (HandInTripProgressed, donor MoveFarTo). Only a walk
+    // that stops closing the gap reaches the drop and the 5-min quest park.
+    if (sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster() &&
+        HandInTakerDestination(target, purpose) &&
+        HandInTripProgressed(target->HandInBestDistance(), botLocation.distance(location)))
+        target->SetRetry(true, 0);
+
+    if (!canMove || noProgress)
     {
         target->IncRetry(true);
 
@@ -719,29 +1078,71 @@ bool MoveToTravelTargetAction::Execute(Event& event)
         // in MoveTo2/DispatchMovement (LastMovement::moveFailReason, stamped
         // right before each `return false`), so a "complete" probe over a
         // clipped route is separable from a dispatch that truly reached the
-        // goal and failed. Parsers reading `dist:pathtag` keep working: the
-        // reason is only ever appended after the tag.
+        // goal and failed. A third colon carries the bot/target height pair
+        // (botZ>targetZ, whole yards), so an above-the-mesh trap reads
+        // straight off the row. Parsers reading `dist:pathtag` keep working:
+        // the reason and the heights are only ever appended after the tag.
         if (target->GetRetryCount(true) == 2)
         {
             std::string failDetail = std::to_string((int32)botLocation.distance(location));
             failDetail += ":";
-            bool noPath = false;
+            // The navmesh verdict for the blacklist below: only a same-map
+            // probe ran on the mesh at all (cross-map is never probed, an
+            // unloaded tile reports not-using-path and has nothing to say).
+            std::string pathTag;
             if (location.GetMapId() != bot->GetMapId())
-                failDetail += "crossmap";
+                pathTag = "crossmap";
             else
             {
                 PathFinder probe(bot);
                 probe.calculate(location.getX(), location.getY(), location.getZ(), false);
-                std::string const pathTag = TravelMoveFailPathTag((uint32_t)probe.getPathType());
-                noPath = pathTag == "nopath";
-                failDetail += pathTag;
+                pathTag = TravelMoveFailPathTag((uint32_t)probe.getPathType());
             }
+            bool const noPath = pathTag == "nopath";
+            failDetail += pathTag;
             failDetail += ":";
             failDetail += MoveFailReasonName(AI_VALUE(LastMovement&, "last movement").moveFailReason);
+            failDetail += ":";
+            failDetail += std::to_string((int32)botLocation.getZ()) + ">" + std::to_string((int32)location.getZ());
+            // Fifth field: why the node route was empty (TravelNodeMap::getRoute), when one was asked for.
+            if (!TravelNodeMap::LastRouteFail().empty())
+                failDetail += ":" + TravelNodeMap::LastRouteFail();
             sPlayerbotAIConfig.logEvent(ai, "TravelMoveFailed", purpose, failDetail);
 
-            if (TryRescueNoPathTrap(noPath, purpose))
+            // Give up the kind like a wedged combat target: a mesh-proven
+            // hole to a grind spot blacklists the creature kind for five
+            // minutes (the reach-action window), so the re-pick after the
+            // coming drop walks a different kind instead of the same spot.
+            // Without it the bot drops, re-picks the identical target and
+            // fires "move stuck" resets in place indefinitely.
+            if (TravelMoveFailBlacklistsKind(!ai->HasRealPlayerMaster() && sRandomBotFacade.IsFreeBot(bot),
+                dynamic_cast<GrindTravelDestination*>(target->GetDestination()) != nullptr,
+                noPath, target->GetEntry()))
+            {
+                AiObjectContext* context = ai->GetAiObjectContext();
+                uint32 const nowMs = WorldTimer::getMSTime();
+                context->GetValue<std::map<uint32, uint32>&>("unreachable entries")->Get()[(uint32)target->GetEntry()] =
+                    nowMs + 5 * MINUTE * IN_MILLISECONDS;
+                ai->TellDebug(ai->GetMaster(), "Giving up on this hunting ground - no path there.", "debug travel");
+            }
+
+
+            // A bot that cannot walk to any route node is trapped the same way:
+            // islands with no nodes (Lapidis Isle, live 2026-10-09) failed every
+            // off-island target as "not-using-path" + startwalk at the shore and
+            // never counted toward the trap streak.
+            std::string const& routeFail = TravelNodeMap::LastRouteFail();
+            bool const offGraph = routeFail == "startwalk" || routeFail == "nostartnode";
+            if (TryRescueNoPathTrap(noPath || offGraph, offGraph, purpose))
                 return false;
+        }
+
+        // A step toward the target (or a hop back onto the mesh) replaces the
+        // drop. The odd count keeps the first-failure row from repeating.
+        if (!canMove && TryStepTowardTarget(location))
+        {
+            target->SetRetry(true, 1);
+            return true;
         }
 
         // A failed move toward a hand-in taker is one no-progress episode for that
@@ -759,6 +1160,11 @@ bool MoveToTravelTargetAction::Execute(Event& event)
         // masterless pool bot, once per 30 min. A refused or failed rescue
         // falls through to the ordinary drop below.
         if (TryRescueServiceTrip(target, purpose))
+            return true;
+
+        // Any other stuck trip of a masterless pool bot teleports to
+        // its destination instead of dropping (AiPlayerbot.StuckTravelTeleport).
+        if (TryRescueStuckTravel(target, purpose))
             return true;
 
         if (target->IsMaxRetry(true))

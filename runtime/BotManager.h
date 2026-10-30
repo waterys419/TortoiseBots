@@ -7,7 +7,9 @@
 #include <vector>
 // pi-lens-ignore: clang:pp_file_not_found
 #include "ObjectGuid.h"
-#include "PoolPassRotation.h"
+#include "BotTurnScheduler.h"
+#include "AdaptiveBudget.h"
+#include "WorldThreadQueue.h"
 #ifndef MANGOS_OBJECT_GUID_H
 // Lens/build fallback — core header not on analyzer include path.
 enum { HIGHGUID_PLAYER = 0 };
@@ -18,6 +20,7 @@ public:
     bool IsEmpty() const { return true; }
     bool IsPlayer() const { return true; }
     uint32_t GetCounter() const { return 0; }
+    uint64_t GetRawValue() const { return 0; }
     std::string GetString() const { return ""; }
     bool operator==(ObjectGuid const&) const { return true; }
     bool operator!=(ObjectGuid const&) const { return false; }
@@ -29,6 +32,7 @@ class WorldSession;
 class Player;
 class WorldPacket;
 class Unit;
+class PlayerbotAI;
 
 namespace TortoiseBots {
 
@@ -83,6 +87,22 @@ struct BotEntry
 {
     BotRecord record;
     std::unique_ptr<PlayerbotAIAdapter> aiAdapter;
+    // Server time (WorldTimer ms) of this bot's last AI update; 0 = never.
+    uint32_t lastAiUpdateMs = 0;
+    // AI updates this bot has had since login (dashboard visit rate).
+    uint32_t aiVisits = 0;
+    // Teleport acks sent by UpdateBots, and how many left the near flag set.
+    uint32_t teleportAcks = 0;
+    uint32_t teleportAcksIgnored = 0;
+    // Last SLOWBOT line for this bot (WorldTimer ms); throttles the log.
+    uint32_t lastSlowLogMs = 0;
+    // Immediate turns granted in a row for travel-pipeline steps.
+    uint8_t followUps = 0;
+    // Pool turn queue (BotTurnScheduler.h): when the next turn is due
+    // (WorldTimer ms) and the situation it was scheduled for; a change of
+    // situation makes the bot due at once.
+    uint32_t turnDueMs = 0;
+    TurnSituation turnSituation = TurnSituation::Normal;
     BotEntry() = default;
     ~BotEntry();
     BotEntry(BotEntry&&) = default;
@@ -98,7 +118,14 @@ public:
     void OnPlayerLogin(Player* player);
     void OnPlayerBeforeLogout(Player* player);
     void OnPlayerLogout(Player* player);
+    // Issue #1043: checks the bot's current pet once per pet guid and moves a
+    // pet that appeared out of the bot's sight, on another floor or far away
+    // onto the bot (runtime/PetSpawnPolicy.h). Called on the world thread after
+    // the bot's AI turn and, for a clearly misplaced pet, from the map-thread
+    // player update hook; the two never run at the same time.
+    static void CheckNewPetSpawn(::Player* bot, ::PlayerbotAI* ai);
     void ReleaseToClient(Player* player);
+    void Shutdown();
 
     // Manual control for testing — bool success; core owns Headless session
 // pi-lens-ignore: clang:unknown_typename
@@ -125,6 +152,9 @@ public:
     // RelocateHopelessBot). Same eligibility, +5 rule and destinations;
     // relocates after a grace period of continuous stranding.
     bool RelocateStrandedBot(::Player* bot);
+    // Teleport to a validated point in a zone that fits the bot's level (the
+    // pool's login scatter picker), for any bot. Level 10+, alive, fail-closed.
+    bool TeleportToLevelFittingZone(::Player* bot);
 
     // Durable manual ownership is separate from the transient Headless record.
     // GetOwnedCharacters includes every undeleted same-account character plus
@@ -149,11 +179,19 @@ public:
 
     // Snapshot of in-world bots owned by a master. Callers never receive the
     // manager's records or session pointers, only live Player identities.
+    // World thread only (it walks the records the world thread mutates).
     std::vector<Player*> GetBotsForMaster(ObjectGuid masterGuid) const;
+    // Any thread (issue #839): raw guids of the master's live bots as published
+    // at the end of the last world update - at most one tick stale. Packet
+    // hooks on the AsyncPackets / ChannelBroadcaster / map threads use this and
+    // resolve each guid themselves; nothing here dereferences a Player.
+    std::vector<uint64_t> GetBotGuidsForMasterAnyThread(ObjectGuid masterGuid) const;
     // Snapshot of every live module-owned bot for legacy holder adapters and
     // diagnostics. Ownership remains entirely inside BotManager.
     std::vector<Player*> GetAllBots() const;
     uint32_t GetBotCount() const { return static_cast<uint32_t>(m_bots.size()); }
+    // Diagnostics: AI updates so far and ms since the last one (0, 0 when unknown).
+    void GetAiVisitInfo(uint32_t guidLow, uint32_t& visits, uint32_t& ageMs) const;
 
     // Native follow command and durable master ownership.
 // pi-lens-ignore: clang:unknown_typename
@@ -192,11 +230,15 @@ private:
     void UpdateAutoTest(uint32_t diff);
     void UpdatePacketBridgeTest(uint32_t diff);
     void UpdateBots(uint32_t diff);
+    void PublishMasterView();
     void DetachOwnedBots(Player* master);
     void RebindOwnedBots(Player* master);
 
 
     std::unordered_map<uint32_t, BotEntry> m_bots; // key = guid counter
+    // Issue #839: master -> live bot guids for packet hooks off the world
+    // thread; rebuilt from m_bots at the end of every OnWorldUpdate.
+    MasterBotView m_masterView;
     // Reentrancy guard for AI-driven removal. PlayerbotAI::UpdateAIInternal can
     // request its own removal (stunned/idle logout path) while its Update is on
     // the stack inside UpdateBots. Stopping the Headless session synchronously
@@ -211,15 +253,37 @@ private:
         bool save = true;
     };
     std::vector<PendingBotRemoval> m_pendingBotRemovals;
-    // Round-robin rotation for the random-pool pass in UpdateBots, with the
-    // cursor that lets a budgeted pass resume where the previous tick stopped
-    // (see PoolPassRotation.h).
-    PoolPassRotation m_poolRotation;
+    // Due pool turns collected each UpdateBots pass (kept to reuse the
+    // allocation; see BotTurnScheduler.h).
+    std::vector<DueTurn> m_dueTurns;
+    // Self-tuning tick budget: fed the measured world tick each pass, hands
+    // back the effective pool/combat budgets. Lazily re-synced when the
+    // operator's target or ceilings change (restart-only keys, so once).
+    AdaptiveBudget m_adaptiveBudget{50, 10000, 15000};
+    uint32_t m_adaptiveTargetMs = 50;
+    uint64_t m_adaptivePoolCeilingUs = 10000;
+    uint64_t m_adaptiveCombatCeilingUs = 15000;
+    // How long the last pool turn loop ran (ms): the part of the world tick
+    // the controller can cut.
+    uint32_t m_lastPoolTurnsMs = 0;
     // BOTPERF window: UpdateBots pass cost accumulated over ~30 s of tick time.
     uint64_t m_perfPassUsSum = 0;
     uint64_t m_perfPassUsMax = 0;
     uint32_t m_perfPassCount = 0;
     uint32_t m_perfElapsedMs = 0;
+    // BOTPERF window: pool turns served and how late they ran (ms past due).
+    uint32_t m_perfTurns = 0;
+    uint64_t m_perfLateMsSum = 0;
+    uint32_t m_perfLateMsMax = 0;
+    // Same window: time spent inside the turn loop, and lateness by situation.
+    uint64_t m_perfTurnLoopUsSum = 0;
+    uint32_t m_perfCombatTurns = 0;
+    uint64_t m_perfCombatLateMsSum = 0;
+    uint32_t m_perfOtherTurns = 0;
+    uint64_t m_perfOtherLateMsSum = 0;
+    // Action-count snapshot cadence: cumulative per-(class, action) CSV dump
+    // every 5 minutes of tick time (AiPlayerbot.ActionCountsLog only).
+    uint32_t m_actionCountsElapsedMs = 0;
     bool m_autoTestEnabled = false;
     uint32_t m_autoTestAccount = 0;
 // pi-lens-ignore: clang:unknown_typename
@@ -228,12 +292,24 @@ private:
     enum class AutoState { Idle, LoggingIn, InWorld, Saving, LoggingOut, Relogging, CleaningUp, Done };
     AutoState m_autoState = AutoState::Idle;
     bool m_autoTestPassed = false;
-
     bool m_packetTestEnabled = false;
     uint32_t m_packetTestAccount = 0;
     ObjectGuid m_packetTestMasterGuid;
     ObjectGuid m_packetTestBotGuid;
     uint32_t m_packetTestTicks = 0;
+    // Dead-bot sweep (module-side safety net, independent of the pool AI
+    // rotation): releases stuck corpses and revives stalled ghosts that never
+    // got an AI tick. Own cadence from OnWorldUpdate, so a starved pool budget
+    // cannot strand the dead.
+    void SweepDeadBots(uint32_t diff);
+    uint32_t m_deadSweepElapsedMs = 0;
+    // First-seen timestamps (time(nullptr)) for dead bots awaiting release /
+    // revive. A bot seen alive (or gone) drops out; only a bot dead across the
+    // whole grace window is touched. Key = guid counter.
+    std::unordered_map<uint32_t, time_t> m_deadSince;
+    // First-seen timestamps for bots the sweep found mid-teleport; a bot seen
+    // out of teleport drops out. Feeds the "stuck teleport" diagnostic line.
+    std::unordered_map<uint32_t, time_t> m_teleportSince;
     void SweepStrandedBots(uint32_t diff);
     uint32_t m_strandedSweepElapsedMs = 0;
     std::unordered_map<uint32_t, time_t> m_strandedSince; // key = guid counter

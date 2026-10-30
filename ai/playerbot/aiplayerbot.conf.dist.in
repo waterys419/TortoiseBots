@@ -2,6 +2,9 @@
 # MANGOS Ai Playerbot Configuration file #
 ##########################################
 
+# Every `#Key = value` line below shows the default that already runs.
+# Uncomment a line only to change it; an active line sets the value.
+
 [AiPlayerbotConf]
 ConfVersion=2020072501
 
@@ -14,12 +17,14 @@ AiPlayerbot.Enabled = 0
 # Enable Observability telemetry UDP emitter (default 0, switched off)
 AiPlayerbot.Observability = 0
 AiPlayerbot.ObservabilityPort = 9195
+# Mobs, threat and target lines for every dungeon run on the dashboard's Dungeons tab (only acts with Observability = 1)
+AiPlayerbot.ObservabilityDungeonMobs = 1
 
 # Enable random bot system
-# Single-bot manual-add (`.bot add <name>`) is the
-# recommended starting point. Random bots auto-spawn dozens of characters and
-# need DB schema + tuned class probabilities — defer this.
-AiPlayerbot.RandomBotAutologin = 0
+# On by default: a fresh install brings up a living world of random bots
+# (see MinRandomBots/MaxRandomBots, RandomBotAutoCreate). 0 turns the pool off
+# and leaves only manually added bots (`.bot add <name>`).
+AiPlayerbot.RandomBotAutologin = 1
 
 # Log on all random bots on start
 AiPlayerbot.RandomBotLoginAtStartup = 0
@@ -29,10 +34,6 @@ AiPlayerbot.ExplicitDbStoreSave = 0
 
 # Log out random bots after BotInWorldTime interval
 # AiPlayerbot.RandomBotTimedLogout = 1
-
-# Currently has no effect (read but unused).
-# Keep random bots logged out for an BotInWorldTime interval
-# AiPlayerbot.RandomBotTimedOffline = 0
 
 # Level ladder: choose the next random bot to log in by level instead of round-robin over
 # the whole pool. The levels are cut into bands of LevelLadderBandSize (1-5, 6-10, ... 56-59)
@@ -51,16 +52,10 @@ AiPlayerbot.ExplicitDbStoreSave = 0
 # Login Bots when real players login
 # AiPlayerbot.RandomBotLoginWithPlayer = 0
 
-# Currently has no effect (read but unused).
-# auto-login all player alts as bots on player login
-AiPlayerbot.BotAutologin = 0
-
-# Mark many quests <= Bot level as complete (slows down bot creation)
-AiPlayerbot.PreQuests = 0
-
-# Random bot count
-AiPlayerbot.MinRandomBots = 0
-AiPlayerbot.MaxRandomBots = 0
+# Random bot count. Default 500 is sized for an average PC or a Steam Deck
+# (with the self-tuning tick budget below); a bigger machine can raise both.
+AiPlayerbot.MinRandomBots = 500
+AiPlayerbot.MaxRandomBots = 500
 AiPlayerbot.RandomBotMaxLevel = 60
 
 # Username prefix used when the module NAMES a new pool account, and when the
@@ -90,7 +85,7 @@ AiPlayerbot.RandomBotAccountPrefix = RNDBOT
 # reset command. Existing installations must first enroll their hand-made
 # accounts at the server console with `bot pool adopt preview` and
 # `bot pool adopt confirm <challenge>`; until then those accounts are not
-# managed and are never touched. See docs/guides/living-world.md.
+# managed and are never touched. See docs/server/bot-pool.md.
 AiPlayerbot.RandomBotPoolReset = off
 
 # Bounded idempotent RNDBOT population (feature 01). Default OFF.
@@ -127,7 +122,7 @@ AiPlayerbot.RandomBotPoolReset = off
 # to the normal Headless login (AddRandomBot -> LoginPlayer) and post-login
 # PlayerbotFactory gear enrichment (already in RandomBotService.Update) handle
 # them. No raw INSERT, no DB worker, no AddAsyncTask.
-AiPlayerbot.RandomBotAutoCreate = 0
+AiPlayerbot.RandomBotAutoCreate = 1
 
 # Optional pinned RNDBOT names that remain online when possible. Comma-separated
 # character names matched using the database's stored `characters.name` collation
@@ -172,6 +167,47 @@ AiPlayerbot.AllowIsolatedCustomStartingZones = 0
 # core playercreateinfo spawns). Set 0 for the old behaviour: uniform random
 # race, goblins to Valley of Trials, high elves to Northshire. Default 1.
 AiPlayerbot.RandomBotEvenStartZones = 1
+# % of new random bots that are Alliance (0-100); the rest are Horde.
+# 50 = no bias (today's mix). Faction is rolled first, then the start zone
+# inside that faction (weights below, else RandomBotEvenStartZones). Account
+# faction limits still apply: a roll with no valid race on the account keeps
+# the full account-eligible list, and core creation limits back off as today.
+# Only new bots and the login preference below follow it; existing pool bots
+# are never deleted or moved (use RandomBotPoolReset for a hard restart).
+# Login preference: when the ratio is not 50, the level ladder prefers the
+# faction furthest below its share as bots rotate in; no forced logouts. It
+# applies only while the ladder is filling bands (LevelLadder=1, online below
+# target); full pools and LevelLadder=0 are unaffected.
+# e.g. 90 for a mostly-Alliance pool. Default 50.
+AiPlayerbot.RandomBotFactionRatio = 50
+
+# Optional per-start-zone weights for new random bots, e.g.
+# "Durotar=100,Elwynn=50". Names are region names (Durotar, Mulgore,
+# Tirisfal, Elwynn, Dun Morogh, Teldrassil) or spawn names (Northshire,
+# Coldridge, ...). Empty = today's even spread. A zone with weight 0 gets no
+# new bots through this pick; malformed (or all-zero) text logs an error and
+# keeps the even spread. Applies within the rolled faction above. e.g. all
+# new bots in Durotar: AiPlayerbot.RandomBotStartZoneWeights = Durotar=100.
+# Bots seeded level 10+ still scatter to level-fitting zones at first login,
+# so weighted zones only control where level-1 bots start. Default empty.
+AiPlayerbot.RandomBotStartZoneWeights =
+
+# Names for new bot characters (pool bots and hires), as percentages of three
+# styles: race-flavoured,compound,fun. Race-flavoured names fit the bot's race
+# and gender ("Thorvin" for a dwarf), compound names join two words with a
+# class lean ("Nightrunner"), fun names are puns and nods ("Kidneyshotz",
+# "Gnomebody"). Every name passes the same checks as a player's name. Only new
+# characters follow it; existing bots keep their names. 100,0,0 = serious
+# names only, 0,0,100 = fun names only. Default 55,20,25.
+AiPlayerbot.RandomBotNameStyleWeights = 55,20,25
+
+# Optional text file with more names, added to the built-in ones. Same format
+# as runtime/BotNameData.h: a [key] line, then names separated by spaces or
+# new lines, e.g. "[fun:rogue]" then "Stabbyjoe Sneakypants". Keys: fun,
+# fun:<class>, fun:<race>, rp:<race>:<male|female> (samples for race names),
+# start, start:<class>, end, prefix:<class|race>, suffix, pet:hunter.
+# Read once at the first name pick; restart to reload. Default empty.
+AiPlayerbot.RandomBotNamesFile =
 
 # Where a random bot without a player master comes back after a repop (the
 # evacuation used when it keeps dying or is stuck while dead): 1 = nearest
@@ -179,6 +215,9 @@ AiPlayerbot.RandomBotEvenStartZones = 1
 # (the old behaviour, which drained bots back into the starting zones).
 # Default 1.
 AiPlayerbot.RepopAtGraveyard = 1
+# Teleport a dead bot out of a hopeless corpse run (grim clueless solo graveyard
+# with no reachable spirit) to the graveyard it would repop at
+#AiPlayerbot.RelocateHopelessDeaths = 1
 # Level at which random bots learn the Swift Riding Turtle (quest 40302
 # "Torta's Egg" -> item 23720 -> spell 30174), as if they did the quest.
 # Applies on seed/refresh at TurtleMountAtLevel..39 and on level-up for the
@@ -190,6 +229,13 @@ AiPlayerbot.TurtleMountAtLevel = 18
 # the riding skill already level-gated). 1 = on; 0 = off, so a bot levelled
 # from 1 keeps only the turtle until it is re-seeded. Default 1.
 AiPlayerbot.LevelUpMounts = 1
+# Random pool bots and hired companions ride only mounts that fit their own
+# race, i.e. the strict own-race vendor mounts a player of that race would buy
+# (normal from 40, epic from 60). Cross-race mounts, shop mounts that any race
+# can use, and mounts that drop from loot (raid/dungeon bosses), are left out.
+# 1 = any mount, including shop and raid-drop mounts (old behaviour).
+# Player alts are never gated. Default 0.
+AiPlayerbot.RandomBotShopMounts = 0
 # Safety factor on the mount break-even distance: bots mount for travel/RPG
 # trips only when the remaining distance exceeds
 # 7 y/s * mount cast time / (best mount speed % / 100) * this. 0 disables
@@ -218,6 +264,16 @@ AiPlayerbot.UnstuckHearthLevelFit = 1
 # graveyard instead. 0 disables the gate (always hearth). Default 300.
 AiPlayerbot.UnstuckHearthMinDistance = 300
 
+# Stuck-travel teleport for random bots without a player master (owned and hired
+# bots never teleport). 1 = a trip that fails or makes no progress for six moves
+# in a row (the point where the destination would be dropped) teleports the bot
+# to its destination instead: onto the navmesh next to it, or the nearest route
+# node within 200 yards. Same map only, only when no player is near either end,
+# at most once per 10 minutes per bot. It frees bots stranded swimming at sea,
+# where no walk can reach land. 0 = drop the destination and pick another (the
+# old behaviour). Default 1.
+AiPlayerbot.StuckTravelTeleport = 1
+
 # Quest-log upkeep for random bots without a player master: drop finished
 # quests that can no longer be rewarded (except transient money blockers),
 # drop grey incomplete deliver quests whose items are gone, refuse grey
@@ -234,6 +290,9 @@ AiPlayerbot.BotQuestLogUpkeep = 1
 # Vendor/Repair relevance), refuses services and inn homebinds in zones 10+
 # below its level (capitals excepted); 0 = the old behaviour, which let bots
 # sit in outgrown zones and bind there. Unknown area levels fail closed.
+# A level 10+ pool bot whose travel target has been reset back to back for
+# 2 min also requests that Grind target, for that one trip, whatever needs
+# are pending.
 # Default 1.
 AiPlayerbot.LeaveOutgrownZones = 1
 
@@ -257,6 +316,13 @@ AiPlayerbot.LowLevelVendorBatchMinBagSpace = 25
 # Default 600.
 AiPlayerbot.LowLevelVendorMaxDistance = 600
 
+# Microseconds a travel-destination pick may spend scanning candidates per bot
+# visit before yielding to the next visit (the pick resumes where it stopped,
+# accepting the same target, just spread across visits). Bounds the worst-case
+# single-bot update so one 11 s pick no longer lands whole in a world tick.
+# 0 = no slicing (the whole pick runs in one visit). Default 4000 (4 ms).
+AiPlayerbot.TravelPickBudgetUs = 4000
+
 # Bot-only drop-rate boost for green (uncommon) and blue (rare) items. Masterless
 # random pool bots roll each quality-2/3 entry of a creature's loot template one extra
 # time per kill, at (multiplier - 1) x the entry's DB chance, so the expected number of
@@ -271,7 +337,7 @@ AiPlayerbot.LowLevelVendorMaxDistance = 600
 # Default-on bounded fill of human-waiting LFT queues with live random Headless bots.
 # Uses core #416 QueuePlayer/LeaveQueue/IsQueued/IsInOffer/AcceptOffer/
 # GetQueuedPlayers; core owns private queues, offers, cancellation and groups.
-# Candidates use AiFactory roles and the hardcoded Soromeister LFT.allDungeons
+# Candidates use AiFactory roles and the hardcoded Turtle client LFT LFT_Data.lua
 # minLevel/maxLevel range table (see LftBotFillService.cpp; no DBC fallback),
 # not an average-human +/-5 approximation. Unknown/corrupt/custom ranges fail
 # closed and log once.
@@ -291,16 +357,77 @@ AiPlayerbot.LowLevelVendorMaxDistance = 600
 #AiPlayerbot.HireEnabled = 1
 #AiPlayerbot.HireMinAccountSecurity = 0
 #AiPlayerbot.HireMaxBotsPerPlayer = 4
+# Issue #936: `.bot hire <class> ... [level]` (or level=<n>) hires the
+# companion at a chosen level, 1 up to the hirer's level plus this many (0-59,
+# never above 60). 0 = no higher than the hirer; a GM hirer may go to 60. Any
+# level below the hirer is allowed. No level given = the hirer's level, as ever.
+#AiPlayerbot.HireMaxLevelAboveHirer = 0
+# Free hires for staff: accounts with this security level or more hire
+# companions for free (no gold taken; the reply says "free (GM)"). 0 = off,
+# everyone pays. Account levels on this core: 1 observer, 2 moderator,
+# 3 developer, 4 administrator; e.g. 2 = moderators and up hire free. Range 0-6.
+#AiPlayerbot.HireFreeMinSecurity = 0
 # HireAnywhere: 0 = hire only at a <Mercenary Hire> recruiter (the .bot hire
 # command points players to one); 1 = .bot hire also works anywhere. Fees are
 # the same either way.
 #AiPlayerbot.HireAnywhere = 0
+# HireAllowPvP: 0 = hired companions are PvE-only (queueing for a battleground
+# warns once, entering dismisses them, hiring is refused while queued or
+# inside). 1 = today's behaviour (hires may go to battlegrounds).
+#AiPlayerbot.HireAllowPvP = 0
+# HireLoot: 1 = hired companions loot corpses and roll on group loot (today's
+# behaviour). 0 = a hire never loots: it passes on every roll and leaves every
+# corpse alone. Hires never quest, whatever this is set to.
+#AiPlayerbot.HireLoot = 1
+# ShamanTankEnabled: 1 = the experimental 7.3 shaman tank build (Enhancement
+# (Tank)) is offered at recruiters and by `.bot hire`, and random pool shamans
+# may roll it. 0 = withheld everywhere. Shamans already on the build keep it.
+#AiPlayerbot.ShamanTankEnabled = 1
 #AiPlayerbot.HireBaseCostCopper = 15000
 #AiPlayerbot.HirePartyMult2 = 1.66
 #AiPlayerbot.HirePartyMult3 = 2.66
 #AiPlayerbot.HirePartyMult4 = 4.66
 #AiPlayerbot.HireRaidFlatCostCopper = 10000
 #AiPlayerbot.HireDisconnectGracePeriod = 300
+# Issue #900: `.bot hire raid <preset|composition> [tier]` hires a whole raid
+# through the single-hire path (up to HireMaxBotsPerPlayer minus the
+# companions you already have). A role count like `3t 12h 24d` picks its
+# classes from HireRaidSpread: per role (tank, healer, dps) a comma list of
+# classes handed out round-robin; repeat a class to weight it. Classes your
+# faction cannot field are skipped. HireRaidPresets: `name=composition`
+# entries separated by `;`, run as `.bot hire raid <name> [tier]`; the
+# composition may end in a tier word (a tier typed after the name wins).
+# The values below are the values that actually run.
+#AiPlayerbot.HireRaidSpread = tank=warrior,druid,paladin;healer=priest,priest,paladin,shaman,druid;dps=mage,warlock,rogue,hunter,warrior,mage,warlock,rogue,hunter,shaman
+#AiPlayerbot.HireRaidPresets = zg=2t 4h 13d t2;aq20=2t 4h 13d t5;onyxia=3t 10h 26d t1;mc=3t 10h 26d t3;bwl=3t 10h 26d t4;aq40=3t 10h 26d t5;naxx=3t 10h 26d t6
+# Issue #490: static best-in-slot sets for level-60 hires (tiers 1-7 from
+# the tortoise_bots_hire_gear table). 0 = today's random hire gear only.
+# HireGearStartTier (0..7) is the tier every player has. Higher tiers are
+# unlocked by seven quests at the six capital recruiters (one per tier:
+# kill the tier's bosses, bring materials, pay a fee). The recruiter's
+# "Choose equipment" step and `.bot hire <tier>` pick any tier from 0 up to
+# the player's highest; the default is tier 0.
+# HireGearUnlockAccountWide = 1: an unlock on any character of the account
+# counts. HireGearAllQuestsAvailable = 1: all seven quests are offered at
+# once instead of as a chain (written into the quests at startup, live
+# after the NEXT restart). HireGearOptionalMaps: comma-separated map ids
+# whose bosses are credited automatically when the quest is taken, e.g.
+# 819 (Timbermaw Hold) or all Turtle content 800,532,819,807,814; their
+# loot stays in the gear pool. HireGearTierCostMultipliers: hire fee
+# multiplier for tiers 0..7 (exactly 8 numbers, else the defaults are used).
+# The values below are the values that actually run.
+#AiPlayerbot.HireGearTiersEnabled = 1
+#AiPlayerbot.HireGearStartTier = 0
+#AiPlayerbot.HireGearUnlockAccountWide = 0
+#AiPlayerbot.HireGearAllQuestsAvailable = 0
+#AiPlayerbot.HireGearOptionalMaps =
+#AiPlayerbot.HireGearTierCostMultipliers = 1,1.5,2,3,4,5,6,6
+# Standard (tier 0) companion kit: generated item level <= hire level + this
+# value, and never above RandomGearMaxLevel. Default 5 = a little above the
+# pool rule (RandomGearMaxItemLevelAboveLevel, 1) and below the tier-2 curated
+# kit: a level-60 standard hire tops out at item level 65, the tier-1 ceiling.
+# The curated tier 1-7 sets are not affected. 0 keeps RandomGearMaxLevel alone.
+#AiPlayerbot.HireGearMaxItemLevelAboveLevel = 5
 # Issue #492: world buffs at the six capital <Mercenary Hire> recruiters
 # (Stormwind, Ironforge, Darnassus, Orgrimmar, Undercity, Thunder Bluff).
 # Level 60+ players get a "World buffs" branch next to "Hire bots"; the
@@ -325,6 +452,12 @@ AiPlayerbot.LowLevelVendorMaxDistance = 600
 #AiPlayerbot.WorldBuffsSilithystPricePerPersonCopper = 4000
 #AiPlayerbot.WorldBuffsUnlockFeeRaidCopper = 2000000
 #AiPlayerbot.WorldBuffsUnlockFeeCopper = 1000000
+# Ammo stacks (200 rounds each) a warrior or rogue with a bow, gun or
+# crossbow keeps topped up (maintenance, level-up, ammo refill). Hunters keep
+# 5 + level / 10 stacks as before and are not affected. 1-10, never more than
+# a hunter of the same level gets; a bot with the item cheat keeps 1. The
+# value below is the value that actually runs.
+#AiPlayerbot.AmmoStacksNonHunter = 2
 # Issue #473: opt-in quality of life for owned/hired bots only (every part
 # off by default; pool bots always keep progressing organically and are
 # never touched). The values below are the values that actually run.
@@ -334,6 +467,11 @@ AiPlayerbot.LowLevelVendorMaxDistance = 600
 # ilvl 0 = no cap (clamped to 5 at load).
 #AiPlayerbot.OwnedBotAutogearQualityCap = 2
 #AiPlayerbot.OwnedBotAutogearIlvlCap = 0
+# `.autogear` on real players: 0 = GM-only (a GM may gear any player), 1 =
+# every player may run .autogear on themselves only. Never affects bots.
+# The value below is the value that actually runs.
+#AiPlayerbot.PlayerAutogearForAll = 0
+
 # Summon the joining bot to its inviter on group accept, with the condition
 # knobs below (dead bots are only revived when both the dead-bot and revive
 # knobs are on; repair runs after arrival).
@@ -346,6 +484,74 @@ AiPlayerbot.LowLevelVendorMaxDistance = 600
 # Seconds between summon-on-accept teleports per bot (default 300 = 5
 # minutes). 0 disables the cooldown (not recommended with revive/repair on).
 #AiPlayerbot.OwnedBotSummonCooldown = 300
+
+# Issue #884: remote commander. A GM, or the owner of every bot in it, binds a
+# bot-only group of up to five to themselves with `.bot commander bind
+# <LeadBot> [<Bot>...]` and leads it from anywhere (another zone, outside the
+# instance) with `.bot cmd ...` orders that name their target by GUID or a 3D
+# point; `.bot commander view` sends the TBM:VIEW feed. This is how an outside
+# program (an AI agent such as turtle-agent) drives a party, so it is off by
+# default: turn it on only if you run such a program. With 0 a player still
+# binds his own party with `inparty` and uses `.bot cmd enter` and `.bot cmd summon`
+# for the run leader (needs AiPlayerbot.DungeonSelfClear = 1); every other
+# commander command answers that the feature is off.
+#AiPlayerbot.RemoteCommander = 0
+
+# Issue #884, phase 2: while a commander is bound and its feed is on (`.bot
+# commander view on|off`; a new binding starts off), the commander receives
+# one TBM:VIEW frame (the bound bots, the hostiles they see, the top of each
+# engaged hostile's threat list) every this many milliseconds. Built from what
+# the bots already track; no extra world scan. Clamped to 250..60000.
+#AiPlayerbot.RemoteCommanderViewMs = 1000
+
+# Work in progress. These features are not officially released and not supported yet. Enable them at your own risk.
+# Until the official release, bug reports and feedback about them are not handled through the issue tracker; contact Hypeer directly.
+# Run trace (opt-in, off by default). A GM, or the owner of the bots, runs
+# `.bot trace start <run_id> [party|bot <Name>]` and the server records what the
+# party's bots do - hp/power/position/target/strategy, the hostiles they see and
+# who they hold, every action with its result (OK / FAILED / IMPOSSIBLE / USELESS /
+# PREREQ / VETOED / BACKOFF), deaths, combat enter/leave, loot, facing and movement - as one JSONL
+# file (<run_id>.jsonl) plus <run_id>.summary.json, until `.bot trace stop`.
+# tools/trace_score.py scores the file offline. Schema: docs/server/run-trace.md.
+# Costs nothing while no run is active; a run reads only what the bots already
+# track (no world scan, no database), builds its lines on the world thread and
+# writes them on a separate thread through a bounded queue (lines are dropped and
+# counted if the disk cannot keep up). With 0 `.bot trace start` answers that the
+# feature is off, and a run in progress ends at the next tick.
+#AiPlayerbot.RunTrace.Enabled = 0
+
+# Milliseconds between two frames of a run (clamped to 250..10000).
+#AiPlayerbot.RunTrace.IntervalMs = 500
+
+# Where traces are written; a relative path is under LogsDir.
+#AiPlayerbot.RunTrace.Dir = traces
+
+# Only a GameMaster may start a trace (each takes up to MaxFileMb of disk).
+# With 0 the owner of the bots may start one too.
+#AiPlayerbot.RunTrace.GmOnly = 1
+
+# Size cap of one trace file in MiB (clamped to 1..1024). When it is reached the
+# run ends (end reason size_cap) with its end record intact.
+#AiPlayerbot.RunTrace.MaxFileMb = 64
+
+# Issue #1012: `.bot cmd gossip <npc entry> <bot> <option>` lets a commanded bot
+# talk to an NPC and pick a gossip option (a commander's own order needs AiPlayerbot.RemoteCommander = 1; the run leader's gossip steps need only AiPlayerbot.DungeonSelfClear = 1). A gossip option can do anything its script says (take money,
+# give items, teleport), so a bot talks only to the creature entries listed
+# here, comma-separated, after you have read what their scripts do. Empty = the
+# order is refused for every NPC (the default). Audited entries:
+#   7607 Weegli Blastfuse (Zul'Farrak): after the pyramid event his one option
+#        sends him to blow the End Door open; before it his menu is empty.
+#   7604 Sergeant Bly (Zul'Farrak): after the pyramid event his one option starts
+#        his fight (he and his crew turn hostile and attack the bot that asked).
+# To allow both: AiPlayerbot.BotGossipNpcs = 7607,7604
+# Since fix/plan-gossip-allow (SFK r27 slot7 stopped at step 130/313 when its
+# plan's gossip step was refused Deathstalker Adamant, 3849), a dungeon run did
+# not need this list for its own gossip steps: a bot of a running or paused run
+# was let talk to the NPC entry the run's CURRENT gossip step names (the step's
+# `entry` only), read from the loaded plan, and to no other. A manual
+# order outside a run, another NPC, or a run at any other step still needed the
+# entry listed here.
+#AiPlayerbot.BotGossipNpcs =
 
 # Bounded AH market population through the native bot/session auction path. Default off.
 # When enabled, online random Headless bots use real inventory items, pricing, deposits,
@@ -377,16 +583,20 @@ AiPlayerbot.AhMarketDynamicLevel = 0
 AiPlayerbot.AhMarketLevelRefresh = 600
 AiPlayerbot.AhMarketVariance = 10
 AiPlayerbot.AhMarketBidMin = 75
+# AiPlayerbot.AhMarketBidMax = 90
 AiPlayerbot.AhMarketTimeMax = 24
-# Currently has no effect (read but unused).
-AiPlayerbot.AhMarketValueVendor = 1
-
+# AiPlayerbot.AhMarketTimeMin = 8
 # Demand-aware WSG/AB/AV queue participation for live Headless RNDBOTs. Default on.
 # Uses the native BattleGroundJoinAction/WorldSession handler path and the
 # copy-only BattleGroundMgr queued-participant snapshot from core #416. No
 # human-waiting queue means no bot queueing; otherwise bots match the observed
-# queue type/bracket and underrepresented team. Candidates are in-memory and
-# checked for level, alive/idle/not queued/not in a BG, no deserter/taxi, and no
+# queue type/bracket and fill BOTH sides up to the core's match minimum plus 1
+# (e.g. AV 15 + 1), counting humans and bots already waiting, so a solo human's
+# own side reaches the minimum too and no bot-only second match is left
+# behind. Human demand is checked every 5 s with up to 10 bots per check (5 per
+# side), so a match forms within seconds; the interval/budget below pace only
+# the autonomous seeder (budget 0 still turns both off). Candidates are
+# in-memory and checked for level, alive/idle/not queued/not in a BG, no deserter/taxi, and no
 # active human master. WSG/AB group joins require every member to be a
 # service-owned Headless bot; AV is always queued solo. Cadence is 5s..10m and
 # the per-interval budget is 0..10. No second queue/thread, DB scan, arena,
@@ -395,11 +605,16 @@ AiPlayerbot.AhMarketValueVendor = 1
 #AiPlayerbot.RandomBotBgEnabled = 1
 #AiPlayerbot.RandomBotBgQueueInterval = 30000
 #AiPlayerbot.RandomBotBgMaxQueuePerInterval = 1
-
-# Currently has NO effect: the key is read but nothing uses it (kept for
-# config compatibility). Bot activity is controlled by
-# AiPlayerbot.DisableActivityPriorities and AiPlayerbot.botActiveAlone below.
-# AiPlayerbot.DisableBotOptimizations = 0
+# Autonomous bot-only Warsong Gulch (default on). When no human waits in any
+# BG queue, seeds one 10v10 WSG in the most populated level bracket so pool
+# bots have matches of their own. Top-up batches accumulate until both sides
+# fill; a still-forming match keeps absorbing queued seeds, so only a full
+# instance stops new seeds. Capped at 1 concurrent full instance for an
+# average PC (20 bots on one map); clamped 0-2, raise to 2 only on a strong host.
+#AiPlayerbot.RandomBotBgAutonomous = 1
+#AiPlayerbot.RandomBotBgAutonomousMaxInstances = 1
+# Note: the seeder runs inside the backfill tick, so it also requires
+# AiPlayerbot.RandomBotBgEnabled = 1 (Autonomous=1 + BgEnabled=0 seeds nothing).
 
 # 1 = every bot's AI is always fully active (botActiveAlone is ignored).
 # 0 = activity priorities apply: bots near/visible to a player, in combat, in
@@ -438,9 +653,23 @@ AiPlayerbot.RandomGearLoweringChance = 0.15
 # Max iLVL Phase 1 = 71(MC, ONY, ZG) | Phase 2(BWL) = 77 | Phase 2.5(AQ) = 88 | Phase 3(NAXX) = 100 (NOT RECOMMENDED SINCE ILVL OVERLAPS BETWEEN TIERS)
 AiPlayerbot.RandomGearMaxLevel = 100
 
+# Owner rule (Oct 2026): generated gear is capped by the bot's own level too,
+# so a wandering pool bot never wears raid loot it could not have earned.
+# Generated item level <= bot level + this value, and never above
+# RandomGearMaxLevel. Default 1: a level-60 pool bot tops out at item level 61.
+# Fresh seeding and every later re-gear of a pool bot use it; gear a bot earns
+# itself (loot, quest rewards, vendor and auction buys) is not capped. 0 keeps
+# RandomGearMaxLevel alone.
+AiPlayerbot.RandomGearMaxItemLevelAboveLevel = 1
+
 # Max difference between bot level and item's required level to be used in randomisation
 # Default = 9, means bots level 60 can use items that require (themselves or via quests) level 51 and above
 AiPlayerbot.RandomGearMaxDiff = 9
+
+# Seed gear progressively by bot level instead of throwing the full band at once
+#AiPlayerbot.RandomGearProgression = 1
+# Upgrade pooled bots' gear as they level (from level 5, bots without a real master)
+#AiPlayerbot.RandomGearUpgradeEnabled = 1
 
 # Owner-rule source-tier cap for seeded/hired bot gear (roadmap #289: higher
 # tiers unlock later). 0 = base only (world drop, vendor, quest, allowed
@@ -469,12 +698,20 @@ AiPlayerbot.RandomGearTabardsChance = 0.1
 # Replace guild tabard with random one
 AiPlayerbot.RandomGearTabardsReplaceGuild = 0
 
-# Currently has no effect (read but unused).
-# Allow use tabards that have no vendors, quests or loot related to it
-AiPlayerbot.RandomGearTabardsUnobtainable = 0
-
-# Items listed here are never picked by random gear (seed/hire/upgrade).
+# Comma-separated item IDs that no auto-gear path hands out, e.g.
+# AiPlayerbot.RandomGearBlacklist = 12345,23456
+# Item IDs are on database.turtle-wow.org. Empty (default) means nothing is
+# blocked, and there is no separate on/off switch. The ban covers every
+# auto-gear path including .autogear, and wins over the whitelist below. A
+# pool or hired bot already wearing a blocked item gets it replaced or
+# removed on its next gear pass; real players and owned bots keep whatever
+# they wear, and items a bot finds itself (loot, quest rewards, auction
+# house) are unaffected.
 AiPlayerbot.RandomGearBlacklist =
+
+# Item ids always seeded on random gear regardless of the scoring rules below,
+# unless the id is also on the blacklist above.
+#AiPlayerbot.RandomGearWhitelist =
 
 # Roll need on items if slot is empty or broken, even if not appropriate for bot's spec
 # Bots without real player master ignore this config and always roll need in that case
@@ -503,21 +740,383 @@ AiPlayerbot.GenerateItemCaches = 1
 # Bots will mount up to catch up when far behind the master while following.
 # AiPlayerbot.BoostFollow = 0
 
+# Dungeon follow: hold before a pack (audit fix 127).
+# Inside a dungeon or raid, with nobody in combat, a bot whose leader is more
+# than 30 yd ahead walks the route to the leader itself and stops just outside
+# the aggro range of the first unpulled hostile creature on that route, instead
+# of walking past or through it. It whispers its master once per pack ("pack in
+# the way") and stands there; it does not eat or drink while it holds (it rests
+# through the normal out-of-combat flow once the hold ends). It walks on when
+# the pack is dead or gone or the route no longer passes it; when the leader
+# comes back within 25 yd the normal follow takes over. Off by default.
+# 0 - core follow, no pack check (Default)
+# 1 - hold before packs in dungeons and raids
+AiPlayerbot.DungeonFollowHoldBeforePacks = 0
+
+# Warlock pet by spec.
+# In PvE (open world and dungeons, not raids or PvP) a warlock summons the demon
+# that fits its talent tree instead of always the Voidwalker (mod-playerbots
+# parity, adapted to 1.12 which has no Felguard): Affliction and Demonology
+# use the Felhunter, falling back to the Succubus, Voidwalker and Imp by what
+# the warlock has learned; Destruction uses the Imp. A warlock whose group has
+# no tank keeps the Voidwalker. The pet is chosen when the warlock has none;
+# pool bots also swap a default demon they already have (needs a Soul Shard).
+# A pet a player ordered (a "pet <demon>" strategy, or a demon a player's own
+# bot already has) is never replaced. On by default.
+# 0 - Voidwalker whenever learned, Imp before that
+# 1 - pet that fits the spec (Default)
+AiPlayerbot.WarlockPetBySpec = 1
+
+# Rogue threat drops in dungeons.
+# In a grouped 5-man dungeon with a living tank in the fight, a rogue uses
+# Feint when its threat on the current target is medium (60 percent of the
+# tank's or more) and, if that is not enough, Vanish at critical threat (80
+# percent and climbing) so it does not pull the mob off the tank. Vanish is
+# only used while the mob is on the tank or the rogue; it is never used solo,
+# without a tank, or in the open world. Raid rogues already do this (Feint at
+# medium, Vanish at high) and are unchanged. The thresholds are the bots'
+# existing medium and high threat levels. On by default.
+# 0 - dungeon rogues do not shed threat
+# 1 - Feint on medium threat, Vanish on critical threat in 5-man dungeons (Default)
+AiPlayerbot.RogueDungeonThreatDrops = 1
+
+# Hunter Aspect of the Viper on low mana.
+# A hunter that has learned Aspect of the Viper (Turtle 1.18.1 spell 45651,
+# trainer level 56) switches to it in combat when its mana drops below 20
+# percent (fixed, not tied to AiPlayerbot.LowMana), and goes back to Aspect of
+# the Hawk once mana is at 60 percent or more (the 60 percent exit follows
+# mod-playerbots); between the two it keeps the aspect it has, so it does not
+# flip. An "aspect <name>" strategy a player set (hawk, monkey,
+# cheetah, pack, beast, wild) is never overridden, and a hunter running in
+# Cheetah or Pack is left alone. On by default; with 0 Viper stays a manual
+# action and the hunter keeps Hawk.
+# 0 - never switch to the Viper by itself
+# 1 - Viper on low mana, Hawk again at 60 percent mana (Default)
+AiPlayerbot.HunterViperOnLowMana = 1
+
+# Paladin Judgement upkeep.
+# In a group, paladin bots keep Judgement of Wisdom / Judgement of Light up on a
+# boss or elite (or, inside a dungeon or raid, on the mob the tank is fighting),
+# the way mod-playerbots does. A Retribution paladin owns
+# Wisdom, a Holy paladin owns Light; with two paladins of the same kind the
+# second one takes the other debuff, so two paladins never judge the same one,
+# and a third paladin owns none. A paladin in the tank role (Protection) never
+# owns a judgement; it keeps its own Seal. The owner swaps to the matching Seal and
+# judges when the debuff has 4 seconds left or is gone (a Seal and a Judgement
+# cost mana and a global each). A healing paladin only does this above 50% mana
+# and never while someone in the party needs healing; everyone needs at least
+# AiPlayerbot.MediumMana. Never solo, never on a target below 25% health. A
+# debuff another paladin (a player) keeps up is left alone. On by default.
+# 0 - paladins judge on their own rotation, no group debuff upkeep
+# 1 - keep Judgement of Wisdom / Light up on the boss (Default)
+AiPlayerbot.PaladinJudgementUpkeep = 1
+
+# Onyxia whelps and eggs.
+# In Onyxia's Lair, while Onyxia is airborne (phase 2), bots that are
+# AoE-capable ranged DPS (mage, warlock, hunter, and ranged shaman and druid
+# specs; never tanks or healers) take the nearest Onyxian Whelp as their target
+# and keep it until it dies, then return to the boss. Every bot in the fight
+# also steps back out of the egg caves west of the arena when it stands within
+# 12 yd of an unbroken Onyxia Egg (the egg trap circle is 10 yd and hatches
+# whelps). mod-playerbots parity, adapted to Turtle 1.18.1 entries. Only active
+# on map 249 and only once the Onyxia fight strategy is on. An explicit target
+# order from a player always wins. On by default.
+# 0 - generic target choice and no egg avoidance
+# 1 - whelp duty and egg avoidance (Default)
+AiPlayerbot.OnyxiaWhelpsAndEggs = 1
+
+# Work in progress. These features are not officially released and not supported yet. Enable them at your own risk.
+# Until the official release, bug reports and feedback about them are not handled through the issue tracker; contact Hypeer directly.
+# Dungeon boss tactics.
+# Per-boss rows from the world table ai_boss_tactic (map + boss entry) that bots
+# apply while they fight that boss: interrupt a listed spell, kill a listed add
+# before anything else (in a listed order), stay out of the boss's front during a
+# listed frontal attack. Built from Turtle's own core data; Uldaman up to
+# Ironaya and the Obsidian Sentinel so far (docs/play/boss-tactics.md).
+# This changes how bots play in dungeons, so it is off for everybody by default.
+# Bots of a bound group (a commander's or the run leader's) get the tactics regardless of
+# this key. An explicit target order from a player always wins.
+# 0 - off, except for commander-bound groups (Default)
+# 1 - on for every bot on a map that has rows
+AiPlayerbot.DungeonTactics = 0
+
+# Dungeon self-clear (the run leader).
+# `.bot run start [plan]` lets a bound party clear a dungeon plan (world tables
+# ai_dungeon_plan/leg/step) by itself: it walks the route, pulls the packs, kills
+# the bosses and opens the doors, and pauses on 3 dead, on any player order and
+# at every wait's ceiling. A player starts it for his own party (`.bot commander
+# bind <LeadBot> [<Bot>...] inparty`, then `.bot run start`), and the bot LFG
+# groups (AiPlayerbot.BotLfgGroups) start it for bot-only parties. Leading a
+# party from outside it also needs AiPlayerbot.RemoteCommander = 1
+# (docs/play/dungeon-run-leader.md).
+# `.reload config` reads this key and the AiPlayerbot.DungeonRun* keys below again
+# (only those; every other setting here needs a restart).
+# 0 - `.bot run` is refused
+# 1 - the run leader is on (Default)
+AiPlayerbot.DungeonSelfClear = 1
+
+# Bot LFG dungeon groups: online, idle world bots of one faction and of a proven
+# dungeon's level band (table ai_bot_lfg_plan; the band is the LFT addon's) form a
+# group of four, tank, healer and damage, with one role left open for a player.
+# While it waits it looks for that player in the LookingForGroup channel (AiPlayerbot.BotLfgChat).
+# When no player joins within AiPlayerbot.BotLfgFillAfterMinutes, a bot of the open
+# role joins. Getting the group to the dungeon is not built yet, so a full group
+# breaks up again after two minutes. A GameMaster watches and drives them with
+# `.bot run lfg list | form [plan] | fill <id> | disband <id>`; `.bot run system`
+# runs a bot-only party through a dungeon by hand.
+# Needs AiPlayerbot.DungeonSelfClear = 1 (with it off the server log says the
+# feature stays dormant). Does not need AiPlayerbot.RemoteCommander.
+# `.reload config` reads this key again.
+# 0 - off (Default)
+# 1 - on
+AiPlayerbot.BotLfgGroups = 0
+
+# Bot LFG groups: how long a group of four waits for a player before a bot takes
+# the open slot (minutes, 1-60). Only read while AiPlayerbot.BotLfgGroups = 1.
+# `.reload config` reads it again.
+# Default: 10
+AiPlayerbot.BotLfgFillAfterMinutes = 10
+
+# Bot LFG groups: how many groups exist at once per 100 bots online (0-20; 0 forms none by itself, a GameMaster still can). Only read while AiPlayerbot.BotLfgGroups = 1.
+# `.reload config` reads it again.
+# Default: 1
+AiPlayerbot.BotLfgGroupsPer100Bots = 1
+
+# Bot LFG groups: the most groups at once (0-20). Only read while AiPlayerbot.BotLfgGroups = 1.
+# `.reload config` reads it again.
+# Default: 5
+AiPlayerbot.BotLfgMaxGroups = 5
+
+# Bot LFG groups: groups form only while at least one real player is online. Only read while AiPlayerbot.BotLfgGroups = 1.
+# `.reload config` reads it again.
+# 0 - also on an empty server
+# 1 - only with a player online (Default)
+AiPlayerbot.BotLfgOnlyWithPlayersOnline = 1
+
+# Bot LFG groups: the leader of a group that waits for a player posts one line in
+# its faction's LookingForGroup channel (the dungeon, the open role, the level
+# band, "w me inv"), again every 3 minutes, never more than one post per 30 s per
+# faction across all groups, and only while a real player of that faction is
+# online. A real player who whispers the leader "inv" gets a party invite when his
+# faction, level and class fit the open role; other whispers get one short answer.
+# Not limited by AiPlayerbot.EnableBroadcasts. Only read while
+# AiPlayerbot.BotLfgGroups = 1. `.reload config` reads it again.
+# 0 - off
+# 1 - on (Default)
+AiPlayerbot.BotLfgChat = 1
+
+# The run leader's walk back after a guarded fight. When the tank left its stand
+# to take mobs off the party, the run used to walk the tank and the party back to
+# that stand after every fight, then forward again to the next pack or boss.
+# 0 - once the step's pack is cleared (or on a move step) the run goes on from
+#     where the tank stands; a pack with units left is still pulled from the
+#     stand, so the tank goes back to it first (Default)
+# 1 - walk back to the stand after every guarded fight, as before 2026-10-22
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunWalkBackAfterWonFight = 0
+
+# The run leader's retreat at two dead. In a fight with two members dead, the lead
+# bot alive and no engaged unit losing hp for 15 s, the living walk back to the
+# run's last stand (at most 40 yd away) once, for at most 20 s, before a third
+# death makes it a wipe. Never in a scripted event or against an event boss.
+# 0 - off: the party fights on as before (Default)
+# 1 - on
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunRetreatAt2Dead = 0
+
+# The run leader's rescue of a stuck walk back. A walk back whose lead bot is stuck
+# short of its point after its tries, and a placed run's lead bot revived behind
+# the run's start step, are teleported to a safe point on the run's way (out of
+# every live pack's reach), out of combat, once a step.
+# 0 - off: the stuck walk back pauses as before
+# 1 - on (Default)
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunWalkBackRescue = 1
+
+# The run leader's fight forward. After a won fight, the next pack within 30 yd
+# of the tank is pulled from where the tank stands instead of walking the plan's
+# rows back to its stand, when the navmesh path to it is direct, the tank sees it
+# and no live hostile stands by the way.
+# 0 - off: the plan's rows as before
+# 1 - on (Default)
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunFightForward = 1
+
+# The run leader's light rest lines. Before a small pull (or with no fight ahead)
+# the party rests only under 60 % health / 35 % healer mana / 25 % mana and to
+# 75 / 60 / 45; before a boss, an event or a big pull the full lines stay.
+# 0 - off: the full lines everywhere, as before
+# 1 - on (Default)
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunLightRest = 1
+
+# The run leader's time limit, in minutes from `.bot run start` (a pause counts).
+# At the limit the run ends and its status line says "time limit reached (3h)".
+# 0 - no limit
+# 180 - three hours (Default)
+AiPlayerbot.DungeonRunMaxMinutes = 180
+
+# The run leader's pull aggro estimate. Before each pack pull it works out how many
+# other creatures the pull would bring (the pack, creatures in aggro range of the
+# party, one ring of family assistance) and, when that is more than the ceiling
+# below, rests the party to its end lines once before it pulls (status note
+# "N joiners expected"). It adds no movement and never skips a pull.
+# 0 - off, the run leader pulls as before (Default)
+# 1 - on
+AiPlayerbot.DungeonRunAggroEstimate = 0
+
+# Joiners (creatures besides the pulled one) above which the estimate rests the party first.
+# 6 - default; 1 and up. Only read while AiPlayerbot.DungeonRunAggroEstimate = 1.
+AiPlayerbot.DungeonRunAggroCeiling = 6
+
+# The run leader's regroup after a death: how long it waits for a living priest,
+# paladin or shaman (a druid's Rebirth only when none of those lives) to raise the
+# fallen where they lie before `cmd revive party` sends them to the spirit healer.
+# 0 - a fixed 15 s wait when a priest, paladin or shaman is out of combat (Default)
+# 1 - the rez hold: up to 60 s (more for each extra body), a resurrector short of
+#     mana is waited for up to 90 s, bodies over 80 yd away are not waited for
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunRezHold = 0
+
+# The run leader's pull stand. A `pullback` goes out only when the tank can shoot
+# from where it stands: the target in its sight, within its ranged pull's range
+# less 5 yd, and the tank standing still (it is waited for up to 3 s). Otherwise
+# the party walks to a firing stand on the tank's navmesh path to the target
+# first (at most 2 stands per target and step), then the order goes out; a stand
+# walk that gets stuck gives the stand up, it never pauses the run. Only a pull with
+# a ranged weapon (bow, crossbow, gun, thrown, wand) is covered: a spell pull or a
+# body pull (no ranged weapon, skill or ammo) goes out as before.
+# The status note of each order names the target's guid and how its shot stood.
+# 0 - off, the run leader pulls as before (Default)
+# 1 - on
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunPullStand = 0
+
+# The run leader's loot step when the corpse's item is another member's under the group's loot
+# rules (round robin / group loot: the loot step is refused with "nothing this bot may loot",
+# e.g. Uldaman, Revelosh's Shaft of Tsol). With 1 the lead bot (it leads the bound group) sets
+# the loot method to free-for-all, the carrier loots the item, and the method goes back to
+# what it was; it also goes back when the run pauses or stops in between. Once per step. If the
+# lead bot does not lead the group or the order is refused, the step goes on as before (the
+# next bot is tried).
+# 0 - off, the run leader tries the other bots in turn as before (Default)
+# 1 - on
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunLootFfa = 0
+
+# Player-led runs (owner 2026-10-23). A player who leads his own party of bots
+# (up to three other players may be in it) starts `.bot run start [plan] player
+# [tank <Bot>]`: he walks wherever he wants, and the run leader pulls the plan's
+# packs near him with the tank bot, marks, crowd controls, rests and revives.
+# Plain `.bot run start` stays bot-led. Needs AiPlayerbot.DungeonSelfClear = 1.
+# 0 - `.bot run start ... player` is refused (Default)
+# 1 - a player who leads his party may start a player-led run
+AiPlayerbot.DungeonRunPlayerLed = 0
+
+# How close (yards, straight line) the leading player must stand to a plan pack
+# or boss for the player-led run to pull it.
+# 40 - default; 5 to 100. Only read while AiPlayerbot.DungeonRunPlayerLed = 1.
+AiPlayerbot.DungeonRunPlayerLedPullYd = 40
+
+# How long (minutes) the leading player of a player-led run may be out of the
+# plan's dungeon. Meanwhile the bots that stayed inside hold where they stand;
+# back in time, they follow him again and the run goes on. Past it the run
+# stops with a note and its binding ends (the bots keep holding).
+# 10 - default; 1 to 60. Only read while AiPlayerbot.DungeonRunPlayerLed = 1.
+AiPlayerbot.DungeonRunPlayerLedAwayMinutes = 10
+
+# Bot-only runs only: the run leader GIVES each needed dungeon item/key (the plan's
+# ai_dungeon_leg_need rows) to every bot of the party at the start, and TAKES it back
+# at the end, on stop, when a bot leaves, or when a real player joins. The warn/hold/skip
+# check (a key door warns and holds, a blocking item asks, an optional leg skips) is always on.
+# 1 - give the items to the bots (Default)
+# 0 - give nothing (blocking items refuse the start of a bot-only run instead)
+# Only read while AiPlayerbot.DungeonSelfClear = 1.
+AiPlayerbot.DungeonRunGiveItems = 1
+
+# When 1, bots also carry the needed dungeon keys/items in a party WITH real players and open
+# the doors for them (players skip the key content); 0 = players must bring their own key,
+# the bots stop at the door and ask. Only read while AiPlayerbot.DungeonSelfClear = 1.
+# 0 - players bring their own key, the bots stop at the door and ask (Default)
+# 1 - bots carry the keys and open the doors
+AiPlayerbot.DungeonRunBotKeysForPlayers = 0
+
+# Scripted area triggers for bots (an audited allowlist of trigger ids, off by default).
+# A bot has no game client, so it never tells the server it walked into an area
+# trigger, and a trigger script never ran for it: Zul'Farrak's Witch Doctor
+# Zum'rah, who only turns hostile through such a script, stayed friendly in
+# front of an all-bot party. A living bot in a group inside a dungeon (not a
+# raid) now runs the script of a listed trigger it walks into, once per entry,
+# as a player's client would - but only when its party is clearing on purpose:
+# bound to a remote commander (every run-leader run is), or with a human member
+# within 40 yd. A follower running ahead of its player cannot start an event
+# alone. Instance entrances and exits, taverns and battleground entrances never
+# fire, listed or not. Each bot checks its own map's listed triggers twice a
+# second (no world scan).
+# Not every trigger script is safe to start from a bot (at_ring_of_law starts
+# the Blackrock Depths arena, the UBRS stadium trigger starts that event,
+# at_shadowforge_bridge spawns guards), so read and document a trigger's script
+# in docs/server/settings/dungeons-raids.md before adding its id here.
+# Audited ids (set the key to these to opt in):
+#   962 - Zul'Farrak, at_zumrah: if Witch Doctor Zum'rah is alive within 30 yd,
+#         he turns hostile, yells, and his encounter is marked in progress
+#         (nothing else). Opt in with: AiPlayerbot.BotAreaTriggers = 962
+# Since fix/plan-gossip-allow a dungeon run did not need this list for its own
+# plan: a move or move_direct step whose `entry` names a trigger armed it for the
+# run's bots from that step on until it fired once for the run (Zul'Farrak's walk
+# into 962), and no other unlisted trigger. A refused script (at_zumrah with
+# Zum'rah farther than 30 yd) kept it armed and was tried again every 2 s while
+# the bot stood inside. A run started past that move step never armed it: when
+# the event had not happened, the run was started again from before the step.
+# Comma-separated trigger ids; empty (the default) turns the feature off.
+# New automation, so it is off by default.
+# Default: (empty)
+AiPlayerbot.BotAreaTriggers =
+
+# Keep out of creature auras.
+# Some creatures carry a permanent damaging aura that pulses around them even
+# while they are idle. With this on, every bot steps out when it is within 8 yd
+# (10 yd for Living Poison) of a listed creature (from its centre), its chase
+# and other moves keep 9 yd (11 yd) away, and a follower stops just outside that circle while its leader stands
+# in it; the ranged kill it. A melee DPS bot holding outside the circle on its
+# target switches target after 3 s and leaves that target alone for 30 s,
+# also when the tank fights it or it carries the bot's raid mark. Tanks are
+# exempt in combat from the sludge (they may hold mobs inside), not from
+# Living Poison. The creature the player
+# ordered the bot to attack is never avoided by that bot. Listed today:
+# Maraudon's Creeping Sludge (12222, aura 22638 Poison Shock, 5 yd every 2 s)
+# and Naxxramas' Living Poison (16027, no aura, not selectable, Explode 28433
+# within 5 yd, about 30k: tanks get no pass; bots keep out to 10 yd, paths to
+# 11 yd).
+# With it on, a non-tank bot without an attack order also does not Charge,
+# Intercept or Feral Charge onto a listed creature or onto a mob within 9 yd
+# of one, and its flank, set-behind and unstack moves never end in the ring.
+# On by default.
+# 0 - no keep-out; bots melee and walk past these creatures as before
+# 1 - stay out of listed creature auras (Default)
+AiPlayerbot.AvoidCreatureAuras = 1
+
+# Two taxi paths in the 1.18.1 client data have missing nodes, and a bot that
+# flies one crashes the world server: 355 (Shimmerstar Lake -> Valormok) and
+# 274 (an unused dev path). Bots never take them unless this is on.
+# Turn it on ONLY with a core that repairs them at startup (drops 274, rebuilds
+# 355 from its reverse path 356); the server log then shows "Taxi path 355 ...
+# rebuilt from reverse path 356". On a core without that repair it crashes.
+# 0 - bots skip the broken taxi paths (Default)
+# 1 - bots may fly the repaired paths (needs the core repair)
+AiPlayerbot.AllowRepairedTaxiPaths = 0
+
 # Bots and npcs turn to eachother during an rpg interaction
 AiPlayerbot.TurnInRpg = 0
 
 # Bots will make sounds when repairing, selling items ect.
 AiPlayerbot.GlobalSoundEffects = 0
 
-# Show progress bars for random bots (disabled by default)
+# Show progress bars for random bots (enabled by default)
 AiPlayerbot.ShowProgressBars = 1
 
 # Set randombots movement speed to walking anywhere
 AiPlayerbot.RandombotsWalkingRPG = 0
-
-# Currently has no effect (read but unused).
-# Set randombots movement speed to walking only inside buildings
-AiPlayerbot.RandombotsWalkingRPG.InDoors = 0
 
 # Bots greet real players passing by (text emote, once per encounter).
 # Bots never greet other bots: the pool is hundreds of them, so greetings only
@@ -533,30 +1132,18 @@ AiPlayerbot.GreetCooldown = 600
 # of greetings answers every visitor, so it is opt-in.
 AiPlayerbot.RandomBotGreet = 0
 
-# Show helmet and cloak on randombots (reset required)
+# Chance (0-1) that a bot in combat plays an attack emote
+#AiPlayerbot.AttackEmoteChance = 0.0
+
+# Pool bots share their attack targets with each other instead of each picking
+# their own
+#AiPlayerbot.ShareTargets = 1
+
+# Pool bots wear their helmet and cloak (1, default); 0 = they show up
+# bare-headed and bare-backed. Pool bots get the setting on their next login;
+# hired companions and a player's own characters keep their own setting.
 AiPlayerbot.RandomBotShowHelmet = 1
 AiPlayerbot.RandomBotShowCloak = 1
-
-# Disable random levels for randombots
-# Bots level up by killing mobs; nothing re-rolls their level afterwards.
-#
-# This is a bet on uptime, so choose deliberately:
-#
-#   0  Bots keep the level they were seeded with (level 1 by default, or
-#      RandomBotStartLevelMin/Max when set) and level up from there through
-#      normal gameplay while the realm is actually running.
-#
-#   1  Bots below randombotStartingLevel are brought up to it with GiveLevel,
-#      then level up normally from there. On a realm that runs continuously
-#      this produces a genuine level curve over a few weeks. On one that
-#      does not, bots stay near their seed level until gameplay advances them.
-#
-# Flipping this on a running realm does not reassign levels.
-AiPlayerbot.DisableRandomLevels = 0
-
-# Set randombots starting level here if "AiPlayerbot.DisableRandomLevels" enabled
-# Recommended: 5+
-AiPlayerbot.randombotStartingLevel = 1
 
 # Random starting level for freshly created pool bots, inclusive range.
 # Applied once per bot on its first login (played time == 0), before the
@@ -586,9 +1173,6 @@ AiPlayerbot.LevelCheck = 30
 # Spells that won't affect bots
 AiPlayerbot.ImmuneSpellIds = 19428
 
-# Quest that will be completed and rewarded to all random bots
-AiPlayerbot.RandomBotQuestIds = 7848,3802,5505,6502,7761,9378
-
 # Randombots will invite players to groups/raids/guilds. (This can also be disabled by turning on DnD on your character)
 # AiPlayerbot.RandomBotInvitePlayer = 1
 
@@ -611,6 +1195,39 @@ AiPlayerbot.InviteChat = 1
 # diagnosing bot lifecycle issues; off in production. The crash handler also
 # reads a thread-local "last phase" tag set by SC_PHASE when this is on.
 # AiPlayerbot.EnableActionLog = 0
+
+# Safeguards for the per-bot action log files (they once filled a disk: about
+# 8 GB a day, up to 176 MB for one bot). They apply only while EnableActionLog
+# is 1, except the cleanup, which also trims files an earlier run left behind.
+#
+# Which bots get a file:
+#   all        every bot, pool bots included (100+ files on a busy realm)
+#   commanded  only bots in a group a commander bound (.bot commander bind)
+#              and hired companions
+#   none       no files
+# A bot's answer is cached and looked up again every 15 seconds, so a bot that
+# was just bound or hired starts logging within that time.
+AiPlayerbot.ActionLogScope = commanded
+
+# Cleanup of logs/bots: at startup and then every hour (and early once the bots
+# wrote a quarter of the size limit since the last one) the oldest files are
+# deleted until both limits hold. Only files named like the ones this log
+# writes (<bot>_acc<id>_<date>-<time>.log) are ever listed or deleted, never a
+# link, a folder or any other file. A file a bot has open is never deleted. One
+# summary line is written to the server log per cleanup. 0 turns a limit off.
+AiPlayerbot.ActionLogMaxAgeDays = 3
+AiPlayerbot.ActionLogMaxTotalMB = 2048
+
+# One bot's file is closed with a note when it would pass this size, and the log
+# goes on in a new file (the cleanup above removes the old ones). 0 = no cap.
+AiPlayerbot.ActionLogMaxFileMB = 100
+
+# Aggregate counter of executed bot actions for live measurement on large
+# realms: every 5 minutes a cumulative snapshot (utc_time,class,action,
+# ok_count,fail_count) is appended to logs/action_counts.csv. Off in
+# production; turn on for a measurement window, then diff two snapshots with
+# tools/action_counts_report.py to see the top actions per class.
+AiPlayerbot.ActionCountsLog = 0
 
 # Redirect all bot subsystem log output to a dedicated file so the main
 # server.log stays clean. Path is relative to the server's LogsDir setting.
@@ -637,6 +1254,9 @@ AiPlayerbot.BotLogFile =
 # the bot walks or uses a meeting stone or innkeeper. .bot summon is not affected.
 # AiPlayerbot.NonGmFreeSummon = 0
 
+# Bots may also use the innkeeper "summon me" path when resolving a summon order
+#AiPlayerbot.SummonAtInnkeepersEnabled = 1
+
 # Bots will put their talentspec in guild notes when they change/tell their talents if they have the rights.
 # AiPlayerbot.TalentsInPublicNote = 0
 
@@ -648,6 +1268,15 @@ AiPlayerbot.BotLogFile =
 # Broadcast rates
 #
 # 1 - to enable broadcasts globally, 0 - to disable (default 1)
+#
+# 0 silences what the bots say on their own: the quest/loot/kill/level-up/suggest
+# broadcasts, the /say and /yell chatter, guild and world channel messages, the
+# recruitment and invite lines, the flavour text of an emote and the scripted
+# battleground callouts.
+#
+# Whispers, party and raid chat, the answer to a player who ordered the bot
+# (speak, a reply to the bot's own master) and the TortoiseBotsManager addon
+# protocol are not broadcasts and stay.
 AiPlayerbot.EnableBroadcasts = 1
 #
 # all broadcast chances should be in range 0-30000
@@ -746,27 +1375,28 @@ AiPlayerbot.RandomBotSayWithoutMaster = 0
 # Minimum level at which bots will start accepting duels
 # AiPlayerbot.BotAcceptDuelMinimumLevel = 10
 
-# Currently has no effect (read but unused).
-# Speeds up respawn of mobs after being killed by a bot. This only affects the delays after being fully looted.
-# AiPlayerbot.RespawnModNeutral = 10.0    # Each nearby player will decrease the respawn time by 10% for neutral mobs.
-# AiPlayerbot.RespawnModHostile = 5.0     # Each nearby player will decrease the respawn time by 5% for hostile mobs.
-# AiPlayerbot.RespawnModThreshold = 10    # Atleast 10 players (including the bot) needs to be near the bot before respawns are modified.
-# AiPlayerbot.RespawnModMax = 18          # After the threshold it will decrease the respawn for up to 18 nearby players max.
-# AiPlayerbot.RespawnModForPlayerBots = 0 # Bots with a player master are not affected.
-# AiPlayerbot.RespawnModForInstances = 0  # Mobs inside instances are not affected.
-
 # Automation
 
-# Bots pick their quest reward (yes = picks first useful item, no = list all rewards, ask = pick useful item and lists if multiple)
+# How alt bots pick a quest reward when the quest offers a choice (other bots always pick themselves):
+#   yes = always pick the best item themselves
+#   no  = always list every reward and wait for you to choose with: r [item]
+#   ask = take the reward themselves when only one is useful to them; list the useful ones and wait
+#         for r [item] only when more than one is useful. So in one party some bots ask and some don't.
 AiPlayerbot.AutoPickReward = yes
 
 # Bots equip upgrades (Bots will equip any item obtained from looting or a quest if they are upgrades)
 # Default: 0 (disabled)
 AiPlayerbot.AutoEquipUpgradeLoot = 1
 
+# An upgrade must beat the old item's stat weight by this factor to count (mod-playerbots parity, default 1.1: a +10% win swaps, an epsilon gain does not). 1.0 restores any-gain swaps.
+AiPlayerbot.EquipUpgradeThreshold = 1.1
+
 # Sync quests with player (Bots will complete quests the moment you hand them in. Bots will ignore looting quest items.)
 # Default: 0 (disabled)
 AiPlayerbot.SyncQuestWithPlayer = 0
+
+# Bot completes its own quests the moment the real player hands the shared quest in
+#AiPlayerbot.SyncQuestForPlayer = 0
 
 # Bot automatically trains spells when talking to trainer (yes = train all available spells as long as the bot has the money, free = auto trains with no money cost, no = only list spells)
 AiPlayerbot.AutoTrainSpells = yes
@@ -1213,6 +1843,19 @@ AiPlayerbot.PremadeSpecLink.7.2.45 = 551331350203212
 AiPlayerbot.PremadeSpecLink.7.2.50 = 5513313502032125
 AiPlayerbot.PremadeSpecLink.7.2.55 = 55133135020321251--4
 AiPlayerbot.PremadeSpecLink.7.2.60 = 55133135020321251--54
+AiPlayerbot.PremadeSpecName.7.3 = tank
+AiPlayerbot.PremadeSpecProb.7.3 = 16
+AiPlayerbot.PremadeSpecLink.7.3.10 = -1
+AiPlayerbot.PremadeSpecLink.7.3.15 = -50001
+AiPlayerbot.PremadeSpecLink.7.3.20 = -50023001
+AiPlayerbot.PremadeSpecLink.7.3.25 = -50033001301
+AiPlayerbot.PremadeSpecLink.7.3.30 = -5015300130201
+AiPlayerbot.PremadeSpecLink.7.3.35 = 2-50153001302031
+AiPlayerbot.PremadeSpecLink.7.3.40 = 5002-50153001302031
+AiPlayerbot.PremadeSpecLink.7.3.45 = 500231-50253001302031
+AiPlayerbot.PremadeSpecLink.7.3.50 = 500231-502530013020315
+AiPlayerbot.PremadeSpecLink.7.3.55 = 500231-502530013520315
+AiPlayerbot.PremadeSpecLink.7.3.60 = 5003313-5025300135203151
 
 
 # --- class 8 ---
@@ -1409,25 +2052,67 @@ AiPlayerbot.PremadeSpecLink.11.2.60 = 5002012--5050013355213521
 # Prefix for bot chat commands (e.g. follow, stay)
 #AiPlayerbot.CommandPrefix =
 
+# Separator between several bot commands in one chat message
+#AiPlayerbot.CommandSeparator = \\
+
 # Max AI iterations per tick
 #AiPlayerbot.IterationsPerTick = 100
 
 # Per-tick AI pass scheduling for a large random pool (party-bot latency).
 # Bots owned by a real player — module-owned records and every bot bound to a
 # master — are always updated first, every tick, with no budget. The random
-# pool runs after them in a round-robin order that resumes where the previous
-# tick stopped, so a bot that misses a pass is served on a later one, never
-# dropped.
-#   PoolTickBudgetUs: microseconds of module work per tick for the pool pass.
-#       0 = no budget at all (the pool always gets the full pass).
+# pool runs after them as one turn queue: after each turn a bot is due again
+# when its AI asked to think next, never later than its situation allows
+# (combat 400 ms, dead or battleground 1 s, teleport 100 ms, else 3 s), and a
+# change of situation makes it due at once. Due bots run most overdue first
+# relative to that cap until the budget is spent, so nobody is dropped.
+#   PoolTickBudgetUs: microseconds of module work per tick for the pool turn
+#       queue, added to CombatTickBudgetUs (the two make one budget).
+#       0 = no budget at all (every due bot runs).
 #       Values below 1000 are raised to 1000; 100000 is the ceiling.
 #   PoolBudgetWhenTickOverMs: the budget only engages while the previous world
-#       tick ran longer than this, so a healthy server (small pool) keeps the
-#       unchanged full pass. 0 = budget on every tick.
+#       tick ran longer than this. 0 = budget on every tick (the default: with
+#       the self-tuning budget below, a healthy server reclaims the full
+#       ceiling on its own, so there is no need to gate behind slow ticks).
+#   CombatTickBudgetUs: the second half of the same budget (it once fed a
+#       separate combat pass; kept so existing configs keep their total).
+#       0 = no budget at all. Default is 15000 (15 ms).
+#   TargetWorldTickMs: self-tuning tick budget. Each tick the controller moves
+#       the effective pool/combat budgets from the measured previous world
+#       tick so the tick stays near this target: over it the budgets shrink
+#       fast (x0.7/tick), at or under it they creep back (+1 ms/tick),
+#       shrinking only above target + 10 ms, and only when cutting the
+#       pool can bring the tick back: if the core (everything outside the
+#       pool turns) alone keeps the tick over, the budgets hold instead of
+#       making bots late for nothing. No hardware detection, just
+#       feedback on tick time — a fast desktop keeps the full configured
+#       ceilings, a weak machine backs off on its own. 0 = off (static
+#       ceilings; also set PoolBudgetWhenTickOverMs=150 to restore the old
+#       gate). Default is 100: player lag stays well under ~200 ms while a
+#       large pool keeps its bots moving. Lower it (e.g. 50) for snappier
+#       ping at the cost of slower bot turns on a busy server; a target
+#       below what the core alone takes has no effect. If the server cannot
+#       hold even 100, run fewer bots.
 # The pass cost and whether the budget cut a pass are reported by the
 # "TortoiseBots: BOTPERF ..." log line every ~30 s (LogLevel 1 or higher).
 AiPlayerbot.PoolTickBudgetUs = 10000
-AiPlayerbot.PoolBudgetWhenTickOverMs = 150
+AiPlayerbot.PoolBudgetWhenTickOverMs = 0
+AiPlayerbot.CombatTickBudgetUs = 15000
+AiPlayerbot.TargetWorldTickMs = 100
+
+# Value cache refresh (performance experiment, off by default).
+# A cached AI value with a check interval of N seconds has always refreshed
+# every N/2 seconds (whole seconds, rounded down), so it recalculates about
+# twice as often as its interval says. 1 = refresh after the full interval
+# instead. Values with interval 0 or 1 (health, mana, auras, targets,
+# inventory, ...) still recalculate on every read, and the values that sense
+# the fight (attackers and their counts, aggro, possible targets, traps and
+# void zones, boss target, AoE heal, enemy players), the free-move values
+# (free move center/range, can free move: followers restart when the master
+# runs off) and grind target keep the old rule.
+# Everything else (travel, quest, vendor, group, ...) may react
+# up to twice as late. Off until an A/B run shows the gain is worth it.
+AiPlayerbot.ValueRefreshAtInterval = 0
 
 # Bounded failure backoff for autonomous background work (issue #84).
 # Repeated failures wait base, 2x, 4x, 8x, 16x up to the max before the
@@ -1436,14 +2121,7 @@ AiPlayerbot.PoolBudgetWhenTickOverMs = 150
 #AiPlayerbot.FailedActionRetryBase = 250
 #AiPlayerbot.FailedActionRetryMax = 2000
 #AiPlayerbot.FailedActionCacheTtl = 30000
-# Currently has no effect (read but unused).
-# Allow/deny bots from your guild
-AiPlayerbot.AllowGuildBots = 1
-
-# Currently has no effect (read but unused).
-# Allow/deny bots from other player accounts (must have AiPlayerbot.AllowGuildBots activated and character on same guild)
-AiPlayerbot.AllowMultiAccountAltBots = 1
-
+#AiPlayerbot.FailedActionCacheMaxEntries = 64
 # Delay between two short-time spells cast (Default 500)
 AiPlayerbot.GlobalCooldown = 1500
 
@@ -1465,19 +2143,29 @@ AiPlayerbot.SitDelay = 20000
 
 AiPlayerbot.LootDelayDelay = 1000
 
-# Distances
+# A queued action basket expires after this many ms
+#AiPlayerbot.ExpireActionTime = 5000
+# Dispel is skipped for auras with less than this many ms left
+#AiPlayerbot.DispelAuraDuration = 2000
+# Delay between flee/return attempts after a failed move home
+#AiPlayerbot.ReturnDelay = 7000
+
+#Distances
 AiPlayerbot.SightDistance = 60.0
 AiPlayerbot.SpellDistance = 26.0
 AiPlayerbot.ShootDistance = 26.0
 #AiPlayerbot.ReactDistance = 150.0
+#AiPlayerbot.FarDistance = 20.0
+#AiPlayerbot.AggroDistance = 22.0
+#AiPlayerbot.WalkDistance = 5.0
+#AiPlayerbot.WanderMinDistance = 5.0
+#AiPlayerbot.WanderMaxDistance = 50.0
+#AiPlayerbot.TargetPosRecalcDistance = 0.1
 #AiPlayerbot.GrindDistance = 75.0
 #overall loot distance
 #AiPlayerbot.LootDistance = 25.0
 #loot distance when bot is a group member (not leader)
 #AiPlayerbot.GroupMemberLootDistance = 15.0
-#loot distance when bot is a group member (not leader) and has active player master (if player is group leader)
-# Currently has no effect (read but unused).
-#AiPlayerbot.GroupMemberLootDistanceWithActiveMaster = 10.0
 #overall gathering distance
 #AiPlayerbot.GatheringDistance = 15.0
 #gathering distance when bot is a group member (not leader)
@@ -1500,20 +2188,32 @@ AiPlayerbot.RpgDistance = 200
 #AiPlayerbot.EatDrinkMaxDistance = 1000.0
 
 
-# Currently has no effect (read but unused).
-# Max distance bot allowed to roam freely around master
-#AiPlayerbot.MaxFreeMoveDistance = 150.0
-
-# Currently has no effect (read but unused).
-# Delay (in seconds) after master inactivity after which bots will start roaming freely around master
-# Set to 0 to disable (bots will not be going places on their own when you are idle)
-#AiPlayerbot.FreeMoveDelay = 30.0
-
 # Bot can flee for enemy
 AiPlayerbot.FleeingEnabled = 1
 
-# Universal raid survival (issue #201): bomb carriers run BombRunoutDistance
-# clear of the raid anchor; spread/flank steps use HazardEvasionDistance.
+# Pool warriors and rogues hold their ground (opt-in). 1 = pool and free bots
+# of these two classes get no generic "flee" combat strategy, so they no longer
+# break off on panic (critical health, no mana gate for rage/energy),
+# outnumbered or critical health: they fight on with their own defensive kit,
+# like mod-playerbots melee. 0 = unchanged flee. Bots with a real player
+# master never get this flee anyway. Takes effect after a server restart.
+#AiPlayerbot.PoolMeleeHoldGround = 0
+
+# Alt-bots (issue #872, opt-in). 1 = an alt you brought in with `.bot add`
+# keeps playing on its own when you kick it from your party (or the party
+# breaks up): it quests, grinds and travels like a pool bot, with protections
+# for your gear, gold and talents, and takes one pool bot's slot while it is
+# out. `.bot remove`, `.bot add` again or logging in on the alt ends it.
+# Hardcore characters are refused. 0 = a kicked alt stays your companion.
+#AiPlayerbot.AltBots = 0
+
+# 1 = alt-bots log out when their owner logs out. 0 = they keep playing until
+# `.bot remove` (or a server restart; they do not come back after one).
+#AiPlayerbot.AltBotsLogoutWithOwner = 0
+
+# Universal raid survival (issue #201): bomb carriers run away from the
+# raid's centre until no group member is within BombRunoutDistance, then
+# stop; spread/flank steps use HazardEvasionDistance.
 #AiPlayerbot.BombRunoutDistance = 30.0
 #AiPlayerbot.HazardEvasionDistance = 12.0
 
@@ -1537,8 +2237,33 @@ AiPlayerbot.EnableCustomRaidTactics = 1
 #AiPlayerbot.PullDpsJoinDelay = 10
 #AiPlayerbot.PullBackDpsJoinDelay = 5
 #AiPlayerbot.PullBackMaxReturnTime = 15
+
+# Ranged opening for commanded pulls (".bot action pull|pullback", ".bot cmd
+# pull|pullback"). A plain pull walks the tank in; with RangedPull = 1 the tank
+# shoots instead (gun, bow, crossbow, thrown weapon with its ammo; a hunter or
+# caster uses its pull spell) when the mob is in sight and in shot range and
+# either no path leads to it (a ledge) or it is farther than
+# RangedPullMeleeApproach yards (walking in would meet the next pack). The order
+# word `ranged` (".bot action pull 10 ranged") asks for it on any pull and is
+# honoured whatever this says. A pullback always opens from range. A tank
+# without the weapon or ammo walks in and the answer says why. Commanded pulls
+# only: the tank's own automatic pulls are unchanged.
+#AiPlayerbot.RangedPull = 1
+#AiPlayerbot.RangedPullMeleeApproach = 20
 # Random bot default strategies (applied after defaults)
-AiPlayerbot.RandomBotCombatStrategies = +dps,+dps assist,-threat
+# Note: non-tank bots grouped with a real-player master (outside BGs) get `threat` added back
+# after this list, so `-threat` here only affects masterless pool bots.
+# No "+dps" here: for a priest "dps" is the Shadow spec strategy, and adding it
+# swaps a Holy or Discipline pool priest onto the Shadow rotation in combat
+# (no Mind Flay or Shadowform talents, so it fills with Smite). The spec
+# defaults already give pool healers off-spec damage through "offdps".
+# A bot whose spec defaults chose "tank assist" (Protection warrior/paladin,
+# bear) keeps it: "+dps assist" here no longer swaps a tank's sibling out.
+AiPlayerbot.RandomBotCombatStrategies = +dps assist,-threat
+# Inside a dungeon or raid the non-combat list skips +grind, +travel, +tfish, +rpg,
+# +rpg craft and +wander, so a pool bot in a party keeps its follow leash there.
+# Zoning in drops those strategies too; leaving gives back only what was dropped
+# (never +wander next to follow), so a strategy you turned off stays off.
 AiPlayerbot.RandomBotNonCombatStrategies = +grind,+loot,+custom::say,+tfish,+wander,+rpg craft
 #AiPlayerbot.RandomBotReactStrategies =
 #AiPlayerbot.RandomBotDeadStrategies =
@@ -1563,9 +2288,24 @@ AiPlayerbot.CombatStrategies = ""
 # PvP Restricted Zones (bots don't pvp)
 #AiPlayerbot.PvpProhibitedZoneIds = 2255,656,2361,2362,2363,976,35,2268,3425,392,541,1446,3828,3712,3738,3565,3539,3623,4152,3988,4658,4284,4418,4436,4275,4323
 
+# Pool bots turn on the same PvP preference /pvp sets at every login, so players can attack them anywhere (1).
+# 0 = no bot sets /pvp. Owned and hired bots are never affected.
+AiPlayerbot.RandomBotForcePvp = 1
+
+# Open-world PvP seeking for free pool bots. 0 = off, 1 = seek real players only, 2 = seek players and enemy bots.
+# An unflagged player is never attacked. Owned/hired bots and bots grouped with a real player never seek.
+AiPlayerbot.WorldPvpSeek = 2
+
+# Share of free pool bots that hold the "world pvp" seek role (0-100).
+#AiPlayerbot.WorldPvpSeekBotPercent = 25
+
+# Minutes between re-rolls of the seek role (with jitter), never while the bot is in combat.
+#AiPlayerbot.WorldPvpSeekRerollMinutes = 30
+
 # Spells every random bot will learn on randomize. Keep this list limited to
-# spells present in the Vanilla/Tortoise data set.
-#AiPlayerbot.RandomBotSpellIds = 1
+# spells present in the Vanilla/Tortoise data set. Empty by default (disabled);
+# a value is a comma separated spell id list, e.g. 3273,8386.
+# AiPlayerbot.RandomBotSpellIds =
 
 
 #AiPlayerbot.OpenGoSpell = 6477
@@ -1573,14 +2313,16 @@ AiPlayerbot.CombatStrategies = ""
 # Intervals
 AiPlayerbot.RandomBotUpdateInterval = 500
 AiPlayerbot.RandomBotsMaxLoginsPerInterval = 30
-#AiPlayerbot.MinRandomBotInWorldTime = 1800
 #AiPlayerbot.MaxRandomBotInWorldTime = 21600
 # A pool bot below level 60 that earns no XP for this many minutes is
 # relogged (a relog clears whatever left it idle). 0 = off.
 #AiPlayerbot.RandomBotStallRelogMinutes = 45
 #AiPlayerbot.MinRandomBotRandomizeTime = 21600
 #AiPlayerbot.MaxRandomBotRandomizeTime = 86400
-#AiPlayerbot.MinRandomBotsPriceChangeInterval = 7200
+# Legacy alias read only when AiPlayerbot.MaxRandomBotRandomizeTime is unset.
+#AiPlayerbot.MaxRandomRandomizeTime = 86400
+#AiPlayerbot.MinRandomBotChangeStrategyTime = 1800
+#AiPlayerbot.MaxRandomBotChangeStrategyTime = 7200
 #AiPlayerbot.MaxRandomBotsPriceChangeInterval = 172800
 
 #######################################
@@ -1591,15 +2333,15 @@ AiPlayerbot.RandomBotsMaxLoginsPerInterval = 30
 # Disabled by default for performance concerns, but you REALLY want to enable it for nicer logic
 # AiPlayerbot.ShouldQueryAHListingsOutsideOfAH = 1
 #
-# List of item ids which bot will prefer to put to AH rather than selling to vendor (these are overrides)
-# For example if you want bots to put certain gray/white armor pieces to AH rather than selling to vendor
-# this list has priority over AiPlayerbot.VendorOverAHItemIds
-# AiPlayerbot.AhOverVendorItemIds = 1,2,3
+# List of item ids which bot will prefer to put to AH rather than selling to vendor (these are overrides).
+# This list has priority over AiPlayerbot.VendorOverAHItemIds.
+# Empty by default (disabled); a value is a comma separated item id list.
+# AiPlayerbot.AhOverVendorItemIds =
 #
 # List of item ids which bot will prefer to sell to vendor rather than selling to AH (these are overrides)
-# (Bot will never buy these items from vendor to resell at AH as well)
-# For example if you do not want to see certain items on AH
-# AiPlayerbot.VendorOverAHItemIds = 1,2,3
+# (Bot will never buy these items from vendor to resell at AH as well).
+# Empty by default (disabled); a value is a comma separated item id list.
+# AiPlayerbot.VendorOverAHItemIds =
 #
 # (0-1) Whether bot should check ALL auction house listings when browsing (by default only checks a small amount)
 # AiPlayerbot.BotCheckAllAuctionListings = 0
@@ -1623,10 +2365,18 @@ AiPlayerbot.JumpInPlaceChance = 0.50
 AiPlayerbot.JumpBackwardChance = 0.10
 # Jumping height limit
 AiPlayerbot.JumpHeightLimit = 60
+# Vertical jump speed
+#AiPlayerbot.JumpVSpeed = 7.96
+# Horizontal jump speed
+#AiPlayerbot.JumpHSpeed = 7.0
 # Add rpg jump strategy if bot is with real player
 AiPlayerbot.JumpWithPlayer = 0
 # Add rpg jump strategy in BG
 AiPlayerbot.JumpInBg = 0
+# Hold the ready-check confirm until buffs settle (grace) or a 30 s cap fires,
+# instead of answering ready and buffing through the pull. Off by default;
+# the readiness text report is immediate either way.
+AiPlayerbot.ForceRebuffOnReadyCheck = 0
 
 # Use jump if can not find a proper path to follow, if possible
 AiPlayerbot.JumpFollow = 1
@@ -1637,13 +2387,17 @@ AiPlayerbot.JumpChase = 1
 AiPlayerbot.UseKnockback = 1
 
 # Set 'wander' as a default following strategy instead of 'follow' (Bots have freedom to move around while near master)
+# Applies to bots without a real-player master; a bot whose master is a real player always rebuilds with 'follow'
 #AiPlayerbot.UseWanderAsDefaultFollowStrategy = 1
 
 # Default bot formation
-#AiPlayerbot.DefaultFormation = near
+#AiPlayerbot.DefaultFormation = chaos
 
 # Debug switches
 #AiPlayerbot.SpellDump = 0
+# Unrelated to ActionLogScope: this keeps the engine's per-action detail lines
+# (server log at detail level, and their copy in the action log) to bots that
+# are in a group. Its value 1 is what runs when the line is left out.
 #AiPlayerbot.LogInGroupOnly = 1
 #AiPlayerbot.LogValuesPerTick = 0
 #AiPlayerbot.RandomChangeMultiplier = 1
@@ -1656,10 +2410,6 @@ AiPlayerbot.PerfMonEnabled = 0
 #                                 !!EXPERIMENTAL!!                               #
 #                                                                                #
 ##################################################################################
-
-# Currently has no effect (read but unused).
-# Instant randomize: Force randombots to randomize on initial login.
-# AiPlayerbot.InstantRandomize = 0
 
 # Bot cheats. Same as "/w <bot> cheat (+/-/?) <cheatcode>" but only globally for all bots.
 # Values: taxi            (all nodes learned)
@@ -1685,28 +2435,30 @@ AiPlayerbot.RndBotCheats = repair,breath,item
 # AiPlayerbot.SelfBotLevel = 1
 
 # Account/character names that are either, always online as bot (SelfBotLevel < 4) or prevented from being always online as bot (SelfBotLevel = 4)
-# When AiPlayerbot.BotAutologin is set to 2 these characters only log in on player (on the same account) logs in.
 # AiPlayerbot.ToggleAlwaysOnlineAccounts =
 # AiPlayerbot.ToggleAlwaysOnlineChars =
 
 
 # Allowed log files. See SPP_MAP for more information
 # https://github.com/mostlikely4r/spp-map
-# Opt-in diagnostics: travel_route_gate.csv (rejected travel routes), ghost_moves.csv (dead bots walking to their corpse).
+# On by default so a bug report can carry them: bot_events.csv (bot decisions), deaths.csv (bot deaths and killers).
+# Opt-in diagnostics: travel_route_gate.csv (rejected travel routes), ghost_moves.csv (dead bots walking to their corpse), pvp_seek.csv (open-world PvP seek grants and engagements).
+# To turn the bot CSV logs off, leave this list empty (AiPlayerbot.AllowedLogFiles =). The dashboard does not need
+# these files: it is fed over UDP by the observability emitter, so activity, deaths and kills keep flowing.
 AiPlayerbot.AllowedLogFiles = bot_events.csv,deaths.csv
+
+# Opt-in engaged raid boss threat snapshots (2 s) and spell-damage packet observations.
+# Requires bot_events.csv above. Hit health is a sample/estimate, not exact post-hit health.
+AiPlayerbot.RaidBossDiagnostics = 0
+
+# Days of bot logs to keep. The live file is plain text; every hour and at server start it is packed into
+# <name>_<date>_<time>.csv.gz next to it (named after the time it was closed), and packs older than this
+# are deleted. 0 = never delete. Only files listed in AiPlayerbot.AllowedLogFiles above are written, so
+# leaving that list empty stops the log files (and their packs) entirely.
+AiPlayerbot.LogRetentionDays = 3
 
 # Filters certain actions from showing up in 'nc +debug' and 'nc +debug action'
 # AiPlayerbot.DebugFilter = add gathering loot,check values,emote,check mount state,jump
-
-# Currently has no effect (read but unused).
-# Random password: Randombot accounts get created with a randompassword instead of equal to their account name.
-# AiPlayerbot.RandomBotRandomPassword = 1
-
-
-# Currently has no effect (read but unused).
-# Diff with/without player in server. The server will tune bot activity to reach the desired server tick speed (in ms).
-# AiPlayerbot.DiffWithPlayer = 100
-# AiPlayerbot.DiffEmpty = 200
 
 # LLM values. These values are for noncombat strategy 'ai chat' which allows bots to reply using a LLM api.
 # For a quickstart download koboldcpp, a 7b model from huggingface and start kobold.
@@ -1716,9 +2468,6 @@ AiPlayerbot.AllowedLogFiles = bot_events.csv,deaths.csv
 # AiPlayerbot.LLMEnabled = 0
 # The api endpoint that should be called for chat generation.
 # AiPlayerbot.LLMApiEndpoint = http://127.0.0.1:5001/api/v1/generate
-# Currently has no effect (read but unused).
-# The api key needed to access the endpoint.
-# AiPlayerbot.LLMApiKey =
 # The default json to send to the endpoint.
 # AiPlayerbot.LLMApiJson = {"max_length": 100, "prompt": "[<pre prompt>]<context> <prompt> <post prompt>"}
 
@@ -1734,7 +2483,7 @@ AiPlayerbot.AllowedLogFiles = bot_events.csv,deaths.csv
 # The prompt part containing the last message from the player the bot is responding to.
 # AiPlayerbot.LLMPrompt = <receiver name>:<initial message>
 # The default prompt to send at the end of each conversation.
-# AiPlayerbot.LLMPostPrompt = <bot name>:
+# AiPlayerbot.LLMPostPrompt = <sender name>:
 
 # The prompt used for rpg chat with npc's
 # AiPlayerbot.LLMRpgPrompt = In Vanilla/Tortoise WoW in <bot zone> <bot subzone> stands <bot type> <bot name> a level <bot level> <bot gender> <bot race> <bot class>. Standing nearby is <unit type> <unit name> <unit subname> a level <unit level> <unit gender> <unit race> <unit faction> <unit class>. Answer as a roleplaying character. Limit responses to 100 characters.
@@ -1777,13 +2526,8 @@ AiPlayerbot.LLMDefaultPromptsFile = llm_character_card.txt
 
 # OPEN-AI (chat completions) example:
 # AiPlayerbot.LLMApiEndpoint = http://IP/URL:PORT/v1/chat/completions
-# AiPlayerbot.LLMApiKey = YOUR_API_KEY
 # AiPlayerbot.LLMApiJson = {"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "<pre prompt> <context>"},{"role": "user", "content": "<prompt>"}],"max_tokens": 60}
 # AiPlayerbot.LLMResponseStartPattern = ("content":\s*")
-
-# Currently has no effect (read but unused).
-# Mystery config value. Currently enables async bot pathfinding. Rarely crashes the server.
-# AiPlayerbot.TweakValue = 0
 
 ##################################################################################
 #                                                                                #
@@ -5506,7 +6250,7 @@ AiPlayerbot.HealDistance = 30
 AiPlayerbot.HealDistanceBg = 25
 
 # Travel/terrain lookups run inline on the world thread when disabled (safe).
-# Cores whose MMapManager does not support concurrent tile loading (e.g. Penqle /
+# Cores whose MMapManager does not support concurrent tile loading (e.g.
 # vmangos) MUST keep this at 0 to avoid a worker-thread SIGSEGV; set 1 only on
 # cores with concurrent terrain support.
 # AiPlayerbot.AsyncTravelPartitions = 0

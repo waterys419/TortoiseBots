@@ -50,13 +50,17 @@ void EnhancementShamanStrategy::InitCombatTriggers(std::list<TriggerNode*>& trig
 {
     ShamanStrategy::InitCombatTriggers(triggers);
 
+    // Stormstrike first: the nature-vulnerability debuff amplifies everything
+    // after it, so it outranks the shield-consuming lightning strike even
+    // though both sit in the NORMAL band (donor EnhancementShaman orders
+    // stormstrike top of its default chain the same way).
     triggers.push_back(new TriggerNode(
         "stormstrike",
-        NextAction::array(0, new NextAction("stormstrike", ACTION_NORMAL + 1), NULL)));
+        NextAction::array(0, new NextAction("stormstrike", ACTION_NORMAL + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "lightning strike",
-        NextAction::array(0, new NextAction("lightning strike", ACTION_NORMAL + 2), NULL)));
+        NextAction::array(0, new NextAction("lightning strike", ACTION_NORMAL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "flame shock upkeep",
@@ -313,8 +317,18 @@ void EnhancementShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>
     ShamanTotemsStrategy::InitCombatTriggers(triggers);
 
     triggers.push_back(new TriggerNode(
+        "grounding totem reactive",
+        NextAction::array(0, new NextAction("grounding totem", ACTION_HIGH + 2), NULL)));
+
+    // Air by subgroup: windfury stays top for the usual melee group; a
+    // caster subgroup falls through to tranquil/grace air instead.
+    triggers.push_back(new TriggerNode(
         "air totem",
         NextAction::array(0, new NextAction("windfury totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("tranquil air totem", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "air totem",
@@ -323,6 +337,22 @@ void EnhancementShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>
     triggers.push_back(new TriggerNode(
         "water totem",
         NextAction::array(0, new NextAction("mana spring totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "poison cleansing totem reactive",
+        NextAction::array(0, new NextAction("poison cleansing totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "disease cleansing totem reactive",
+        NextAction::array(0, new NextAction("disease cleansing totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "tremor totem reactive",
+        NextAction::array(0, new NextAction("tremor totem", ACTION_HIGH + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "earthbind totem reactive",
+        NextAction::array(0, new NextAction("earthbind totem", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "earth totem",
@@ -340,6 +370,30 @@ void EnhancementShamanTotemsStrategy::InitCombatTriggers(std::list<TriggerNode*>
 void EnhancementShamanTotemsStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     ShamanTotemsStrategy::InitNonCombatTriggers(triggers);
+
+    // Pre-pull placement (owner request): same subgroup-picked totems as
+    // combat, above follow so the walk-in drops them (live raid 2026-10-14:
+    // follow held every tick at ACTION_NORMAL and totems lost). Triggers
+    // quiet once the slot holds a totem, so no OOC re-cast spam.
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("windfury totem", ACTION_HIGH), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("tranquil air totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "air totem",
+        NextAction::array(0, new NextAction("grace of air totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "water totem",
+        NextAction::array(0, new NextAction("mana spring totem", ACTION_HIGH - 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "earth totem",
+        NextAction::array(0, new NextAction("strength of earth totem", ACTION_HIGH - 1), NULL)));
 }
 
 void EnhancementShamanTotemsPveStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

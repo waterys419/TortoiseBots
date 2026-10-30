@@ -1,8 +1,13 @@
 #pragma once
 
 #include "Common.h"
+#include "PlayerLagWindow.h"
+#include "CommanderTelemetry.h"
+#include "DungeonMobTelemetry.h"
 #include <cstdint>
+#include <ctime>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -18,6 +23,11 @@ struct BotTelemetrySnapshot
 {
     std::string name;
     uint32 guid = 0;
+    bool isPlayer = false;  // true for a real online player, false for a bot
+    uint32 groupId = 0;     // core Group::GetId(), 0 = not in a group
+    bool isAlt = false;     // true for an autonomous owned alt-bot (Issue #872)
+    // Dashboard kind (Issue #872): pool/hired/claimed/alt/companion/player.
+    std::string kind;
     std::string className;
     std::string role;
     uint32 level = 0;
@@ -28,8 +38,18 @@ struct BotTelemetrySnapshot
     uint32 power = 0;
     uint32 maxPower = 0;
     std::string powerType; // "mana", "rage", "energy", "focus", "happiness"
+    // Guild name the unit carries in its PLAYER_GUILDID field, looked up in
+    // the in-memory guild manager (no DB). Empty when guildless.
+    std::string guild;
     uint32 mapId = 0;
     uint32 zoneId = 0;
+    // Instance copy the unit is in (Map::GetInstanceId(), issue #895): 0 in
+    // the open world, non-zero inside a dungeon, raid or battleground copy,
+    // so the dashboard can tell two copies of the same dungeon apart. The
+    // unit's raid subgroup (Player::GetSubGroup()) rides along for the
+    // Dungeons tab.
+    uint32 instanceId = 0;
+    uint32 subgroupId = 0;
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -37,11 +57,22 @@ struct BotTelemetrySnapshot
     std::string target;
     uint32 targetLevel = 0;  // combat target level (0 = none/non-unit)
     std::string strategy;
+    // Killer remembered when BOT_DEATH fires, shown on later snapshots while
+    // the bot is dead. Never the live target: "target" stays the selected unit.
+    std::string killer;
+    uint32 killerLevel = 0;
     std::string state;       // "combat", "moving", "busy", "stalled", "resting", "dead", "idle"
     std::string lastAction;  // last action the AI executed (loop detection)
     std::string lastTrigger; // event source that drove the last action
     std::string travelPurpose; // active travel destination short name ("grind", "vendor", ...)
     std::string travelTo;      // active travel destination title (empty when idle)
+    std::string travelStatus;  // "travel", "work", "cooldown", ... (empty when idle)
+    int32 travelDist = -1;     // yards to the destination point (-1 when idle)
+    uint32 aiVisits = 0;       // AI updates since login
+    uint32 aiAgeMs = 0;        // ms since the last AI update
+    std::string pvp;           // "bg" inside a battleground, "queue" when queued, else empty
+    std::string pvpWhere;      // battleground name, or the queued battleground names
+    bool worldPvpSeeker = false; // holds the open-world PvP seek role
 };
 
 // ObservabilityEmitter sends non-blocking loopback UDP telemetry to the
@@ -85,9 +116,18 @@ public:
         // Start of the current run of churn-only activity: a new last-action
         // name or an active travel target, with no movement, loot, cast or
         // sit. When the run reaches kIdleAfterMs the bot is stalled, not
-        // busy; real progress (or a full kIdleAfterMs with no activity at
-        // all) resets it to 0.
+        // busy (unless it fought or gained XP inside kRecentFightMs — a
+        // spawn camp between pulls stays busy); real progress (or a full
+        // kIdleAfterMs with no activity at all) resets it to 0.
         uint32 churnSinceMs = 0;
+        // Last world-tick time the bot was seen in combat, and last time its
+        // XP or level changed (kill, quest, or ding). A bot inside
+        // kRecentFightMs of either is camping a spawn, not stuck: it reports
+        // busy, never stalled. Zero when never observed.
+        uint32 lastCombatMs = 0;
+        uint32 lastXpMs = 0;
+        uint32 lastXp = 0;
+        uint32 lastLevel = 0;
         bool hasWorkTarget = false;
         // Last executed action name, to notice a new action without string
         // compares against history: any pointer/name change is activity.
@@ -106,7 +146,8 @@ public:
                      std::string const& details,
                      std::string const& targetName = "",
                      std::string const& strategy = "",
-                     std::string const& lastAction = "");
+                     std::string const& lastAction = "",
+                     uint32 killerLevel = 0);
 
     void OnActionFailed(Player* bot,
                         std::string const& actionName,
@@ -123,11 +164,21 @@ public:
     void EmitBotActivity(std::string const& event,
                          std::string const& info1,
                          std::string const& info2,
-                         Player* bot);
+                         Player* bot,
+                         uint32 targetLevel = 0);
 
     // turtle: let another module (e.g. mod-turtlebots residents) contribute its
     // own Player* roster to every telemetry cycle. Called on the world thread.
     void SetExternalRosterProvider(std::function<void(std::vector<Player*>&)> provider);
+
+    // The standing remote-commander bindings (issue #884) for the dashboard's
+    // Commanders tab, filled by the commands layer on the world thread. Read
+    // once per snapshot cycle; the provider returns at once while none exists.
+    void SetCommanderProvider(std::function<void(std::vector<CommanderTelemetry::BindingRef>&)> provider);
+
+    // The mobs of every dungeon run (issue #1101) for the dashboard's Dungeons tab, filled by the commands layer on the world
+    // thread once per snapshot cycle for the runs the emitter groups (see EmitDungeonMobs).
+    void SetDungeonMobProvider(std::function<void(std::vector<DungeonMobTelemetry::RunRef>&)> provider);
 
 private:
     ObservabilityEmitter();
@@ -141,7 +192,34 @@ private:
     void PruneState(uint32 nowMs);
     bool AnomalyAllowed(uint32 guid, uint8 typeId, uint32 nowMs);
     void AddStateTime(size_t stateIndex, uint32 diff);
-    void EmitSnapshotCycle(std::vector<Player*> const& activeBots, uint32 diff);
+    void EmitSnapshotCycle(std::vector<Player*> const& activeBots, std::vector<Player*> const& onlinePlayers, uint32 diff);
+    // DUNGEON_MOBS datagrams (issue #1101): inside the snapshot cycle, before the roster batches, one entry per instance copy
+    // (dungeon or raid, not a battleground) holding at least one bot; one "runs":[] datagram when the last run ended. Nothing
+    // while AiPlayerbot.ObservabilityDungeonMobs is 0.
+    void EmitDungeonMobs(std::vector<Player*> const& bots, std::vector<Player*> const& players, uint64 seq);
+    std::function<void(std::vector<DungeonMobTelemetry::RunRef>&)> m_dungeonMobProvider;
+    std::vector<DungeonMobTelemetry::RunRef> m_dungeonRunRefs; // reused between cycles
+    bool m_dungeonMobsEnabled = true;
+    bool m_dungeonMobsSent = false;  // the last DUNGEON_MOBS datagram listed at least one run
+    size_t m_dungeonRunOffset = 0;   // rotation start when more than kMaxRunsPerCycle runs exist
+    // Timing aid for the live check: logged at TortoiseBots.LogLevel 3 (debug) once per 30 cycles (60 s).
+    struct DungeonMobsTiming
+    {
+        uint32 cycles = 0;
+        uint64 sumUs = 0;
+        uint64 maxUs = 0;
+        uint32 maxRuns = 0;
+        uint32 maxMobs = 0;
+        uint32 maxCandidates = 0;
+    };
+    DungeonMobsTiming m_dungeonMobsTiming;
+    // COMMANDERS datagram: one per snapshot cycle while a binding stands, and
+    // one empty list when the last binding ends. Nothing otherwise.
+    void EmitCommanders();
+    std::function<void(std::vector<CommanderTelemetry::BindingRef>&)> m_commanderProvider;
+    std::vector<CommanderTelemetry::BindingRef> m_commanderRefs; // reused between cycles
+    std::unordered_map<uint32_t, int64_t> m_commanderSince; // commander guid -> unix seconds its binding was first seen
+    bool m_commandersSent = false; // the last COMMANDERS datagram listed at least one binding
     // Effective running settings for the dashboard Server panel (Addendum 2):
     // core rate getters + AiPlayerbot flags, sent at startup and on a slow
     // cadence. No strings from config files, no secrets — numbers and on/off.
@@ -150,7 +228,7 @@ private:
     // Exact server-side stats for the dashboard armory
     // (tortoise_bots_armory_stats); a few bots per snapshot, round-robin.
     void WriteArmoryStats(Player* bot);
-    size_t m_armoryCursor = 0;
+    size_t m_armoryOffset = 0;
 
     // Storage-only handle: this header stays free of <winsock2.h>/<sys/socket.h>, the same
     // way m_destAddr below stays a void* rather than a struct sockaddr_in*. std::uintptr_t
@@ -193,8 +271,25 @@ private:
     // stale cycles of the previous process.
     uint64 m_sessionId;
     uint64 m_snapshotSeq;
+    // World-tick truth: every Update(diff) feeds the last 30 s of ticks, so
+    // the heartbeat reports what players wait (see PlayerLagWindow.h)
+    // instead of the one gated tick.
+    PlayerLagWindow m_tickWindow;
 
-    std::map<uint32, BotTrackState> m_botTracking;
+    static constexpr size_t kMaxDeathKillers = 5000;
+
+    struct DeathKillerInfo
+    {
+        std::string name;
+        uint32 level = 0;
+        time_t time = 0;
+    };
+    // guid -> killer from the last BOT_DEATH. Attached to later snapshots
+    // while the bot is dead, cleared when the bot is seen alive again.
+    std::unordered_map<uint32, DeathKillerInfo> m_deathKillers;
+    void NoteDeathKiller(uint32 guid, std::string const& name, uint32 level);
+
+    std::unordered_map<uint32, BotTrackState> m_botTracking;
 
     // Optional roster contributor from another module (world thread only).
     std::function<void(std::vector<Player*>&)> m_externalRosterProvider;
@@ -207,10 +302,10 @@ private:
         bool reported = false;
         uint32 lastReportMs = 0;
     };
-    std::map<std::string, ActionFailureRecord> m_actionFailures;
+    std::unordered_map<std::string, ActionFailureRecord> m_actionFailures;
 
     // key = guid << 8 | anomaly type id
-    std::map<uint64, uint32> m_anomalyCooldowns;
+    std::unordered_map<uint64, uint32> m_anomalyCooldowns;
 
     // Rolling macro-state histogram: kStateBuckets buckets of kStateBucketMs
     // each, one column per state. Ratios therefore describe the recent window
@@ -225,6 +320,11 @@ private:
     static constexpr uint32 kStateBucketMs = 2000;
     static constexpr size_t kStateCount = 7; // combat, moving, busy, stalled, resting, dead, idle
     static constexpr uint32 kIdleAfterMs = 45000;
+    // A bot in combat or with an XP/level change inside this window is camping
+    // a spawn (killing in place, waiting for respawn), not stuck: it reports
+    // busy instead of stalled. Longer than kIdleAfterMs so a between-pull lull
+    // cannot flip a fighting camp to stalled.
+    static constexpr uint32 kRecentFightMs = 60000;
     uint64 m_stateWindow[kStateBucketCount][kStateCount];
     size_t m_stateBucketIndex;
     uint32 m_stateBucketElapsedMs;

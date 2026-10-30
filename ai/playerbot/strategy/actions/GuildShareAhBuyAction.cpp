@@ -2,6 +2,7 @@
 #include "GuildShareAhBuyAction.h"
 #include "playerbot/strategy/values/BudgetValues.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
+#include "playerbot/RandomItemMgr.h"
 #include "playerbot/ServerFacade.h"
 #include "AuctionHouse/AuctionHouseMgr.h"
 #include "Guild/GuildMgr.h"
@@ -249,6 +250,9 @@ bool GuildShareAhBuyAction::Execute(Event& event)
             uint32 auctionItemId = item->GetProto()->ItemId;
             uint32 auctionCount = item->GetCount();
 
+            if (sRandomItemMgr.IsTransmogClone(auctionItemId))
+                continue;
+
             auto it = neededItems.find(auctionItemId);
             if (it == neededItems.end())
                 continue;
@@ -303,6 +307,8 @@ bool GuildShareAhBuyAction::Execute(Event& event)
             sAuctionMgr.GetAItem(bestCandidate.itemGuid) == nullptr;
 
         ItemPrototype const* proto = sObjectMgr.GetItemPrototype(bestCandidate.itemId);
+        if (bought && proto)
+            sPlayerbotAIConfig.logEvent(ai, "GuildAhBuy", proto->Name1, std::to_string(proto->ItemId));
         std::ostringstream out;
         out << (bought ? "Bought " : "Could not buy ") << bestCandidate.count << "x ";
         if (proto)

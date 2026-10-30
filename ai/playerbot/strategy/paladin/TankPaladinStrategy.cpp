@@ -9,7 +9,33 @@
 #include "TankPaladinStrategy.h"
 #include "Playerbots.h"
 
-TankPaladinStrategy::TankPaladinStrategy(PlayerbotAI* botAI) : GenericPaladinStrategy(botAI) {}
+class TankPaladinStrategyActionNodeFactory : public NamedObjectFactory<ActionNode>
+{
+public:
+    TankPaladinStrategyActionNodeFactory()
+    {
+        creators["hand of reckoning"] = &hand_of_reckoning;
+    }
+
+private:
+    // Hand of Reckoning (Turtle trainer spell 51303, level 10 taunt)
+    // first, Righteous Defense as the party-member fallback. Mirrors the live
+    // ProtectionPaladinStrategy node and the donor's own factory.
+    static ActionNode* hand_of_reckoning([[maybe_unused]] PlayerbotAI* botAI)
+    {
+        return new ActionNode(
+            "hand of reckoning",
+            /*P*/ {},
+            /*A*/ { NextAction("righteous defense") },
+            /*C*/ {}
+        );
+    }
+};
+
+TankPaladinStrategy::TankPaladinStrategy(PlayerbotAI* botAI) : GenericPaladinStrategy(botAI)
+{
+    actionNodeFactories.Add(new TankPaladinStrategyActionNodeFactory());
+}
 
 std::vector<NextAction> TankPaladinStrategy::getDefaultActions()
 {
@@ -42,25 +68,9 @@ void TankPaladinStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
     );
     triggers.push_back(
         new TriggerNode(
-            "light aoe",
-            {
-                NextAction("consecration", ACTION_HIGH + 5)
-            }
-        )
-    );
-    triggers.push_back(
-        new TriggerNode(
-            "medium aoe",
-            {
-                NextAction("consecration", ACTION_HIGH + 7)
-            }
-        )
-    );
-    triggers.push_back(
-        new TriggerNode(
             "lose aggro",
             {
-                NextAction("judgement", ACTION_HIGH + 7)
+                NextAction("hand of reckoning", ACTION_HIGH + 7)
             }
         )
     );

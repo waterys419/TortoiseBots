@@ -1,6 +1,7 @@
 #pragma once
 #include "playerbot/PlayerbotAI.h"
-#include "playerbot/QuestLogPolicy.h"
+#include "playerbot/policy/quest/QuestLogPolicy.h"
+#include "playerbot/WandPolicy.h"
 #include "playerbot/ChatHelper.h"
 #include "playerbot/strategy/Trigger.h"
 #include "playerbot/PlayerbotAIConfig.h"
@@ -95,13 +96,49 @@ namespace ai
     {
 	public:
 		LoseAggroTrigger(PlayerbotAI* ai) : Trigger(ai, "lose aggro") {}
+		LoseAggroTrigger(PlayerbotAI* ai, std::string name) : Trigger(ai, name) {}
 		virtual bool IsActive() override;
 	};
+
+    // A mob is on a non-tank group member, the healer's attacker first:
+    // fires when the "attacker of non-tank target" value picks a mob. Only
+    // tank strategies arm a row for it; every class context registers it.
+    class PartyMemberAttackedTrigger : public Trigger
+    {
+    public:
+        PartyMemberAttackedTrigger(PlayerbotAI* ai) : Trigger(ai, "party member attacked") {}
+
+        virtual bool IsActive() override
+        {
+            return AI_VALUE(Unit*, "attacker of non-tank target") != NULL;
+        }
+    };
+    // Loose-add emergency for the tank AoE taunts (Challenging Shout/Roar):
+    // fires only while 3+ mobs inside the 10 yd shout radius are hitting
+    // non-tank group members (one Taunt fixes one or two). The pure count
+    // rule lives in AoeTauntPolicy.h.
+    class LooseAddsNearTrigger : public Trigger
+    {
+    public:
+        LooseAddsNearTrigger(PlayerbotAI* ai) : Trigger(ai, "loose adds near") {}
+
+        virtual bool IsActive() override;
+    };
 
 	class HasAggroTrigger : public Trigger
     {
 	public:
 	    HasAggroTrigger(PlayerbotAI* ai) : Trigger(ai, "have aggro") {}
+		virtual bool IsActive() override;
+	};
+
+	// "has aggro" in a real raid group only (RaidAggroWandRow, WandPolicy.h):
+	// the raid class strategies are on in every dungeon, the wand-on-aggro
+	// row is meant for raids.
+	class HasAggroInRaidGroupTrigger : public HasAggroTrigger
+	{
+	public:
+		HasAggroInRaidGroupTrigger(PlayerbotAI* ai) : HasAggroTrigger(ai) {}
 		virtual bool IsActive() override;
 	};
 
@@ -135,12 +172,16 @@ namespace ai
         virtual bool IsActive() override;
     };
 
-	// TODO: check other targets
+	// The pick is any engaged hostile in the interrupt's range casting an
+	// interruptible spell, not only the current target; the matching actions
+	// (CastInterruptSpellAction family) read the same value. Overrides below
+	// pin a spell back to the current target while its action is shared with
+	// non-interrupt rows.
     class InterruptSpellTrigger : public SpellTrigger
 	{
     public:
         InterruptSpellTrigger(PlayerbotAI* ai, std::string spell) : SpellTrigger(ai, spell) {}
-        virtual std::string GetTargetName() override { return "current target"; }
+        virtual Value<Unit*>* GetTargetValue() override { return context->GetValue<Unit*>("interrupt target", spell); }
         virtual bool IsActive() override;
     };
 
@@ -246,6 +287,16 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+    // mod-playerbots LowTankThreatTrigger (LD-8): the bot climbs past half
+    // the main tank's threat (or the tank holds nothing). No live consumers
+    // in 1.18.1 (Misdirection/Tricks are WotLK-only); raid tactics read it.
+    class LowTankThreatTrigger : public Trigger
+    {
+    public:
+        LowTankThreatTrigger(PlayerbotAI* ai, std::string name = "low tank threat", int checkinterval = 1) : Trigger(ai, name, checkinterval) {}
+        virtual bool IsActive() override;
+    };
+
     class SomeThreatTrigger : public Trigger
     {
     public:
@@ -327,6 +378,7 @@ namespace ai
     public:
 		virtual std::string GetTargetName() override { return "self target"; }
         virtual bool IsActive() override;
+        virtual bool IsBuffTrigger() const override { return true; }
 
     protected:
         bool checkIsOwner;
@@ -487,6 +539,8 @@ namespace ai
     public:
 		virtual std::string GetTargetName() override { return "current target"; }
         virtual bool IsActive() override;
+        virtual bool IsDebuffTrigger() const override { return true; }
+
 
     protected:
         bool HasMaxDebuffs();
@@ -495,11 +549,23 @@ namespace ai
     class DebuffOnAttackerTrigger : public DebuffTrigger
     {
     public:
-        DebuffOnAttackerTrigger(PlayerbotAI* ai, std::string spell) : DebuffTrigger(ai, spell) {}
+        DebuffOnAttackerTrigger(PlayerbotAI* ai, std::string spell, bool checkIsOwner = false) : DebuffTrigger(ai, spell, 1, checkIsOwner) {}
 
     public:
         virtual Value<Unit*>* GetTargetValue() override;
         virtual std::string getName() override { return spell + " on attacker"; }
+    };
+
+    // Boss-gated debuff conservation (mod-playerbots parity, CD-3, Base
+    // trigger only): fires when the current target wants this debuff AND is
+    // a world boss (no IsDungeonBoss on this core; dungeon-boss coverage
+    // waits on a real boss flag), so expensive debuffs are saved for bosses.
+    // Class debuff wiring stays untouched in this PR.
+    class DebuffOnBossTrigger : public DebuffTrigger
+    {
+    public:
+        DebuffOnBossTrigger(PlayerbotAI* ai, std::string spell) : DebuffTrigger(ai, spell) {}
+        virtual bool IsActive() override;
     };
 
 	class BoostTrigger : public BuffTrigger
@@ -511,6 +577,26 @@ namespace ai
 	protected:
 		float balance;
 	};
+
+    // Difficulty-gated cooldown trigger (mod-playerbots parity, CD-2):
+    // fires in combat when the fight is hard enough (balance <= 50, i.e.
+    // not a trivial pull), always against a PvP target, or always for a
+    // player-owned bot (local master bypass, same as BoostTrigger).
+    // Rewires only the generic racial/trinket rows; per-class
+    // BoostTrigger consumers keep their own gates.
+    class GenericBoostTrigger : public Trigger
+    {
+    public:
+        // The spells the racials row offers, in its cast order: readiness is
+        // checked against exactly this pair.
+        GenericBoostTrigger(PlayerbotAI* ai, std::string firstSpell = "berserking",
+                            std::string secondSpell = "blood fury")
+            : Trigger(ai, "generic boost", 3), firstSpell(firstSpell), secondSpell(secondSpell) {}
+        virtual bool IsActive() override;
+
+    protected:
+        std::string firstSpell, secondSpell;
+    };
 
     class RandomTrigger : public Trigger
     {
@@ -615,10 +701,35 @@ namespace ai
 		virtual bool IsActive() override;
 	};
 
+    // A group healer is running dry (mod-playerbots parity, donor default
+    // interval 1): fires when the lowest-mana healer (the "healer low mana"
+    // value) drops below the low-mana line. Pure mana check — cast-specific
+    // guards (Innervate known/ready/range/aura) live in the druid action.
+    class HealerLowManaTrigger : public Trigger
+    {
+    public:
+        HealerLowManaTrigger(PlayerbotAI* ai) : Trigger(ai, "healer low mana") {}
+
+        virtual std::string GetTargetName() override { return "healer low mana"; }
+        virtual bool IsActive() override;
+    };
+
     class HighManaTrigger : public Trigger
     {
     public:
         HighManaTrigger(PlayerbotAI* ai) : Trigger(ai, "high mana") {}
+
+        virtual bool IsActive() override;
+    };
+
+    // Donor EnoughManaTrigger verdict (mod-playerbots GenericTriggers.cpp):
+    // fires while mana sits ABOVE the high-mana line, gating spenders like
+    // consecration. Deliberately separate from HighManaTrigger, whose local
+    // verdict is inverted (mana < 65) to drive the drink row.
+    class EnoughManaTrigger : public Trigger
+    {
+    public:
+        EnoughManaTrigger(PlayerbotAI* ai) : Trigger(ai, "enough mana") {}
 
         virtual bool IsActive() override;
     };
@@ -636,6 +747,57 @@ namespace ai
 
     private:
         bool checkMana;
+    };
+
+    // True when `target` is attacking the bot or a member of its group
+    // (HealerDamageTargetAllowed, HealerMayWand).
+    bool TargetFightsGroup(Player* bot, Unit* target);
+
+    // True when no other live member of the bot's group stands within
+    // SightDistance on its map (mod-playerbots GetNearGroupMemberCount <= 1).
+    bool NoGroupMemberNear(Player* bot);
+
+    // Game-state side of HealerMayWand (WandPolicy.h): may this bot start
+    // (or keep) a wand on `target` now? Always true outside a group or
+    // without a heal spec. Used by the "shoot" action and the priest's
+    // "wand blocks cast" stop, so both read the same line.
+    bool HealerWandAllowed(PlayerbotAI* ai, Unit* target);
+
+    // Shared probes for the class "wand blocks ..." triggers (mage, priest,
+    // warlock; rule in WandPolicy.h). Each Turtle wand shot renews the GCD,
+    // so a running wand keeps every caster spell "not ready"; the class
+    // trigger fires when a spell it wants is held back by that GCD alone.
+    class WandBlocksCastTrigger : public Trigger
+    {
+    public:
+        // Check interval 2 s: each probe builds a Spell for CheckCast, so it
+        // must not run every tick while a wand is up. needCheck() treats an
+        // interval below 2 as "every tick" and counts whole seconds of
+        // time(), so 2 means the trigger runs again after 1 to 2 s.
+        WandBlocksCastTrigger(PlayerbotAI* ai, std::string name) : Trigger(ai, name, 2) {}
+
+    protected:
+        // The current auto-repeat spell is a wand shot (category 351).
+        bool IsWanding();
+        // One spell probe: castable now, refused by the GCD alone, or
+        // refused for any other reason. Range is ignored: the wand shares
+        // the casters' 30 yd and the core stops it by itself out of range.
+        // "GCD alone" also needs the caster not silenced or locked out of
+        // the school, in the right form (when checkForm) and in line of
+        // sight of the target: the core checks the GCD first and hides
+        // those (WandCastBlockers in WandPolicy.h).
+        WandSpellProbe ProbeSpell(std::string const& spell, Unit* target, bool checkForm = true);
+        WandCastBlockers CastBlockers(std::string const& spell, Unit* target, bool checkForm);
+        // Below 5% mana the "no mana" -> shoot row wands on purpose (same
+        // line as NoManaTrigger); stopping it would only ping-pong.
+        bool NoManaRowActive();
+        // The raid "has aggro" -> shoot row (mage, warlock) wands on purpose
+        // to stop building threat; leave that wand alone.
+        bool RaidAggroWand();
+        // The "threat" strategy's multiplier zeroes a single-target nuke
+        // now (same gate as ThreatMultiplier): the nuke falls back to the
+        // wand, so the wand is the intended back-off, not a GCD trap.
+        bool ThreatVetoesNuke();
     };
 
     class AlmostFullManaTrigger : public Trigger
@@ -790,6 +952,26 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+    // Generic rear-flank gate (donor RearFlankAction::isUseful shape):
+    // fires while the bot stands in the target's frontal arc or tail cone.
+    // Angle check only, no movement: cheap enough for the combat tick.
+    class RearFlankNeededTrigger : public Trigger
+    {
+    public:
+        RearFlankNeededTrigger(PlayerbotAI* ai) : Trigger(ai, "rear flank needed", 1) {}
+        virtual bool IsActive() override;
+    };
+
+    // Party tank-face (night2 research): a tank bot holding a mob turns it
+    // so its front points away from the rest of the party. Fires only in
+    // real-player-master groups; pool bots keep old behaviour.
+    class TankFaceNeededTrigger : public Trigger
+    {
+    public:
+        TankFaceNeededTrigger(PlayerbotAI* ai) : Trigger(ai, "tank face needed", 2) {}
+        virtual bool IsActive() override;
+    };
+
     class IsNotFacingTargetTrigger : public Trigger
     {
     public:
@@ -797,11 +979,41 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+
     class HasCcTargetTrigger : public Trigger
     {
     public:
         HasCcTargetTrigger(PlayerbotAI* ai, std::string name) : Trigger(ai, name) {}
         virtual bool IsActive() override;
+        // The row has a target to CC (dungeon mark gating included), leaving
+        // spell readiness aside. WandBlocksCcTrigger reads it too: a running
+        // wand keeps the spell "not ready", so IsActive alone never fires.
+        virtual bool CcTargetPending();
+    };
+
+    // A running wand renews the GCD on every shot (WandPolicy.h), so a CC
+    // row, which needs its spell ready, never fires while the wand runs.
+    // Fires while one of the class's own CC spells has a pending target and
+    // is held back by that GCD alone. Registered per class as "wand blocks
+    // cc" (mage, priest, warlock) and used by the cc strategies' stop-wand row.
+    class WandBlocksCcTrigger : public WandBlocksCastTrigger
+    {
+    public:
+        WandBlocksCcTrigger(PlayerbotAI* ai, std::vector<std::string> ccSpells)
+            : WandBlocksCastTrigger(ai, "wand blocks cc"), ccSpells(ccSpells) {}
+        bool IsActive() override;
+        // The same test without the running wand. CastShootAction reads it
+        // so a "shoot" fallback does not restart the wand while a CC waits.
+        // The answer is kept for about 1 s: "shoot" is weighed every tick
+        // and the cast probe builds a Spell (see WandBlocksCastTrigger).
+        bool CcCastWaiting();
+
+    private:
+        bool ComputeCcCastWaiting();
+
+        std::vector<std::string> ccSpells;
+        uint32 waitingCheckMs = 0;
+        bool waitingCached = false;
     };
 
 	class NoMovementTrigger : public Trigger
@@ -1048,6 +1260,17 @@ namespace ai
         virtual bool IsActive() override;
     };
 
+    // Proactive AoE gate: fires when any of the three strafe sensors sees
+    // danger — dynobj aura on the bot, damaging trap in range, trigger NPC
+    // in range. Mirrors AvoidAoeAction::isUseful so the trigger row and
+    // the action agree; the sensor reads are value-cached.
+    class AoeThreatNearbyTrigger : public Trigger
+    {
+    public:
+        AoeThreatNearbyTrigger(PlayerbotAI* ai) : Trigger(ai, "aoe threat nearby", 1) {}
+        virtual bool IsActive() override;
+    };
+
     // racials
 
     class BerserkingTrigger : public BoostTrigger
@@ -1100,10 +1323,42 @@ namespace ai
 
         virtual bool IsActive() override
         {
-            return bot->HasAuraType(SPELL_AURA_MOD_FEAR);
-            return bot->HasAuraType(SPELL_AURA_MOD_STUN);
-            return bot->HasAuraType(SPELL_AURA_MOD_CHARM);
-            return bot->HasAuraType(SPELL_AURA_MOD_CONFUSE);
+            // Donor FearCharmSleepTrigger shape (fear/charm/sleep): 1.12 WotF
+            // (spell 7744, charm+fear immunity) breaks exactly these, so the
+            // stun/confuse/sap arms only fired uselessly on uncastable bots.
+            if (bot->HasAuraType(SPELL_AURA_MOD_FEAR) ||
+                bot->HasAuraType(SPELL_AURA_MOD_CHARM) ||
+                bot->HasAuraType(SPELL_AURA_AOE_CHARM))
+                return true;
+            uint32 sleepMask = 1 << (MECHANIC_SLEEP - 1);
+            for (auto itr : bot->GetSpellAuraHolderMap())
+            {
+                if (itr.second->HasMechanicMask(sleepMask))
+                    return true;
+            }
+            return false;
+        }
+    };
+
+    // Lift-CC cooldown gate (mod-playerbots parity, SUPD-2): fires while
+    // feared, slept or sapped so warrior Berserker Rage rows light up. The
+    // two warrior strategy rows already push this name — no creator existed.
+    class FearSleepSapTrigger : public Trigger
+    {
+    public:
+        FearSleepSapTrigger(PlayerbotAI* ai) : Trigger(ai, "fear sleep sap") {}
+
+        bool IsActive() override
+        {
+            if (bot->HasAuraType(SPELL_AURA_MOD_FEAR))
+                return true;
+            uint32 sleepSapMask = (1 << (MECHANIC_SLEEP - 1)) | (1 << (MECHANIC_SAPPED - 1));
+            for (auto itr : bot->GetSpellAuraHolderMap())
+            {
+                if (itr.second->HasMechanicMask(sleepSapMask))
+                    return true;
+            }
+            return false;
         }
     };
 
@@ -1173,19 +1428,26 @@ namespace ai
             uint32 disMask = GetDispellMask(DISPEL_DISEASE);
             uint32 poisMask = GetDispellMask(DISPEL_POISON);
             uint32 bleedType = 1 << (MECHANIC_BLEED - 1);
+            bool wantsCure = false;
             for (auto itr : bot->GetSpellAuraHolderMap())
             {
                 SpellEntry const* spell = itr.second->GetSpellProto();
                 if (IsPositiveSpell(spell->Id))
                     continue;
 
+                // Stoneform removes every disease and poison on the bot (its dispel immunity carries
+                // SPELL_ATTR_EX_DISPEL_AURAS_ON_IMMUNITY), so it is held back while a never-dispel debuff
+                // such as Mutating Injection is on the bot.
+                if (PlayerbotAI::IsNeverDispelSpell(spell->Id))
+                    return false;
+
                 if (((1 << spell->Dispel) & disMask) || ((1 << spell->Dispel) & poisMask))
-                    return true;
+                    wantsCure = true;
 
                 if (itr.second->HasMechanicMask(bleedType))
-                    return true;
+                    wantsCure = true;
             }
-            return false;
+            return wantsCure;
         }
     };
 
@@ -1228,8 +1490,10 @@ namespace ai
         {
             if (!AI_VALUE2(uint32, "spell id", "arcane torrent"))
                 return false;
-            Unit* target = AI_VALUE(Unit*, "current target");
-            return InterruptSpellTrigger::IsActive() && target && AI_VALUE2(float, "distance", "current target") <= 8.0f;
+            // The cast itself is an AoE silence and needs no target; the 8 yd
+            // radius is judged on the interrupt pick.
+            return InterruptSpellTrigger::IsActive() &&
+                AI_VALUE2(float, "distance", "interrupt target::arcane torrent") <= 8.0f;
         }
     };
 
@@ -1240,6 +1504,13 @@ namespace ai
 
         virtual bool IsActive() override
         {
+            // Only while War Stomp is known and off cooldown: the cast action
+            // has no reach step, but a ready-gate here keeps the 71.0 row from
+            // firing for the whole 2.5-min cooldown (live: tauren spent 13-14 %
+            // of their fights walking into melee for a Stomp they could not cast).
+            uint32 spellId = AI_VALUE2(uint32, "spell id", "war stomp");
+            if (!spellId || !sServerFacade.IsSpellReady(bot, spellId))
+                return false;
             Unit* target = AI_VALUE(Unit*, "current target");
             return target && AI_VALUE2(bool, "combat", "self target") && AI_VALUE2(float, "distance", "current target") <= 8.0f &&
                 (AI_VALUE2(uint8, "health", "self target") < sPlayerbotAIConfig.mediumHealth ||
@@ -1354,6 +1625,17 @@ namespace ai
     {
     public:
         AtWarTrigger(PlayerbotAI* ai) : Trigger(ai, "at war", 60) {}
+
+        bool IsActive() override;
+    };
+
+    // Deferred ready-check confirm is waiting (SOC-S5): the confirm was
+    // held so buffs could land; fires the "ready reply" action once buffs
+    // settle or the cap hits.
+    class ForceRebuffPendingTrigger : public Trigger
+    {
+    public:
+        ForceRebuffPendingTrigger(PlayerbotAI* ai) : Trigger(ai, "force rebuff pending", 1) {}
 
         bool IsActive() override;
     };

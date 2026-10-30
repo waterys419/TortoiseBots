@@ -25,6 +25,7 @@ namespace ai
                 creators["stealth"] = [](PlayerbotAI* ai) { return new StealthPlaceholderStrategy(ai); };
                 creators["stealthed"] = [](PlayerbotAI* ai) { return new RogueStealthedStrategy(ai); };
                 creators["cc"] = [](PlayerbotAI* ai) { return new CcPlaceholderStrategy(ai); };
+                creators["no sap"] = [](PlayerbotAI* ai) { return new RogueNoSapStrategy(ai); };
             }
         };
 
@@ -199,10 +200,15 @@ namespace ai
                 creators["adrenaline rush"] = [](PlayerbotAI* ai) { return new RogueBoostBuffTrigger(ai, "adrenaline rush"); };
                 creators["unstealth"] = [](PlayerbotAI* ai) { return new RogueUnstealthTrigger(ai); };
                 creators["sap"] = [](PlayerbotAI* ai) { return new SapTrigger(ai); };
+                creators["sap cc mark"] = [](PlayerbotAI* ai) { return new SapCcMarkTrigger(ai); };
                 creators["in stealth"] = [](PlayerbotAI* ai) { return new InStealthTrigger(ai); };
                 creators["no stealth"] = [](PlayerbotAI* ai) { return new NoStealthTrigger(ai); };
                 creators["stealth"] = [](PlayerbotAI* ai) { return new StealthTrigger(ai); };
                 creators["sprint"] = [](PlayerbotAI* ai) { return new SprintTrigger(ai); };
+                creators["blade flurry near cc"] = [](PlayerbotAI* ai) { return new BladeFlurryNearCcTrigger(ai); };
+                creators["rogue dungeon feint"] = [](PlayerbotAI* ai) { return new RogueDungeonFeintTrigger(ai); };
+                creators["rogue dungeon vanish"] = [](PlayerbotAI* ai) { return new RogueDungeonVanishTrigger(ai); };
+                creators["rogue raid vanish"] = [](PlayerbotAI* ai) { return new RogueRaidVanishTrigger(ai); };
                 creators["2 combo"] = [](PlayerbotAI* ai) { return new ComboPointsAvailableTrigger(ai, 2); };
                 creators["3 combo"] = [](PlayerbotAI* ai) { return new ComboPointsAvailableTrigger(ai, 3); };
                 creators["4 combo"] = [](PlayerbotAI* ai) { return new ComboPointsAvailableTrigger(ai, 4); };
@@ -215,6 +221,7 @@ namespace ai
                 creators["shadow of death"] = [](PlayerbotAI* ai) { return new ShadowOfDeathTrigger(ai); };
                 creators["mark for death"] = [](PlayerbotAI* ai) { return new MarkForDeathTrigger(ai); };
                 creators["eviscerate"] = [](PlayerbotAI* ai) { return new EviscerateTrigger(ai); };
+                creators["target with combo points almost dead"] = [](PlayerbotAI* ai) { return new AlmostDeadFinisherTrigger(ai); };
                 creators["blade flurry"] = [](PlayerbotAI* ai) { return new RogueBoostBuffTrigger(ai, "blade flurry"); };
                 creators["riposte"] = [](PlayerbotAI* ai) { return new RiposteCastTrigger(ai); };
                 creators["apply deadly poison main hand"] = [](PlayerbotAI* ai) { return new ApplyDeadlyPoisonTrigger(ai, true); };
@@ -260,6 +267,7 @@ namespace ai
                 creators["expose armor"] = [](PlayerbotAI* ai) { return new CastExposeArmorAction(ai); };
                 creators["kick on enemy healer"] = [](PlayerbotAI* ai) { return new CastKickOnEnemyHealerAction(ai); };
                 creators["blade flurry"] = [](PlayerbotAI* ai) { return new CastBladeFlurryAction(ai); };
+                creators["remove blade flurry"] = [](PlayerbotAI* ai) { return new RemoveBuffAction(ai, "blade flurry"); };
                 creators["adrenaline rush"] = [](PlayerbotAI* ai) { return new CastAdrenalineRushAction(ai); };
                 creators["ambush"] = [](PlayerbotAI* ai) { return new CastAmbushAction(ai); };
                 creators["stealth"] = [](PlayerbotAI* ai) { return new CastStealthAction(ai); };
@@ -269,6 +277,7 @@ namespace ai
                 creators["blind"] = [](PlayerbotAI* ai) { return new CastBlindAction(ai); };
                 creators["unstealth"] = [](PlayerbotAI* ai) { return new RogueUnstealthAction(ai); };
                 creators["sap"] = [](PlayerbotAI* ai) { return new CastSapAction(ai); };
+                creators["reach sap"] = [](PlayerbotAI* ai) { return new ReachSapAction(ai); };
                 creators["check stealth"] = [](PlayerbotAI* ai) { return new CheckStealthAction(ai); };
                 creators["cold blood"] = [](PlayerbotAI* ai) { return new CastColdBloodAction(ai); };
                 creators["preparation"] = [](PlayerbotAI* ai) { return new CastPreparationAction(ai); };

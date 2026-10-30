@@ -1,8 +1,11 @@
 #pragma once
 
 #include "playerbot/HunterSwitchPolicy.h"
+#include "playerbot/HunterKitePolicy.h"
+#include "playerbot/GroupMembers.h"
 #include "playerbot/strategy/triggers/GenericTriggers.h"
 #include "playerbot/strategy/hunter/HunterActions.h"
+#include "playerbot/strategy/hunter/HunterValues.h"
 
 namespace ai
 {
@@ -15,6 +18,16 @@ namespace ai
     {
     public:
         AspectOfTheHawkTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "aspect of the hawk") {}
+        // Opt-in (AiPlayerbot.HunterViperOnLowMana): stands down while the Viper is up and mana has not recovered.
+        virtual bool IsActive() override;
+    };
+
+    // Opt-in (AiPlayerbot.HunterViperOnLowMana): low mana and no Viper yet.
+    class AspectOfTheViperLowManaTrigger : public BuffTrigger
+    {
+    public:
+        AspectOfTheViperLowManaTrigger(PlayerbotAI* ai) : BuffTrigger(ai, "aspect of the viper") {}
+        virtual bool IsActive() override;
     };
 
     class AspectOfTheWildTrigger : public BuffTrigger
@@ -50,30 +63,32 @@ namespace ai
     BEGIN_TRIGGER(HuntersPetDeadTrigger, Trigger)
     END_TRIGGER()
 
+    BEGIN_TRIGGER(SafeToRevivePetTrigger, Trigger)
+    END_TRIGGER()
+
     BEGIN_TRIGGER(HuntersPetLowHealthTrigger, Trigger)
+    END_TRIGGER()
+
+    BEGIN_TRIGGER(PetHasAggroTrigger, Trigger)
+    END_TRIGGER()
+
+    BEGIN_TRIGGER(HuntersPetMediumHealthTrigger, Trigger)
     END_TRIGGER()
 
     class HuntersMarkTrigger : public DebuffTrigger
     {
     public:
         HuntersMarkTrigger(PlayerbotAI* ai) : DebuffTrigger(ai, "hunter's mark") {}
+        // Tank-target gate; see HunterTriggers.cpp.
+        virtual bool IsActive() override;
     };
 
     class FreezingTrapTrigger : public HasCcTargetTrigger
     {
     public:
         FreezingTrapTrigger(PlayerbotAI* ai) : HasCcTargetTrigger(ai, "freezing trap") {}
-
-        bool IsActive() override
-        {
-            // Check if feign death not on cooldown
-            if (sServerFacade.IsSpellReady(bot, 5384))
-            {
-                return HasCcTargetTrigger::IsActive();
-            }
-
-            return false;
-        }
+        // Free pick on the chooser's own target; see HunterTriggers.cpp.
+        virtual bool IsActive() override;
     };
 
     class FrostTrapTrigger : public MeleeLightAoeTrigger
@@ -172,6 +187,13 @@ namespace ai
         virtual bool IsActive() override { return bot->GetGroup() && (AI_VALUE2(uint32, "item count", "ammo") < 100) && (AI_VALUE2(uint32, "item count", "ammo") > 0); }
     };
 
+    class VolleyChannelCheckTrigger : public Trigger
+    {
+    public:
+        VolleyChannelCheckTrigger(PlayerbotAI* ai) : Trigger(ai, "volley channel check") {}
+        bool IsActive() override;
+    };
+
     class HunterNoAmmoTrigger : public AmmoCountTrigger
 {
 public:
@@ -221,6 +243,30 @@ private:
     // on the melee side, off-bot/immobilized/slow/far on the ranged side) -
     // only the distance half is pinned to the hysteresis edge. No level gate
     // on either, mirroring the donor.
+    // Inside the shot's own minimum range (the dead zone), at the same
+    // boundary EnemyTooCloseForAutoShotTrigger and the shot use.
+    inline bool HunterTargetInDeadZone(PlayerbotAI* ai, Unit* target)
+    {
+        float maxRange = 0.0f;
+        float minRange = 0.0f;
+        if (!target || !ai->GetSpellRange("auto shot", &maxRange, &minRange) || minRange <= 0.0f)
+            return false;
+        return ai->GetBot()->GetDistance(target, SizeFactor::CombatReach) < minRange;
+    }
+
+    // The dead-zone step-out verdict (HunterSwitchPolicy.h) for the current
+    // target; shared by the step-out row and the step-out action.
+    inline HunterDeadZoneStep HunterDeadZoneStepFor(PlayerbotAI* ai, Unit* target)
+    {
+        HunterKitState* state = GetHunterKitState(ai);
+        if (!state || !target)
+            return HunterDeadZoneStep::None;
+        Player* bot = ai->GetBot();
+        bool const moving = !bot->IsStopped() || sServerFacade.isMoving(bot);
+        return DecideHunterDeadZoneStep(*state, target->GetObjectGuid().GetRawValue(),
+            WorldTimer::getMSTime(), HunterTargetInDeadZone(ai, target), target->GetVictim() == bot, moving);
+    }
+
     class SwitchToRangedTrigger : public Trigger
     {
     public:
@@ -230,9 +276,8 @@ private:
         {
             // No level gate: the donor's SwitchToRangedTrigger has none either, and
             // below level 10 this is what hands the ranged kit back after a melee
-            // trade - once the target is off the bot, immobilized, too slow to
-            // follow, or the bot has made distance (10+ yd, the hysteresis edge
-            // in HunterSwitchPolicy.h).
+            // trade - once the target is off the bot (pet or tank holds it, at
+            // any distance) or immobilized (HunterSwitchPolicy.h).
             bool hasAmmo = ai->HasCheat(BotCheatMask::item) || AI_VALUE2(uint32, "item count", "ammo");
             if (!hasAmmo)
                 return false;
@@ -248,7 +293,13 @@ private:
             bool const targetOffBot = target->GetVictim() != bot;
             bool const immobilized = IsImmobilizedStateCompat(target);
             bool const tooSlowToFollow = target->GetSpeed(MOVE_RUN) <= (bot->GetSpeed(MOVE_RUN) / 2) && !((!bot->GetPet() || bot->GetPet()->IsDead()) && target->IsCreature() && target->GetHealthPercent() < 50.f && target->GetHealth() < bot->GetHealth());
-            return ai::ShouldSwitchToRanged(true, targetOffBot, immobilized, tooSlowToFollow, distance, true);
+            // Kit dwell (HunterSwitchPolicy.h). There is no failed-step-out
+            // hold any more: the ranged kit never trades into melee for a mob
+            // off the hunter (#1018), so there is nothing to flip back into.
+            HunterKitState* state = GetHunterKitState(ai);
+            bool const dwellElapsed = !state || HunterKitDwellElapsed(*state, WorldTimer::getMSTime());
+            return ai::ShouldSwitchToRanged(true, targetOffBot, immobilized, tooSlowToFollow, distance, true,
+                false, dwellElapsed);
         }
     };
 
@@ -277,7 +328,138 @@ private:
             if (!ai->GetSpellRange("auto shot", &maxRange, &minRange) || minRange <= 0.0f)
                 return false;
 
+            // Mob on the hunter only (the kite flee). A mob the pet, a tank
+            // or anyone else holds gets the one-shot step-out below instead:
+            // the generic flee re-fired every tick there without moving.
+            if (target->GetVictim() != bot)
+                return false;
+
             return bot->GetDistance(target, SizeFactor::CombatReach) < minRange;
+        }
+    };
+
+    // Dead-zone step-out for a mob that is NOT on the hunter (pet, tank or
+    // anyone else holds it): one step straight out of the shot's minimum
+    // range per mob and episode (mod-playerbots 79bd428 steps out with
+    // MoveAway / disengage the same way), held while the step is under way.
+    // If the step does not get the hunter out it is retried farther (up to
+    // kHunterStepOutMaxAttempts per episode); the hunter never trades into
+    // melee for this mob (#1018).
+    class HunterDeadZoneStepOutTrigger : public Trigger
+    {
+    public:
+        HunterDeadZoneStepOutTrigger(PlayerbotAI* ai) : Trigger(ai, "hunter dead zone step out", 1) {}
+
+        bool IsActive() override
+        {
+            if (!ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT) || !HunterHasLoadedRangedWeapon(ai))
+                return false;
+
+            HunterDeadZoneStep const step = HunterDeadZoneStepFor(ai, AI_VALUE(Unit*, "current target"));
+            return step == HunterDeadZoneStep::StepOut || step == HunterDeadZoneStep::Hold;
+        }
+    };
+
+    // Living group tank (the mark gate and the disengage gate share it).
+    inline bool HunterHasLivingTank(PlayerbotAI* ai)
+    {
+        Group* group = ai->GetBot()->GetGroup();
+        if (!group)
+            return false;
+        for (Player* member : LiveGroupMembers(group))
+            if (member && member->IsAlive() && PlayerbotAI::IsTank(member))
+                return true;
+        return false;
+    }
+
+    // The kite's "usable ranged kit": ranged strategy with a loaded ranged
+    // weapon. Shared by the kite trigger, the melee-chain veto and the
+    // melee-switch veto.
+    inline bool HunterKiteReady(PlayerbotAI* ai)
+    {
+        return ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT) && HunterHasLoadedRangedWeapon(ai);
+    }
+
+    inline bool HunterShouldKite(PlayerbotAI* ai, uint8_t attackerCount)
+    {
+        Unit* nearest = ai->GetAiObjectContext()->GetValue<Unit*>("closest attacker targeting me")->Get();
+        float const nearestYd = nearest ? ai->GetBot()->GetCombatDistance(nearest) : 9999.0f;
+        return ShouldHunterKite(attackerCount, HunterKiteReady(ai), nearestYd);
+    }
+
+    // Wing Clip the nearest and step out instead of trading with the pack
+    // (HunterKitePolicy.h). In combat comes from the base trigger.
+    class HunterMultipleAttackersTrigger : public MyAttackerCountTrigger
+    {
+    public:
+        HunterMultipleAttackersTrigger(PlayerbotAI* ai) : MyAttackerCountTrigger(ai, kHunterKiteMinAttackers) {}
+
+        bool IsActive() override
+        {
+            if (!MyAttackerCountTrigger::IsActive())
+                return false;
+            return HunterShouldKite(ai, AI_VALUE(uint8, "my attacker count"));
+        }
+    };
+
+    // Disengage is a threat drop, not a move: it wipes the hunter off the
+    // mob's threat list so a living tank can take the mob back. Only worth
+    // the global when the mob fought is on the hunter (or climbing to it)
+    // and stands in melee reach, and there is a tank to hand it to - solo
+    // the mob just re-attacks the hunter. Readiness is rank-aware: "spell
+    // id" resolves the highest known rank (0 when untrained) and each rank
+    // has its own cooldown.
+    class HunterDisengageTrigger : public Trigger
+    {
+    public:
+        HunterDisengageTrigger(PlayerbotAI* ai) : Trigger(ai, "disengage on attacker", 1) {}
+
+        bool IsActive() override
+        {
+            uint32 const rankId = AI_VALUE2(uint32, "spell id", "disengage");
+            if (!rankId || !sServerFacade.IsSpellReady(bot, rankId))
+                return false;
+
+            if (!HunterHasLivingTank(ai))
+                return false;
+
+            Unit* target = AI_VALUE(Unit*, "current target");
+            if (!target || !bot->CanReachWithMeleeAutoAttack(target))
+                return false;
+
+            return AI_VALUE2(bool, "has aggro", "current target") ||
+                AI_VALUE2(uint8, "threat", "current target") >= 80;
+        }
+    };
+
+    // Raptor Strike / Wing Clip row: the generic 5 yd "enemy is close", but in
+    // the ranged kit only for a mob that is on the hunter itself (the melee
+    // chain and the kite snare). A mob the pet or a tank holds is left to the
+    // dead-zone step-back, and the hunter goes back to shooting (mod-playerbots
+    // 79bd428 GenericHunterStrategy ranks its step-back above wing clip). The
+    // close kit (mob on the hunter, or no ammo) keeps the row as before.
+    // While 2+ mobs are on the hunter the kite owns the fight: the chain
+    // stands down and the hunter clips and steps instead.
+    class HunterEnemyIsCloseTrigger : public EnemyInRangeTrigger
+    {
+    public:
+        HunterEnemyIsCloseTrigger(PlayerbotAI* ai) : EnemyInRangeTrigger(ai, "hunter enemy is close", sPlayerbotAIConfig.tooCloseDistance) {}
+
+        bool IsActive() override
+        {
+            if (!EnemyInRangeTrigger::IsActive())
+                return false;
+
+            if (!ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
+                return true;
+
+            // 2+ mobs on the hunter: the kite owns the fight, the melee
+            // chain stands down.
+            if (HunterShouldKite(ai, AI_VALUE(uint8, "my attacker count")))
+                return false;
+
+            Unit* target = AI_VALUE(Unit*, "current target");
+            return target && target->GetVictim() == bot;
         }
     };
 
@@ -301,16 +483,35 @@ private:
             Unit* target = AI_VALUE(Unit*, "current target");
             if (!target || !ai->HasStrategy("ranged", BotState::BOT_STATE_COMBAT))
                 return false;
+            // 2+ mobs on the hunter: no trading into melee, the kite owns
+            // the fight. No ammo falls through above - nothing to kite with.
+            if (HunterShouldKite(ai, AI_VALUE(uint8, "my attacker count")))
+                return false;
             bool const fastOrFinisher = (target->GetSpeed(MOVE_RUN) > (bot->GetSpeed(MOVE_RUN) / 2)) || ((!bot->GetPet() || bot->GetPet()->IsDead()) && target->GetHealthPercent() < 50.f && target->IsCreature() && target->GetHealth() < bot->GetHealth());
             // Same true distance as the ranged half (see above): one call for
             // both switches and the telemetry row.
             float const distance = bot->GetDistance(target);
+            // Only a mob on the hunter trades, after the kit dwell; a failed
+            // dead-zone step-out for a mob someone else holds is retried
+            // farther, not answered with melee (HunterSwitchPolicy.h, #1018).
+            HunterKitState* state = GetHunterKitState(ai);
+            bool const dwellElapsed = !state || HunterKitDwellElapsed(*state, WorldTimer::getMSTime());
             return ai::ShouldSwitchToMelee(true, target->GetVictim() == bot,
-                IsImmobilizedStateCompat(target), fastOrFinisher, distance, true);
+                IsImmobilizedStateCompat(target), fastOrFinisher, distance, true, false, dwellElapsed);
         }
     };
 
-    CAN_CAST_TRIGGER(MultishotCanCastTrigger, "multi-shot");
+    // Multi-Shot flies only when the splash around the kill target hits a
+    // second fighting enemy (HunterAoePolicy.h): the bare can-cast row fired
+    // the shot on cooldown, so its share never scaled with the pack. The
+    // count and the CC veto live in HunterTriggers.cpp.
+    class HunterMultiShotTrigger : public SpellCanBeCastedTrigger
+    {
+    public:
+        HunterMultiShotTrigger(PlayerbotAI* ai) : SpellCanBeCastedTrigger(ai, "multi-shot") {}
+        virtual bool IsActive() override;
+    };
+
     // BM cooldown: intimidation is a self-cast (BUFF_ACTION on self, core
     // rejects positive spells on hostile targets), ordered by the owner, so
     // the cast gate must run against the hunter itself — plus a live-pet
@@ -420,6 +621,34 @@ private:
         }
     };
 
+    // [Turtle] Steady Shot filler (ranks 3035..45974: timed cast, no
+    // cooldown, 1.5s GCD). A timed cast pauses the repeating Auto Shot, so it
+    // only fires right after an Auto Shot, while the time to the next one
+    // still covers the cast plus the core's resume windup
+    // (HunterSteadyShotFitsAutoShotWindow). Otherwise the bot keeps
+    // auto-shooting.
+    class SteadyShotTrigger : public Trigger
+    {
+    public:
+        SteadyShotTrigger(PlayerbotAI* ai) : Trigger(ai, "steady shot", 1) {}
+        virtual std::string GetTargetName() override { return "current target"; }
+
+        virtual bool IsActive() override
+        {
+            uint32 const spellId = AI_VALUE2(uint32, "spell id", "steady shot");
+            if (!HunterSteadyShotFitsAutoShotWindow(ai, spellId) || !HunterHasRangedAmmo(ai))
+                return false;
+
+            Unit* target = GetTarget();
+            return target && ai->CanCastSpell("steady shot", target, true, nullptr, true);
+        }
+    };
+
+    // PET-5 (donor NoPetTrigger shape): purely petless + unmounted. The old
+    // local addition gated this on Call Pet being unavailable, which starved
+    // both call-pet nodes exactly when a dismissed pet waited to be called.
+    // Ordering is by relevance now: instant Call Pet outranks the 20s Tame
+    // wherever castable; Tame stays for the genuine no-call-pet case.
     class HunterNoPet : public Trigger
     {
     public:
@@ -427,15 +656,8 @@ private:
         virtual bool IsActive() override
         {
             if (AI_VALUE2(bool, "mounted", "self target"))
-            return false;
-
-            if (bot->GetPetGuid())
-            return false;
-
-            if (ai->CanCastSpell("call pet", bot, 0))
-            return false;
-
-            return ai->CanCastSpell("tame beast", bot, 0);
+                return false;
+            return !bot->GetPetGuid();
         }
     };
 

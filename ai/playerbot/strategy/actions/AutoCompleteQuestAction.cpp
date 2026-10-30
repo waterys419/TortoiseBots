@@ -1,10 +1,15 @@
 #include "playerbot/playerbot.h"
 #include "AutoCompleteQuestAction.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireQuestPolicy.h"
 
 using namespace ai;
 
 bool AutoCompleteQuestAction::Execute(Event& event)
 {
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
+        return false;
+
     Player* requester = event.GetOwner() ? event.GetOwner() : GetMaster();
 
     // Static list of quest IDs to auto-complete
@@ -61,7 +66,7 @@ bool AutoCompleteQuestAction::Execute(Event& event)
             uint8 msg = bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, count - curItemCount);
             if (msg == EQUIP_ERR_OK)
             {
-                Item* item = bot->StoreNewItem(dest, id, true);
+                Item* item = bot->StoreNewItem(dest, id, true, Item::GenerateItemRandomPropertyId(id));
                 bot->SendNewItem(item, count - curItemCount, true, false);
             }
         }

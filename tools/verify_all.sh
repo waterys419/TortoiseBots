@@ -7,12 +7,19 @@ cd "${ROOT_DIR}"
 
 echo "=== 1. Verifying Open Knowledge Format (OKF) Docs ==="
 python3 tools/verify_okf.py
+python3 tools/verify_manual_value_types.py
 echo "✓ OKF docs verified."
+
+echo ""
+echo "=== 1b. Verifying .bot Command Table Against Docs ==="
+python3 tools/verify_command_docs.py
+echo "✓ Command table documented."
 
 echo ""
 echo "=== 2. Verifying Tortoise Core Module Surface ==="
 bash tools/verify_tortoise_surface.sh
 echo "✓ Module surface verified."
+python3 tools/check_eluna_guards.py
 
 echo ""
 echo "=== 3. Verifying Action & Trigger Wiring ==="
@@ -20,20 +27,65 @@ python3 tools/verify_action_trigger_wiring.py | grep -E "^(queued=|known|skip)"
 echo "✓ Action and trigger wiring verified (0 missing live creators)."
 
 echo ""
-echo "=== 4. Running Engine Unit Tests (AoE Density & Walk Gating) ==="
-python3 -m unittest tools/test_attackers_aoe_density.py
-python3 -m unittest tools/test_engine_walk_gating.py
+echo "=== 4. Running Engine Unit Tests (discovered: tools/test_*.py) ==="
+python3 -m unittest discover -s tools -p 'test_*.py'
+if [[ -z "${TORTOISE_CORE:-}" ]]; then
+    echo "SKIPPED: core-side repop door checks (set TORTOISE_CORE=<core checkout>; the VM build gate runs them)"
+fi
 echo "✓ Engine unit tests passed."
 
 echo ""
-echo "=== 5. Running Standalone Policy Tests (issue #265, party-bot latency, hire deletion guard, hunter pet threshold, grind-spot level band, travel-instance guard, hire spec honouring, pull firing position, taker reachability, death-cluster escalation) ==="
+echo "=== 5. Running Standalone Policy Tests ==="
 if command -v g++ >/dev/null 2>&1; then
-    for policy_test in test_pool_reset_policy test_pool_pass_rotation test_player_bot_classification test_hire_deletion_policy test_hire_departure_policy test_hunter_pet_policy test_start_zone_balance test_nearby_service_policy test_grind_spot_policy test_travel_instance_policy test_hire_spec_policy test_pull_firing_policy test_taker_reachability_cache test_death_cluster_policy test_vendor_trip_policy test_long_stuck_rescue_policy test_starter_kit_policy test_grind_hostility_policy test_profession_grant_policy test_vendor_weapon_upgrade_policy test_shaman_imbue_policy test_travel_repick_policy test_pull_regen_policy test_quest_objective_level_policy test_quest_taker_level_policy test_combat_stuck_policy test_ghost_stall_policy test_owned_bot_qol_policy test_survive_policy test_spell_rank_policy test_aoe_fear_policy test_class_consumable_policy test_quest_log_triage_policy test_loot_roll_policy test_skinning_loot_policy test_trading_lease_policy test_pet_upkeep_policy test_gather_tool_policy test_point_danger_policy test_flight_errand_policy test_fishing_spot_policy test_hire_intro_policy test_world_buff_policy test_ah_buyer_policy test_quest_stall_policy test_local_pick_policy test_vendor_buy_policy test_rpg_mixer_policy test_lowbie_graveyard_policy test_zone_migrate_policy test_combat_spread_policy test_pool_bot_trade_policy test_group_buff_policy test_service_trip_policy test_spec_weapon_policy test_warlock_pet_policy test_pet_spell_rank_policy test_rogue_weapon_policy test_ammo_cheat_policy test_hunter_switch_policy test_graveyard_teleport_policy test_ah_seller_teleport_policy; do
-        policy_bin="${TMPDIR:-/tmp}/${policy_test}"
-        g++ -std=c++17 -Wall -Wextra "tools/${policy_test}.cpp" -o "${policy_bin}"
-        "${policy_bin}"
-    done
-    echo "✓ Standalone policy tests verified."
+    JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+    BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tortoisebots-verify-tests.XXXXXX")"
+    trap 'rm -rf "${BUILD_DIR}"' EXIT
+    export BUILD_DIR
+
+    # Special case: needs a writable scratch directory as its argument.
+    g++ -std=c++17 -Wall -Wextra -pedantic tools/test_log_file_rotation.cpp -o "${BUILD_DIR}/test_log_file_rotation"
+    "${BUILD_DIR}/test_log_file_rotation" "${TMPDIR:-/tmp}"
+
+    # Special case: the run trace's file writer builds from its own source and needs the thread library.
+    g++ -std=c++17 -Wall -Wextra tools/test_run_trace_writer.cpp runtime/RunTraceWriter.cpp -pthread -o "${BUILD_DIR}/test_run_trace_writer"
+    "${BUILD_DIR}/test_run_trace_writer" "${TMPDIR:-/tmp}"
+
+    # Every other standalone test: discover the sources, compile and run in parallel.
+    mapfile -t CPP_TESTS < <(printf '%s\n' tools/test_*.cpp | grep -v '^tools/test_log_file_rotation\.cpp$' | grep -v '^tools/test_run_trace_writer\.cpp$')
+
+    compile_one() {
+        local src="$1" name
+        name="$(basename "${src}" .cpp)"
+        if ! g++ -std=c++17 -Wall -Wextra "${src}" -o "${BUILD_DIR}/${name}" 2> "${BUILD_DIR}/${name}.compile.log"; then
+            echo "COMPILE FAILED: ${name} (last 20 lines):"
+            tail -n 20 "${BUILD_DIR}/${name}.compile.log" | sed 's/^/    /'
+            return 1
+        fi
+        rm -f "${BUILD_DIR}/${name}.compile.log"
+    }
+
+    run_one() {
+        local src="$1" name
+        name="$(basename "${src}" .cpp)"
+        [[ -x "${BUILD_DIR}/${name}" ]] || return 0 # compile failure already reported
+        if ! "${BUILD_DIR}/${name}" > "${BUILD_DIR}/${name}.run.log" 2>&1; then
+            echo "TEST FAILED: ${name} (output):"
+            sed 's/^/    /' "${BUILD_DIR}/${name}.run.log"
+            return 1
+        fi
+        rm -f "${BUILD_DIR}/${name}.run.log"
+    }
+    export -f compile_one run_one
+
+    FAILED=0
+    printf '%s\n' "${CPP_TESTS[@]}" | xargs -P "${JOBS}" -I{} bash -c 'compile_one "$@"' _ {} || FAILED=1
+    printf '%s\n' "${CPP_TESTS[@]}" | xargs -P "${JOBS}" -I{} bash -c 'run_one "$@"' _ {} || FAILED=1
+
+    if [[ "${FAILED}" -ne 0 ]]; then
+        echo "✗ Standalone policy tests FAILED."
+        exit 1
+    fi
+    echo "✓ $((${#CPP_TESTS[@]} + 2)) standalone policy tests verified (compiled and run in parallel, ${JOBS} jobs)."
 else
     echo "ℹ Skipping standalone policy tests (no g++ on PATH)."
 fi
@@ -72,6 +124,18 @@ else
     echo ""
     echo "ℹ Skipping host contract check (no --core path provided or ../tortoise-wow not found)."
 fi
+
+echo ""
+echo "=== 8. Verifying Config Defaults vs Shipped Templates ==="
+python3 tools/verify_config_defaults.py
+python3 -m unittest tools/test_verify_config_defaults.py
+echo "✓ Config defaults verified."
+
+echo ""
+echo "=== 8b. Verifying Config Keys Are Actually Used ==="
+python3 tools/verify_config_usage.py
+python3 -m unittest tools/test_verify_config_usage.py
+echo "✓ Config usage verified."
 
 echo ""
 echo "=========================================="

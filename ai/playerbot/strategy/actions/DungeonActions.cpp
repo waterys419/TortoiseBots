@@ -1,10 +1,17 @@
 #include "playerbot/GroupMembers.h"
 #include "DungeonActions.h"
+#include "playerbot/strategy/triggers/DungeonTriggers.h"
 #include "playerbot/strategy/values/PositionValue.h"
 #include "playerbot/strategy/AiObjectContext.h"
 #include "playerbot/PlayerbotAI.h"
 #include "playerbot/strategy/values/LastMovementValue.h"
 #include "playerbot/CombatSpreadPolicy.h"
+#include "playerbot/CastKeepsRunningPolicy.h"
+#include "playerbot/policy/raid/VaelPolicy.h"
+#include "playerbot/policy/combat/DebuffSpreadPolicy.h"
+#include "playerbot/BombRunoutPolicy.h"
+#include "playerbot/FourHorsemenRotationPolicy.h"
+#include "Movement/spline/MoveSpline.h"
 #include "Maps/GridNotifiers.h"
 #include "Maps/GridNotifiersImpl.h"
 #include "Maps/CellImpl.h"
@@ -122,6 +129,12 @@ bool MoveAwayFromHazard::IsHazardNearby(const WorldPosition& point, const std::l
 
 bool MoveAwayFromCreature::Execute(Event& event)
 {
+    // (#903: holding a cast-out position is not a hazard escape - stepping
+    // out mid-cast cancels the bar. Finish the cast first; the trigger
+    // re-fires next tick. Standing in fire keeps escaping via
+    // MoveAwayFromHazard, the bomb carrier via RaidBombRunoutAction.)
+    if (ai::MoveBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true), false))
+        return false;
     // Get the active attacking creatures
     std::list<Creature*> creatures;
     size_t closestCreatureIdx = 0;
@@ -299,32 +312,170 @@ bool FindStep(PlayerbotAI* ai, Player* bot, const WorldPosition& from, float ang
 bool RaidBombRunoutAction::Execute(Event& event)
 {
     (void)event;
-    // 30yd clear of the raid anchor: Geddon/Vael/Grobbulus detonations
-    // bracket the whole clump otherwise. Keep running while the aura lives;
-    // the trigger re-fires each tick until it expires or detonates.
+    // Run from the raid's centre, not from one person: anchoring on the
+    // master or the nearest member could send a carrier through the other
+    // side of the raid. Move once to a point that clears every living
+    // same-map member by the runout radius, then stay there; the trigger
+    // keeps firing while the aura lasts, but a clear carrier does nothing.
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    std::vector<DebuffAnchor> members;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (!member || member == bot || !sServerFacade.IsAlive(member))
+            continue;
+        if (member->GetMapId() != bot->GetMapId())
+            continue;
+        DebuffAnchor anchor;
+        anchor.x = member->GetPositionX();
+        anchor.y = member->GetPositionY();
+        members.push_back(anchor);
+    }
     const float runout = sPlayerbotAIConfig.bombRunoutDistance;
+    const float botX = bot->GetPositionX();
+    const float botY = bot->GetPositionY();
+    float centreX = 0.0f, centreY = 0.0f, nearestDist = 0.0f;
+    std::size_t nearestIdx = 0;
+    if (!BombRunoutCentre(botX, botY, members.data(), members.size(), centreX, centreY, nearestDist, nearestIdx))
+        return false;
+    if (IsBombRunoutClear(nearestDist, runout))
+        return false;
+    const float away = BombRunoutAwayAngle(botX, botY, centreX, centreY,
+        members[nearestIdx].x, members[nearestIdx].y);
     const WorldPosition botPos(bot);
     WorldPosition out(botPos);
-    if (Unit* anchor = RaidAnchor(ai, bot))
+    const float angles[] = { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f };
+    for (float d : angles)
     {
-        const WorldPosition anchorPos(anchor);
-        float away = anchorPos.GetAngleTo(botPos);
-        const float angles[] = { 0.0f, 0.5f, -0.5f };
-        for (float extra = 0.0f; extra <= 10.0f; extra += 5.0f)
+        const float step = BombRunoutStep(botX, botY, away + d, nearestDist, runout, members.data(), members.size());
+        if (FindStep(ai, bot, botPos, away + d, step, out) &&
+            MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true))
         {
-            for (float d : angles)
+            // Hold the reaction until the carrier arrives, so it is not
+            // re-planned every tick on the way out.
+            if (IsReaction())
+                WaitForReach(step);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FourHorsemenRotateAction::Execute(Event& event)
+{
+    (void)event;
+    if (bot->GetMapId() != 533)
+        return false;
+    HorsemanSpot spots[kFourHorsemenCount];
+    Unit* horsemen[kFourHorsemenCount] = { nullptr, nullptr, nullptr, nullptr };
+    for (std::size_t i = 0; i < kFourHorsemenCount; ++i)
+    {
+        if (Aura* aura = ai->GetAura(kFourHorsemenMarks[i], bot))
+            spots[i].stacks = aura->GetStackAmount();
+    }
+    const int stackingIdx = FourHorsemenStackingIndex(spots);
+    if (stackingIdx < 0)
+        return false;
+    // Live horsemen from the cached attackers list (no world scan): where
+    // the tanks hold them is their corner (the core gives no fixed spots).
+    const std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
+    for (const ObjectGuid& guid : attackers)
+    {
+        Unit* unit = ai->GetUnit(guid);
+        if (!unit || !sServerFacade.IsAlive(unit) || unit->GetMapId() != bot->GetMapId())
+            continue;
+        const int idx = FourHorsemenIndexForEntry(unit->GetEntry());
+        if (idx < 0 || horsemen[idx])
+            continue;
+        horsemen[idx] = unit;
+        spots[idx].alive = true;
+        spots[idx].x = unit->GetPositionX();
+        spots[idx].y = unit->GetPositionY();
+    }
+    // The corner the bot stands at now = its nearest living horseman.
+    int currentIdx = -1;
+    float currentDist = FLT_MAX;
+    for (std::size_t i = 0; i < kFourHorsemenCount; ++i)
+    {
+        if (!horsemen[i])
+            continue;
+        const float dist = sServerFacade.getDistance2d(bot, horsemen[i]);
+        if (dist < currentDist)
+        {
+            currentDist = dist;
+            currentIdx = static_cast<int>(i);
+        }
+    }
+    // Keep the corner chosen earlier while that choice holds, so a bot
+    // walking diagonally is not captured by whichever horseman is nearest
+    // mid-walk; otherwise the corner it stands at now.
+    const int storedFrom = AI_VALUE2(int32, "manual int", kFourHorsemenFromKey) - 1;
+    const int storedTo = AI_VALUE2(int32, "manual int", kFourHorsemenToKey) - 1;
+    const bool keepChoice = FourHorsemenChoiceHolds(spots, storedFrom, storedTo);
+    const int nextIdx = FourHorsemenNextIndex(spots, stackingIdx, keepChoice ? storedTo : currentIdx);
+    if (nextIdx < 0)
+        return false;
+    // A tank bot only leaves a corner another tank already covers: walking
+    // off with no handover drags the horseman through the raid with nobody
+    // to pick it up. Covered = another tank (bot or player, alive, same
+    // map) already at / heading to the leaving corner — within handover
+    // range of that horseman, or walking it via its own stored rotation
+    // choice. Non-tanks always rotate; an unheld corner needs no handover.
+    if (ai->IsTank(bot) && currentIdx >= 0 && currentIdx != nextIdx && horsemen[currentIdx])
+    {
+        bool handedOver = false;
+        if (Group* group = bot->GetGroup())
+        {
+            for (Player* member : LiveGroupMembers(group))
             {
-                if (FindStep(ai, bot, botPos, away + d, runout + extra, out) &&
-                    MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true))
-                    return true;
+                if (!member || member == bot || !sServerFacade.IsAlive(member))
+                    continue;
+                if (member->GetMapId() != bot->GetMapId() || !PlayerbotAI::IsTank(member))
+                    continue;
+                if (sServerFacade.getDistance2d(member, horsemen[currentIdx]) <= kFourHorsemenHandoverYd)
+                {
+                    handedOver = true;
+                    break;
+                }
+                if (PlayerbotAI* memberAi = PlayerbotAIStorage::Instance().GetAI(member))
+                {
+                    const int memberTo = memberAi->GetAiObjectContext()->GetValue<int32>(
+                        "manual int", kFourHorsemenToKey)->Get() - 1;
+                    if (memberTo == currentIdx)
+                    {
+                        handedOver = true;
+                        break;
+                    }
+                }
             }
         }
-        return false;
+        if (!handedOver)
+            return false;
     }
-    // Solo carrier: radial flee still clears melee range.
-    float angle = frand(0, M_PI_F * 2.0f);
-    return FindStep(ai, bot, botPos, angle, runout, out) &&
-           MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true);
+    // Remember the choice; the dps/tank target values read it so assists
+    // keep the bot on this horseman instead of the group tank's (no
+    // ping-pong).
+    if (!keepChoice || nextIdx != storedTo)
+    {
+        SET_AI_VALUE2(int32, "manual int", kFourHorsemenFromKey, stackingIdx + 1);
+        SET_AI_VALUE2(int32, "manual int", kFourHorsemenToKey, nextIdx + 1);
+    }
+    Unit* next = horsemen[nextIdx];
+    const bool healer = ai->IsHeal(bot);
+    // Tanks pick the horseman up, DPS hit the one they now stand at (melee
+    // could not reach the old one anyway); healers keep their heal target.
+    if (!healer && AI_VALUE(Unit*, "current target") != next)
+        SET_AI_VALUE(Unit*, "current target", next);
+    const bool standOff = healer || (!ai->IsTank(bot) && ai->IsRanged(bot));
+    const float offset = standOff ? kFourHorsemenRangedOffsetYd : kFourHorsemenMeleeOffsetYd;
+    if (FourHorsemenArrived(currentIdx == nextIdx, sServerFacade.getDistance2d(bot, next), offset))
+        return false;
+    float x = 0.0f, y = 0.0f;
+    FourHorsemenCornerSpot(spots, nextIdx, offset, x, y);
+    WorldPosition point(bot->GetMapId(), x, y, next->GetPositionZ());
+    point.setZ(point.GetHeight());
+    return MoveTo(bot->GetMapId(), point.getX(), point.getY(), point.getZ(), false, IsReaction(), false, true);
 }
 
 bool DragonFlankAction::Execute(Event& event)
@@ -356,23 +507,55 @@ bool DragonFlankAction::Execute(Event& event)
 bool RaidSpreadAction::Execute(Event& event)
 {
     (void)event;
-    // The reaction engine fires this for any stacked ranged bot, but the
-    // Onyxia fight strategy also queues it directly: re-check the spread
-    // gate here so explicit hold orders and owned bots (live master OR owner
-    // record, for offline masters) hold position instead of stepping out.
-    if (!ShouldCombatSpread(sServerFacade.IsInCombat(bot), ai->HasRealPlayerMaster(),
-        ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT),
-        ai->HasStrategy("follow", BotState::BOT_STATE_COMBAT),
-        ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT),
-        ai->HasStrategy("grind", BotState::BOT_STATE_COMBAT)) ||
-        IsSpreadExemptOwned(ai->HasRealPlayerMaster(), ai->IsOwnedBot()))
-        return false;
+    // Opt-in spread ("spread" strategy): the player asked for spacing, so
+    // owned/hired bots and melee are eligible and the manual "spread
+    // distance" (or role default) is the "too close" radius. Otherwise the
+    // legacy pool-only path: ranged pool bots at the 10yd stack radius.
+    bool const optIn = ai->HasStrategy("spread", BotState::BOT_STATE_COMBAT);
+    float radius = kSpreadSettledDistance;
+    if (optIn)
+    {
+        // Tanks never spread: stepping out drags the boss/cleave through the
+        // raid, then reach-melee runs back and re-fires — ping-pong.
+        if (ai->IsTank(bot))
+            return false;
+        if (!ShouldOptInSpread(sServerFacade.IsInCombat(bot),
+            ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("follow", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("guard", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("grind", BotState::BOT_STATE_COMBAT)))
+            return false;
+        radius = SpreadRadius(AI_VALUE(float, "spread distance"), ai->IsRanged(bot));
+    }
+    else
+    {
+        // The reaction engine fires this for any stacked ranged bot, but the
+        // Onyxia fight strategy also queues it directly: re-check the spread
+        // gate here so explicit hold orders hold position, and owned bots (live
+        // master OR owner record, for offline masters) do too outside raid
+        // maps. Inside a raid companions spread like pool bots.
+        if (!ShouldRaidSurvivalSpread(sServerFacade.IsInCombat(bot), ai->HasRealPlayerMaster(),
+            ai->IsOwnedBot(), bot->GetMap() && bot->GetMap()->IsRaid(),
+            ai->HasStrategy("stay", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("follow", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("wait for attack", BotState::BOT_STATE_COMBAT),
+            ai->HasStrategy("grind", BotState::BOT_STATE_COMBAT)))
+            return false;
+        // Melee/tanks stack by design; spread is a ranged survival behavior.
+        if (!ai->IsRanged(bot))
+            return false;
+    }
     // One step per cooldown: stacked bots settle after a single step-out
     // instead of ping-ponging toward the next friendly every tick.
+    // (#903: spacing is not a hazard escape - a step-out mid-cast cancels
+    // the bar. Finish the cast first; the trigger re-fires next tick.)
+    if (ai::MoveBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true), false))
+        return false;
     LastMovement& lastMove = AI_VALUE(LastMovement&, "last movement");
     if (IsSpreadOnCooldown(WorldTimer::getMSTime(), lastMove.lastSpreadStepMs))
         return false;
-    // Step 12yd directly away from the nearest stacked friendly.
+    // Step out directly away from the nearest stacked friendly.
     Group* group = bot->GetGroup();
     if (!group)
         return false;
@@ -391,16 +574,20 @@ bool RaidSpreadAction::Execute(Event& event)
             nearest = member;
         }
     }
-    if (!nearest || nearestDist >= kSpreadSettledDistance)
+    if (!nearest || nearestDist >= radius)
         return false;
     const WorldPosition botPos(bot);
     const WorldPosition nearPos(nearest);
     float away = nearPos.GetAngleTo(botPos);
-    // Donor "recently flee info" (mod-playerbots MovementAction::CheckLastFlee):
-    // first pass skips step-out headings within ~45deg of the last two flee
-    // destinations so repeated spreads fan out; the second pass takes vetoed
-    // headings so a spread is never blocked outright.
-    const float spread = sPlayerbotAIConfig.hazardEvasionDistance;
+    uint32 const nowMs = WorldTimer::getMSTime();
+    lastMove.spreadFailures.Observe(nearest->GetObjectGuid().GetRawValue(),
+        bot->GetMapId(), nearestDist, nowMs, bot->movespline->GetId());
+    // Prefer headings that have not failed to gain spacing. A second pass
+    // allows remembered failures so the cache can never block every route.
+    // Step just past the trigger radius (donor: min(radius + 1, flee)): a
+    // fixed 12yd leap from a 2yd melee trigger would overshoot out of melee
+    // and ping-pong back via reach-melee.
+    const float spread = std::min(radius + 1.0f, sPlayerbotAIConfig.hazardEvasionDistance);
     const float angles[] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, (float)M_PI };
     WorldPosition out(botPos);
     for (int pass = 0; pass < 2; ++pass)
@@ -409,15 +596,13 @@ bool RaidSpreadAction::Execute(Event& event)
         for (float d : angles)
         {
             float heading = away + d;
-            if (!vetoSecondPass && !IsFleeHeadingFree(heading, lastMove.lastFleeAngles, kFleeAngleSlots))
+            if (!vetoSecondPass && !lastMove.spreadFailures.IsHeadingFree(heading, nowMs))
                 continue;
             if (FindStep(ai, bot, botPos, heading, spread, out) &&
                 MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true))
             {
-                lastMove.lastFleeAngles[1] = lastMove.lastFleeAngles[0];
-                lastMove.lastFleeAngles[0] = heading;
-                if (lastMove.lastFleeAngleCount < 2)
-                    ++lastMove.lastFleeAngleCount;
+                lastMove.spreadFailures.BeginAttempt(nearest->GetObjectGuid().GetRawValue(),
+                    bot->GetMapId(), botPos.GetAngleTo(out), nearestDist, nowMs, bot->movespline->GetId());
                 lastMove.lastSpreadStepMs = WorldTimer::getMSTime();
                 return true;
             }
@@ -493,4 +678,215 @@ bool MoveAwayFromCreature::IsHazardNearby(const WorldPosition& point, const std:
     }
 
     return false;
+}
+bool SwapFireResistanceAuraAction::Execute(Event& event)
+{
+    // Combat engine only (donor parity): the rfire strategy's upkeep
+    // trigger then maintains the aura for the rest of the fight. The flag
+    // marks the swap as ours, so "restore spec aura" undoes it after the
+    // fight and a player's own "+rfire" is left alone.
+    ai->ChangeStrategy("+rfire", BotState::BOT_STATE_COMBAT);
+    SET_AI_VALUE2(bool, "manual bool", "resist aura swapped", true);
+    return ai->DoSpecificAction(WantedResistAuraAction(true, false), event, true);
+}
+
+bool SwapShadowResistanceAuraAction::Execute(Event& event)
+{
+    ai->ChangeStrategy("+rshadow", BotState::BOT_STATE_COMBAT);
+    SET_AI_VALUE2(bool, "manual bool", "resist aura swapped", true);
+    return ai->DoSpecificAction(WantedResistAuraAction(false, true), event, true);
+}
+
+bool RestoreSpecAuraAction::Execute(Event& event)
+{
+    (void)event;
+    SET_AI_VALUE2(bool, "manual bool", "resist aura swapped", false);
+    // A manual aura order taken since the swap wins: re-adding the "aura"
+    // placeholder would drop it (same sibling group), so only forget.
+    if (HasManualPaladinAuraOverride(ai))
+        return true;
+    // "aura" is a sibling of rfire/rshadow: adding it back drops the
+    // resist upkeep, and the spec's raid/pve aura strategy follows it.
+    ai->ChangeStrategy("-rfire,-rshadow,+aura", BotState::BOT_STATE_COMBAT);
+    // "no paladin aura" stays quiet while any own aura is up, so drop
+    // the resist aura; the spec aura ("no paladin aura") recasts next tick.
+    if (ai->HasMyAura("fire resistance aura", bot))
+        ai->RemoveAura("fire resistance aura");
+    if (ai->HasMyAura("shadow resistance aura", bot))
+        ai->RemoveAura("shadow resistance aura");
+    return true;
+}
+
+bool VaelBurningAdrenalineFleeAction::Execute(Event& event)
+{
+    (void)event;
+    // Current BA spell ids (universal bomb trigger covers 20475/23620/
+    // 18173/23478/28169 — Vael's set is the middle three).
+    static const uint32 baSpells[] = { 23620, 18173, 23478 };
+    bool hasBa = false;
+    for (uint32 spellId : baSpells)
+    {
+        if (ai->HasAura(spellId, bot))
+        {
+            hasBa = true;
+            break;
+        }
+    }
+    if (!hasBa)
+        return false;
+    // Find Vael among the attackers (entry 13020, set by the BWL bundle).
+    AiObjectContext* context = ai->GetAiObjectContext();
+    const std::list<ObjectGuid> attackers = AI_VALUE(std::list<ObjectGuid>, "attackers");
+    Unit* boss = nullptr;
+    for (const ObjectGuid& attackerGuid : attackers)
+    {
+        Unit* attacker = ai->GetUnit(attackerGuid);
+        if (attacker && attacker->GetEntry() == 13020)
+        {
+            boss = attacker;
+            break;
+        }
+    }
+    bool bossAlive = boss && sServerFacade.IsAlive(boss);
+    // The victim holds while Vael lives — fleeing the tank through the
+    // raid wipes it faster than the detonation.
+    if (boss && boss->GetVictim() && boss->GetVictim()->getObjectGuid() == bot->getObjectGuid())
+    {
+        if (ShouldVaelVictimHold(true, bossAlive))
+            return false;
+    }
+    // Weighted repulsion from non-BA bots within 20y (closer pushes
+    // harder); other BA carriers are ignored while the boss lives so
+    // victims cluster together away from the clean raid.
+    const WorldPosition botPos(bot);
+    float fleeX = 0.0f, fleeY = 0.0f;
+    Group* group = bot->GetGroup();
+    if (group)
+    {
+        for (Player* member : LiveGroupMembers(group))
+        {
+            if (!member || member == bot || !sServerFacade.IsAlive(member))
+                continue;
+            if (member->GetMapId() != bot->GetMapId())
+                continue;
+            bool memberHasBa = false;
+            for (uint32 spellId : baSpells)
+            {
+                if (ai->HasAura(spellId, member))
+                {
+                    memberHasBa = true;
+                    break;
+                }
+            }
+            if (ShouldClusterWithBaCarriers(memberHasBa, bossAlive))
+                continue;
+            float dist = sServerFacade.getDistance2d(bot, member);
+            if (dist < kVaelRepulsionRange && dist > 0.1f)
+            {
+                float weight = 1.0f - dist / kVaelRepulsionRange;
+                fleeX += (botPos.getX() - member->GetPositionX()) / dist * weight;
+                fleeY += (botPos.getY() - member->GetPositionY()) / dist * weight;
+            }
+        }
+    }
+    float fleeLen = sqrt(fleeX * fleeX + fleeY * fleeY);
+    float baseAngle;
+    if (fleeLen < 0.1f)
+    {
+        // No push: tail-sweep recovery — knocked past 30y, walk back to
+        // the boss instead of standing out of range.
+        if (!boss || !ShouldRecoverToVaelBoss(false, bossAlive, boss && bot->GetDistance(boss) > kVaelTailSweepRecoveryRange))
+            return false;
+        const WorldPosition bossPos(boss);
+        baseAngle = botPos.GetAngleTo(bossPos);
+    }
+    else
+    {
+        fleeX /= fleeLen;
+        fleeY /= fleeLen;
+        baseAngle = atan2(fleeY, fleeX);
+        // Ranged past 25y blends the flee toward the boss to hold cast
+        // range; FindStep keeps LOS via its own checks.
+        if (boss && ShouldBiasFleeToVaelBoss(ai->IsRanged(bot), bossAlive, bot->GetDistance(boss) > kVaelRangedBiasThreshold))
+        {
+            const WorldPosition bossPos(boss);
+            float toBoss = botPos.GetAngleTo(bossPos);
+            // Blend only when fleeing away from the boss.
+            float diff = fabs(baseAngle - toBoss);
+            while (diff > M_PI_F)
+                diff = fabs(diff - 2.0f * M_PI_F);
+            if (diff > M_PI_F / 2.0f)
+                baseAngle = toBoss;
+        }
+    }
+    // Step 3y along the flee heading (donor incremental step), sliding
+    // along walls on failure like the bomb runout.
+    WorldPosition out(botPos);
+    const float angles[] = { 0.0f, 0.5f, -0.5f };
+    for (float d : angles)
+    {
+        if (FindStep(ai, bot, botPos, baseAngle + d, 3.0f, out) &&
+            MoveTo(bot->GetMapId(), out.getX(), out.getY(), out.getZ(), false, IsReaction(), false, true))
+            return true;
+    }
+    return false;
+}
+
+bool MoveAwayFromPlayerWithDebuff::Execute(Event& event)
+{
+    // (#903: same cast-out hold as MoveAwayFromCreature - spacing from a
+    // debuff carrier is not standing in fire. The carrier's own escape
+    // (RaidBombRunoutAction) is exempt and still runs mid-cast.)
+    if (ai::MoveBlockedByCast(bot->IsNonMeleeSpellCasted(false, true, true), false))
+        return false;
+    (void)event;
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    // Carriers: live groupmates (never self) holding the debuff. Self is
+    // excluded: the carrier's own escape is RaidBombRunoutAction, and
+    // counting self would fight that runout for the same move.
+    std::vector<Player*> carriers;
+    for (Player* member : LiveGroupMembers(group))
+    {
+        if (!member || member == bot || !sServerFacade.IsAlive(member))
+            continue;
+        if (member->GetMapId() != bot->GetMapId())
+            continue;
+        if (ai->HasAura(spellId, member))
+            carriers.push_back(member);
+    }
+    if (carriers.empty())
+        return false;
+    // Donor search: 8 compass directions x 3yd steps out to range+5yd.
+    // A candidate is safe when EVERY carrier stays outside the blast
+    // radius; the safest (largest minimum separation) wins.
+    const WorldPosition botPos(bot);
+    WorldPosition best(botPos);
+    float bestClearance = -1.0f;
+    for (int dir = 0; dir < 8; ++dir)
+    {
+        float angle = (dir * 2.0f * (float)M_PI) / 8.0f;
+        for (float dist = kDebuffSpreadStepYd; dist <= range + kDebuffSpreadOvershootYd; dist += kDebuffSpreadStepYd)
+        {
+            WorldPosition cand = botPos + WorldPosition(0, dist * cos(angle), dist * sin(angle), 1.0f);
+            cand.setZ(cand.GetHeight());
+            float minCarrier = FLT_MAX;
+            for (Player* carrier : carriers)
+                minCarrier = std::min(minCarrier, sServerFacade.getDistance2d(carrier, cand.getX(), cand.getY()));
+            if (!IsDebuffSafePoint(minCarrier, range))
+                continue;
+            WorldPosition stepOut(botPos);
+            if (!FindStep(ai, bot, botPos, angle, dist, stepOut))
+                continue;
+            if (minCarrier > bestClearance)
+            {
+                bestClearance = minCarrier;
+                best = stepOut;
+            }
+        }
+    }
+    if (bestClearance < 0.0f)
+        return false;
+    return MoveTo(bot->GetMapId(), best.getX(), best.getY(), best.getZ(), false, IsReaction(), false, true);
 }

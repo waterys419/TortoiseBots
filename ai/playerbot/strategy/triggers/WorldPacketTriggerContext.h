@@ -23,6 +23,7 @@ namespace ai
             creators["quest details"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "quest details"); };
             creators["quest share"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "quest share"); };
             creators["loot start roll"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "loot start roll"); };
+            creators["loot vote"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "loot vote"); };
             creators["loot roll"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "loot roll"); };
             creators["loot roll won"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "loot roll won"); };
             creators["resurrect request"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "resurrect request"); };
@@ -31,6 +32,7 @@ namespace ai
             creators["check mount state"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "check mount state"); };
             creators["activate taxi"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "activate taxi"); };
             creators["trade status"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "trade status"); };
+            creators["trade status extended"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "trade status extended"); };
             creators["loot response"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "loot response"); };
             creators["quest update add kill"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "quest update add kill"); };
             creators["quest update add item"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "quest update add item"); };
@@ -58,6 +60,7 @@ namespace ai
             creators["receive emote"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "receive emote"); };
             creators["receive text emote"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "receive text emote"); };
             creators["summon request"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "summon request"); };
+            creators["master use item"] = [](PlayerbotAI* ai) { return new WorldPacketTrigger(ai, "master use item"); };
         }
     };
 };

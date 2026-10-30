@@ -204,7 +204,7 @@ func TestQuestFeedAndActivitySummary(t *testing.T) {
 	}
 }
 
-func TestActivityClearedOnSessionChangeAndRosterWipe(t *testing.T) {
+func TestActivityKeptAcrossSessionChangeAndRosterWipe(t *testing.T) {
 	c := newClock()
 	s := newTestStore(c)
 	s.ApplyBotEvents(events(1, model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 5}))
@@ -212,36 +212,66 @@ func TestActivityClearedOnSessionChangeAndRosterWipe(t *testing.T) {
 		t.Fatal("expected one tracked bot")
 	}
 
-	// A different game-server process (new session id) resets everything.
+	// A different game-server process (new session id) keeps the cumulative
+	// counters: Alpha's kill stays and Beta is added alongside it.
 	s.ApplyBotEvents(events(2, model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Beta", GUID: 2, Class: "rogue", Level: 7}))
 	act := s.Activity()
-	if len(act.Bots) != 1 || act.Bots[0].Name != "Beta" || act.Bots[0].Activity.Kills != 1 {
-		t.Fatalf("session change did not reset activity: %+v", act.Bots)
+	if len(act.Bots) != 2 || killsOf(act, "Alpha") != 1 || killsOf(act, "Beta") != 1 {
+		t.Fatalf("session change lost activity: %+v", act.Bots)
 	}
 
-	// Roster TTL wipe clears counters and feeds too.
-	publishRoster(s, 1, model.BotSnapshot{Name: "Beta", GUID: 2, Class: "rogue", Level: 7, State: "idle"})
+	// A roster TTL wipe clears the roster, not the cumulative activity.
+	publishRoster(s, 2, model.BotSnapshot{Name: "Beta", GUID: 2, Class: "rogue", Level: 7, State: "idle"})
 	c.Advance(60 * time.Second)
 	if !s.Evict() {
 		t.Fatal("expected the roster to expire")
 	}
-	if got := s.Activity(); len(got.Bots) != 0 || len(got.LevelFeed) != 0 {
-		t.Fatalf("roster wipe did not clear activity: %+v", got)
+	if got := s.Activity(); len(got.Bots) != 2 {
+		t.Fatalf("roster wipe dropped activity: %+v", got.Bots)
 	}
 }
 
-func TestPruneDepartedBotActivity(t *testing.T) {
+func TestDepartedBotActivityIsKept(t *testing.T) {
 	c := newClock()
 	s := newTestStore(c)
 	s.ApplyBotEvents(events(1,
 		model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 5},
 		model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Beta", GUID: 2, Class: "rogue", Level: 6},
 	))
-	// Beta logs out: the next published roster no longer carries it.
+	// Beta logs out: the next published roster no longer carries it, but its
+	// counters are cumulative and stay.
 	publishRoster(s, 1, model.BotSnapshot{Name: "Alpha", GUID: 1, Class: "warrior", Level: 5, State: "idle"})
 	act := s.Activity()
-	if len(act.Bots) != 1 || act.Bots[0].Name != "Alpha" {
-		t.Fatalf("departed bot activity not pruned: %+v", act.Bots)
+	if len(act.Bots) != 2 || killsOf(act, "Beta") != 1 {
+		t.Fatalf("departed bot activity dropped: %+v", act.Bots)
+	}
+}
+
+// killsOf is the kill counter of the named bot in an activity view, or -1.
+func killsOf(act model.ActivityResponse, name string) int {
+	for _, b := range act.Bots {
+		if b.Name == name {
+			return b.Activity.Kills
+		}
+	}
+	return -1
+}
+
+func TestRollWonCountsAsLootWithRollSource(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+
+	s.ApplyBotEvents(events(1,
+		model.BotEvent{Event: "RollWon", Info1: "Gold-flecked Gloves", Info2: "5195", Bot: "Vaezel", GUID: 11, Class: "priest", Level: 20, ItemID: 5195, Quality: 2, Sell: 100, Money: 500},
+	))
+
+	act := s.Activity()
+	if act.Summary.Counters.LootItems != 1 {
+		t.Fatalf("RollWon did not count as loot: %+v", act.Summary.Counters)
+	}
+	feed := s.LootFeed(LootFilter{})
+	if len(feed) != 1 || feed[0].Source != "roll" || feed[0].Item != "Gold-flecked Gloves" {
+		t.Fatalf("roll feed wrong: %+v", feed)
 	}
 }
 
@@ -292,7 +322,7 @@ func TestFeedRowsCarryDaemonTimestamp(t *testing.T) {
 	))
 	publishRoster(s, 1, model.BotSnapshot{Name: "Alpha", GUID: 1, Class: "warrior", Level: 4, State: "idle"})
 
-	want := "2026-09-10 12:00:00"
+	want := stampTime(c.Now().Unix())
 	if rows := s.LootFeed(LootFilter{}); len(rows) != 1 || rows[0].TimeStr != want {
 		t.Fatalf("loot feed timestamp = %+v, want %s", rows, want)
 	}
@@ -312,7 +342,7 @@ func TestActivitySummaryReportsWindowStart(t *testing.T) {
 	s.ApplyBotEvents(events(1, model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 5}))
 
 	act := s.Activity()
-	if act.Summary.Since != c.Now().Unix() || act.Summary.SinceStr != "2026-09-10 12:00:00" {
+	if act.Summary.Since != c.Now().Unix() || act.Summary.SinceStr != stampTime(c.Now().Unix()) {
 		t.Fatalf("activity window = %d/%q, want the session start", act.Summary.Since, act.Summary.SinceStr)
 	}
 }
@@ -342,7 +372,7 @@ func TestActivitySurvivesDashboardRestart(t *testing.T) {
 		act.Bots[0].Activity.QuestsCompleted != 1 || act.Bots[0].Activity.OpenQuests != 1 {
 		t.Fatalf("counters did not survive the restart: %+v", act.Bots)
 	}
-	if act.Summary.SinceStr != "2026-09-10 12:00:00" || len(act.LevelFeed) != 0 {
+	if act.Summary.SinceStr != stampTime(c.Now().Unix()) || len(act.LevelFeed) != 0 {
 		t.Fatalf("window/feeds not restored: since=%q levels=%+v", act.Summary.SinceStr, act.LevelFeed)
 	}
 	if len(restarted.LootFeed(LootFilter{})) != 1 || len(restarted.QuestFeed(QuestFilter{})) != 1 {
@@ -356,14 +386,15 @@ func TestActivitySurvivesDashboardRestart(t *testing.T) {
 		t.Fatalf("kills = %d after restore + same-session event, want 2", got)
 	}
 
-	// A restarted game server invalidates the restored counters.
+	// A restarted game server keeps the restored counters and the window start.
+	since := act.Summary.Since
 	restarted.ApplyBotEvents(events(2, model.BotEvent{Event: "Kill", Info1: "Boar", Info2: "20", Bot: "Beta", GUID: 2, Class: "rogue", Level: 7}))
 	after := restarted.Activity()
-	if len(after.Bots) != 1 || after.Bots[0].Name != "Beta" || after.Bots[0].Activity.Kills != 1 {
-		t.Fatalf("new session must reset the restored counters: %+v", after.Bots)
+	if len(after.Bots) != 2 || killsOf(after, "Alpha") != 2 || killsOf(after, "Beta") != 1 {
+		t.Fatalf("new session must keep the restored counters: %+v", after.Bots)
 	}
-	if after.Summary.Since != c.Now().Unix() {
-		t.Fatalf("window start not moved to the new session: %d", after.Summary.Since)
+	if after.Summary.Since != since {
+		t.Fatalf("window start moved on a new session: %d, want %d", after.Summary.Since, since)
 	}
 }
 
@@ -385,4 +416,88 @@ func TestRestoreActivityIgnoresMissingAndCorruptFiles(t *testing.T) {
 	if got := s.Activity(); len(got.Bots) != 0 {
 		t.Fatalf("corrupt restore must leave the store empty: %+v", got.Bots)
 	}
+}
+
+func TestPvpFeedNewestFirstAndBotFilter(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+	s.ApplyBotEvents(events(1,
+		model.BotEvent{Event: "WorldPvpEngage", Info1: "Ganker", Info2: "player", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 40, MapID: 0, ZoneID: 40, TargetLevel: 42},
+	))
+	c.Advance(time.Second)
+	s.ApplyBotEvents(events(1,
+		model.BotEvent{Event: "WorldPvpKill", Info1: "Ganker", Info2: "42", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 40, MapID: 0, ZoneID: 40},
+		model.BotEvent{Event: "WorldPvpDeath", Info1: "Rogue", Info2: "39", Bot: "Beta", GUID: 2, Class: "mage", Level: 38, MapID: 0, ZoneID: 40},
+	))
+
+	feed := s.PvpFeed(PvpFilter{})
+	if len(feed) != 3 {
+		t.Fatalf("want 3 pvp rows, got %d", len(feed))
+	}
+	if feed[0].Event != "death" || feed[0].Bot != "Beta" || feed[0].Target != "Rogue" || feed[0].TargetLevel != 39 {
+		t.Fatalf("newest row wrong: %+v", feed[0])
+	}
+	if feed[1].Event != "kill" || feed[1].TargetLevel != 42 {
+		t.Fatalf("kill row wrong: %+v", feed[1])
+	}
+	if feed[2].Event != "engage" || feed[2].Target != "Ganker" || feed[2].TargetKind != "player" || feed[2].TargetLevel != 42 || feed[2].ZoneID != 40 {
+		t.Fatalf("engage row wrong: %+v", feed[2])
+	}
+	if got := s.PvpFeed(PvpFilter{Bot: "ALPH"}); len(got) != 2 {
+		t.Fatalf("bot filter wrong: %+v", got)
+	}
+	if got := s.PvpFeed(PvpFilter{Bot: "zzz"}); len(got) != 0 {
+		t.Fatalf("bot filter should exclude: %+v", got)
+	}
+	if got := s.PvpFeed(PvpFilter{Limit: 1}); len(got) != 1 {
+		t.Fatalf("limit ignored: %+v", got)
+	}
+
+	act := s.Activity()
+	if act.Summary.Counters.PvpEngagements != 1 || act.Summary.Counters.PvpKills != 1 || act.Summary.Counters.PvpDeaths != 1 {
+		t.Fatalf("pvp counters wrong: %+v", act.Summary.Counters)
+	}
+}
+
+func TestWorldPvpFightingExpiriesAndClears(t *testing.T) {
+	c := newClock()
+	s := newTestStore(c)
+	publishRoster(s, 1, model.BotSnapshot{Name: "Alpha", GUID: 1, Class: "warrior", Level: 40, State: "combat"})
+
+	s.ApplyBotEvents(events(0,
+		model.BotEvent{Event: "WorldPvpEngage", Info1: "Ganker", Info2: "player", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 40, TargetLevel: 42},
+	))
+	if got := fightingOf(s, 1); got != "Ganker" {
+		t.Fatalf("fighting = %q, want Ganker", got)
+	}
+
+	// A kill clears the fight at once.
+	s.ApplyBotEvents(events(0,
+		model.BotEvent{Event: "WorldPvpKill", Info1: "Ganker", Info2: "42", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 40},
+	))
+	if got := fightingOf(s, 1); got != "" {
+		t.Fatalf("fighting = %q after the kill, want empty", got)
+	}
+
+	// Without a kill or death the fight expires after a minute.
+	s.ApplyBotEvents(events(0,
+		model.BotEvent{Event: "WorldPvpEngage", Info1: "Rogue", Info2: "player", Bot: "Alpha", GUID: 1, Class: "warrior", Level: 40, TargetLevel: 39},
+	))
+	c.Advance(59 * time.Second)
+	if got := fightingOf(s, 1); got != "Rogue" {
+		t.Fatalf("fighting = %q before expiry, want Rogue", got)
+	}
+	c.Advance(2 * time.Second)
+	if got := fightingOf(s, 1); got != "" {
+		t.Fatalf("fighting = %q past expiry, want empty", got)
+	}
+}
+
+func fightingOf(s *Store, guid uint32) string {
+	for _, b := range s.Snapshot().Bots {
+		if b.GUID == guid {
+			return b.WorldPvpFighting
+		}
+	}
+	return "<missing>"
 }

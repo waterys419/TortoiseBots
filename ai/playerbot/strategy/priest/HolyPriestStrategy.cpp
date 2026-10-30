@@ -35,20 +35,59 @@ void HolyPriestStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     // heal (16): flash heal needs 20, greater heal needs 40. Without a
     // direct low-rank trigger the engine never falls back (alternatives
     // only run on isPossible failure, not isUseful), so the priest idles.
+    // Donor order: efficient Greater Heal before fast Flash Heal; the
+    // low-level heal/lesser ranks stay as fallbacks for untrained bots.
+    // The slots sit one below the medium row so the pace row's flash heal
+    // (MEDIUM+2) outranks the slow greater heal in this band too.
     triggers.push_back(new TriggerNode(
         "party member low health",
-        NextAction::array(0, new NextAction("power word: shield on party", ACTION_MEDIUM_HEAL + 2),
-                             new NextAction("heal on party", ACTION_MEDIUM_HEAL + 1),
-                             new NextAction("lesser heal on party", ACTION_MEDIUM_HEAL), NULL)));
+        NextAction::array(0, new NextAction("power word: shield on party", ACTION_MEDIUM_HEAL + 4),
+                             new NextAction("greater heal on party", ACTION_MEDIUM_HEAL + 1),
+                             new NextAction("flash heal on party", ACTION_MEDIUM_HEAL),
+                             new NextAction("heal on party", ACTION_MEDIUM_HEAL - 1),
+                             new NextAction("lesser heal on party", ACTION_MEDIUM_HEAL - 2), NULL)));
 
+    // Fast damage with enough healer mana: flash heal lands before the bar
+    // runs into the critical band. Both band rows sit below, so the pick
+    // cannot downgrade to a slow cast as the bar crosses the band line.
+    // Untrained flash heal falls through to those rows.
+    triggers.push_back(new TriggerNode(
+        "party member fast damage",
+        NextAction::array(0, new NextAction("power word: shield on party", ACTION_MEDIUM_HEAL + 4),
+                             new NextAction("flash heal on party", ACTION_MEDIUM_HEAL + 2), NULL)));
+
+    // Slow or stable damage keeps the efficient row here - greater heal/
+    // heal/lesser heal by deficit, renew last. A healer low on mana stays
+    // on the efficient rows too; flash heal is then kept for a member
+    // predicted to reach the critical line before the slow cast lands.
     triggers.push_back(new TriggerNode(
         "party member medium health",
-        NextAction::array(0, new NextAction("heal on party", ACTION_MEDIUM_HEAL),
-                             new NextAction("lesser heal on party", ACTION_MEDIUM_HEAL - 1), NULL)));
+        NextAction::array(0, new NextAction("power word: shield on party", ACTION_MEDIUM_HEAL + 4),
+                             new NextAction("greater heal on party", ACTION_MEDIUM_HEAL),
+                             new NextAction("heal on party", ACTION_MEDIUM_HEAL - 1),
+                             new NextAction("lesser heal on party", ACTION_MEDIUM_HEAL - 2),
+                             new NextAction("renew on party", ACTION_LIGHT_HEAL), NULL)));
+
+    // Owner-approved (2026-10-14): while the tank does not hold the pack,
+    // Flash Heal goes just above Greater Heal (still below Inner Focus and
+    // the shield). Greater Heal stays the fallback when Flash Heal fails.
+    triggers.push_back(new TriggerNode(
+        "party member low health loose pack",
+        NextAction::array(0, new NextAction("flash heal on party", ACTION_MEDIUM_HEAL + 2.5f), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "party member medium health loose pack",
+        NextAction::array(0, new NextAction("flash heal on party", ACTION_MEDIUM_HEAL + 0.5f), NULL)));
 
     triggers.push_back(new TriggerNode(
         "party member almost full health",
         NextAction::array(0, new NextAction("renew on party", ACTION_LIGHT_HEAL), NULL)));
+
+    // Pre-cast above the heal rows so the next heal crits; the trigger
+    // self-gates on the trained spell, the cooldown, mana and a target.
+    triggers.push_back(new TriggerNode(
+        "inner focus for heal",
+        NextAction::array(0, new NextAction("inner focus", ACTION_MEDIUM_HEAL + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
         "party member to heal out of spell range",
@@ -170,12 +209,22 @@ void HolyPriestAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers
 {
     PriestAoeStrategy::InitCombatTriggers(triggers);
 
-    // Vanilla/Tortoise Prayer of Healing is the available group-heal
-    // fallback; later Circle of Healing/Prayer of Mending abilities are not
-    // part of this target spell surface.
+    // Prayer of Healing targets the caster's party, so it queues on the
+    // subgroup count (3+ hurt within 30 yd), not the raid-wide aoe value.
     triggers.push_back(new TriggerNode(
-        "medium aoe heal",
-        NextAction::array(0, new NextAction("prayer of healing", ACTION_MEDIUM_HEAL), NULL)));
+        "prayer of healing party",
+        NextAction::array(0, new NextAction("prayer of healing", ACTION_MEDIUM_HEAL + 5), NULL)));
+
+    // Group-size-scaled gates (mod-playerbots parity, HEAL-1): shields on
+    // the almost-full band, and on the medium band via the subgroup trigger
+    // (the shield refuses a rage tank above the critical band, P1).
+    triggers.push_back(new TriggerNode(
+        "group heal setting",
+        NextAction::array(0, new NextAction("power word: shield on party", ACTION_MEDIUM_HEAL + 7), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "medium group heal setting",
+        NextAction::array(0, new NextAction("power word: shield on party", ACTION_CRITICAL_HEAL + 5), NULL)));
 }
 
 void HolyPriestAoeStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)

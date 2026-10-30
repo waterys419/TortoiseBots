@@ -19,7 +19,11 @@
 #include "ObservabilityEmitter.h"
 
 #include "BotManager.h"
-#include "PlayerbotAIStorage.h"
+#include "AltBotService.h"
+// Issue #872: kind labels (pool/hired/claimed/alt/companion/player).
+#include "BotKindPolicy.h"
+#include "HireLifecycle.h"
+#include "ClaimLifecycle.h"
 #include "../ai/playerbot/PlayerbotAI.h"
 #include "../ai/playerbot/PlayerbotAIConfig.h"
 #include "../ai/playerbot/TravelMgr.h"
@@ -35,7 +39,12 @@
 #include "../host/ModuleVersion.h"
 #include "Timer.h"
 #include "MotionMaster.h"
+#include "Battlegrounds/BattleGround.h"
+#include "Battlegrounds/BattleGroundMgr.h"
+#include "Group/Group.h"
+#include "Guild/GuildMgr.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -49,7 +58,7 @@ namespace {
 
 // Datagram schema version. The Go daemon ignores datagrams it cannot parse;
 // this is bumped when the wire format changes incompatibly.
-constexpr int kProtocolVersion = 8;
+constexpr int kProtocolVersion = 12;
 
 // Snapshot cadence and batching. Datagrams are kept well under the loopback
 // MTU so a large roster arrives as several unpredictable chunks; the receiver
@@ -132,7 +141,7 @@ bool IsActivityEvent(std::string const& event)
         "QuestRewarded", "AcceptQuestAction", "AcceptQuestShareAction",
         "TalkToQuestGiverAction", "QuestUpdateCompleteAction", "QuestCompleted", "QuestDropped",
         // loot & money
-        "StoreLootAction", "GatherLoot", "LootMoney",
+        "StoreLootAction", "GatherLoot", "LootMoney", "RollWon",
         // vendor / trainer / repair / auction
         "SellAction", "BuyAction", "RepairAllAction", "TrainerAction", "NearbyService",
         "AhAction", "AhBidAction",
@@ -142,6 +151,8 @@ bool IsActivityEvent(std::string const& event)
         // explicit kill signal from XpGainAction (the CSV row cannot carry the
         // kill/non-kill XP flag)
         "Kill",
+        // open-world PvP seek: role grants, engagements, kills, deaths
+        "WorldPvpSeekGrant", "WorldPvpEngage", "WorldPvpKill", "WorldPvpDeath",
     };
     return whitelist.count(event) != 0;
 }
@@ -152,6 +163,7 @@ bool IsItemEvent(std::string const& event)
 {
     static std::set<std::string> const itemEvents = {
         "StoreLootAction", "GatherLoot", "SellAction", "BuyAction", "AhAction", "AhBidAction",
+        "RollWon",
     };
     return itemEvents.count(event) != 0;
 }
@@ -238,7 +250,8 @@ std::string GetBotRole(Player* bot, PlayerbotAI* ai)
 {
     if (ai)
     {
-        if (ai->GetForcedRole() == 1 || ai->HasStrategy("tank", BotState::BOT_STATE_COMBAT))
+        if (ai->GetForcedRole() == 1 || ai->HasStrategy("tank", BotState::BOT_STATE_COMBAT) ||
+            ai->HasStrategy("tank shaman", BotState::BOT_STATE_COMBAT))
             return "tank";
         if (ai->GetForcedRole() == 2 || ai->HasStrategy("heal", BotState::BOT_STATE_COMBAT) ||
             ai->HasStrategy("healer", BotState::BOT_STATE_COMBAT))
@@ -332,10 +345,12 @@ Activity NoteActivity(Player* bot, bool hasWorkTarget, ObservabilityEmitter::Bot
 // (the value object already exists; Get() returns the pointer); GetShortName/
 // GetTitle are cheap string builders on the already-chosen destination. Idle
 // bots contribute empty strings so the pool rollup can count not-travelling.
-void FillTravelInfo(PlayerbotAI* ai, std::string& purpose, std::string& to)
+void FillTravelInfo(PlayerbotAI* ai, std::string& purpose, std::string& to, std::string& status, int32& dist)
 {
     purpose.clear();
     to.clear();
+    status.clear();
+    dist = -1;
     if (!ai || !ai->GetAiObjectContext())
         return;
     ai::Value<ai::TravelTarget*>* value =
@@ -356,6 +371,114 @@ void FillTravelInfo(PlayerbotAI* ai, std::string& purpose, std::string& to)
         return;
     }
     to = dest->GetTitle();
+    static char const* const statusNames[] = { "none", "prepare", "ready", "travel", "work", "cooldown", "expired" };
+    uint8 const st = static_cast<uint8>(target->GetStatus());
+    status = st < 7 ? statusNames[st] : "unknown";
+    dist = static_cast<int32>(target->Distance(ai->GetBot()));
+}
+// Issue #872: kind label for the dashboard. Reads only the lifecycles the
+// snapshot already queries (AltBotService, HireLifecycle, ClaimLifecycle)
+// plus the record's random flag: no DB, no world scans.
+static BotKind ResolveBotKind(Player* bot)
+{
+    ObjectGuid guid = bot->GetObjectGuid();
+    if (AltBotService::Instance().IsAutonomous(guid))
+        return BotKind::Alt;
+    if (HireLifecycle::Instance().IsHired(guid))
+        return BotKind::Hired;
+    if (ClaimLifecycle::Instance().IsClaimed(bot->GetGUIDLow()))
+        return BotKind::Claimed;
+    BotRecord* record = BotManager::Instance().FindBot(guid);
+    if (record && !record->random)
+        return BotKind::Companion;
+    return BotKind::Pool;
+}
+
+
+// Online real players, collected from the world's network sessions at
+// snapshot cadence (every 2 s, not per tick): headless bot sessions never
+// enter the network map, so this is the same population the heartbeat's
+// human count reports and a bot can never be double-counted as a player.
+// Only member reads (session, position, group); no DB, no world scans.
+void CollectOnlinePlayers(std::vector<Player*>& out)
+{
+    for (auto const& pair : sWorld.GetAllSessions())
+    {
+        WorldSession* sess = pair.second;
+        if (!sess || !sess->HasNetworkTransport())
+            continue;
+        Player* player = sess->GetPlayer();
+        if (!player || !player->IsInWorld())
+            continue;
+        out.push_back(player);
+    }
+}
+
+// Live-unit fields both roster kinds carry: health, resources, map position,
+// selection, group and battleground state. Bots add AI detail on top.
+void FillLiveUnitSnapshot(Player* unit, BotTelemetrySnapshot& snap)
+{
+    snap.name = unit->GetName();
+    snap.guid = unit->GetGUIDLow();
+    snap.className = GetBotClassName(unit->GetClass());
+    snap.level = unit->GetLevel();
+    snap.xp = unit->GetUInt32Value(PLAYER_XP);
+    snap.nextXp = unit->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
+    // A dead unit reports GetHealth() == 1 in the core, which made corpse
+    // bars read "1 HP" on the dashboard. Report the corpse as 0 HP.
+    snap.hp = unit->IsAlive() ? unit->GetHealth() : 0;
+    snap.maxHp = unit->GetMaxHealth();
+    snap.power = unit->GetPower(unit->GetPowerType());
+    snap.maxPower = unit->GetMaxPower(unit->GetPowerType());
+    // Core stores rage x10 (0-1000); every other resource is already in
+    // display units. Normalize here so all consumers agree.
+    if (unit->GetPowerType() == POWER_RAGE)
+    {
+        snap.power /= 10;
+        snap.maxPower /= 10;
+    }
+    snap.powerType = GetPowerTypeName(unit->GetPowerType());
+    // Guild name from the in-memory manager: a member read plus a locked
+    // map lookup, no DB, safe on this thread.
+    if (uint32 guildId = unit->GetGuildId())
+        snap.guild = sGuildMgr.GetGuildNameById(guildId);
+    snap.mapId = unit->GetMapId();
+    snap.zoneId = unit->GetCachedZoneId();
+    snap.x = unit->GetPositionX();
+    snap.y = unit->GetPositionY();
+    snap.z = unit->GetPositionZ();
+    snap.o = unit->GetOrientation();
+    Unit* target = unit->GetSelectedUnit();
+    snap.target = target ? target->GetName() : "";
+    snap.targetLevel = 0;
+    // Any unit target (creature or player, e.g. a follow master) carries
+    // a level; only self-selection (the no-hostile-target case) is 0.
+    if (target && target != unit)
+        snap.targetLevel = static_cast<uint32>(target->GetLevel());
+    Group* group = unit->GetGroup();
+    snap.groupId = group ? group->GetId() : 0;
+    snap.subgroupId = unit->GetSubGroup();
+    snap.instanceId = unit->GetMap() ? unit->GetMap()->GetInstanceId() : 0;
+    if (unit->InBattleGround())
+    {
+        snap.pvp = "bg";
+        if (BattleGround* bg = unit->GetBattleGround())
+            if (bg->GetName())
+                snap.pvpWhere = bg->GetName();
+    }
+    else if (unit->InBattleGroundQueue())
+    {
+        snap.pvp = "queue";
+        for (uint32 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+        {
+            BattleGroundQueueTypeId queueType = unit->GetBattleGroundQueueTypeId(i);
+            if (queueType == BATTLEGROUND_QUEUE_NONE)
+                continue;
+            BattleGround* bgTemplate = sBattleGroundMgr.GetBattleGroundTemplate(BattleGroundMgr::BGTemplateId(queueType));
+            if (bgTemplate && bgTemplate->GetName())
+                snap.pvpWhere += (snap.pvpWhere.empty() ? "" : ", ") + std::string(bgTemplate->GetName());
+        }
+    }
 }
 
 } // anonymous namespace
@@ -443,9 +566,14 @@ void ObservabilityEmitter::Initialize()
     if (!m_enabled)
         return;
 
+    // Issue #1101: on by default; either config file can turn it off.
+    m_dungeonMobsEnabled = sPlayerbotAIConfig.observabilityDungeonMobs &&
+                           sConfig.GetBoolDefault("AiPlayerbot.ObservabilityDungeonMobs", true);
+    m_dungeonMobsSent = false;
+    m_dungeonRunOffset = 0;
+    m_dungeonMobsTiming = DungeonMobsTiming();
+
     m_port = sPlayerbotAIConfig.observabilityPort;
-    if (m_port == 0)
-        m_port = sConfig.GetIntDefault("AiPlayerbot.ObservabilityPort", 9195);
     if (m_port == 0)
         m_port = 9195;
 
@@ -553,6 +681,16 @@ void ObservabilityEmitter::SetExternalRosterProvider(std::function<void(std::vec
     m_externalRosterProvider = std::move(provider);
 }
 
+void ObservabilityEmitter::SetCommanderProvider(std::function<void(std::vector<CommanderTelemetry::BindingRef>&)> provider)
+{
+    m_commanderProvider = std::move(provider);
+}
+
+void ObservabilityEmitter::SetDungeonMobProvider(std::function<void(std::vector<DungeonMobTelemetry::RunRef>&)> provider)
+{
+    m_dungeonMobProvider = std::move(provider);
+}
+
 void ObservabilityEmitter::SendDatagram(std::string const& payload)
 {
     if (!IsEnabled())
@@ -606,7 +744,8 @@ void ObservabilityEmitter::EmitAnomaly(std::string const& type,
                                         std::string const& details,
                                         std::string const& targetName,
                                         std::string const& strategy,
-                                        std::string const& lastAction)
+                                        std::string const& lastAction,
+                                        uint32 killerLevel)
 {
     if (!IsEnabled())
         return;
@@ -619,6 +758,9 @@ void ObservabilityEmitter::EmitAnomaly(std::string const& type,
     bool const rateLimited = type != "BOT_DEATH";
     if (bot && rateLimited && !AnomalyAllowed(bot->GetGUIDLow(), AnomalyTypeIdFromName(type), WorldTimer::getMSTime()))
         return;
+
+    if (type == "BOT_DEATH" && bot)
+        NoteDeathKiller(bot->GetGUIDLow(), targetName, killerLevel);
 
     // Callers that pass no strategy (the death path) still report the bot's
     // active strategy list, so every row carries the same context.
@@ -639,7 +781,7 @@ void ObservabilityEmitter::EmitAnomaly(std::string const& type,
            << ",\"class\":\"" << EscapeJson(GetBotClassName(bot->GetClass())) << "\""
            << ",\"level\":" << static_cast<uint32>(bot->GetLevel())
            << ",\"map\":" << bot->GetMapId()
-           << ",\"zone\":" << bot->GetZoneId()
+           << ",\"zone\":" << bot->GetCachedZoneId()
            << ",\"pos\":{\"x\":" << std::fixed << std::setprecision(1) << bot->GetPositionX()
            << ",\"y\":" << bot->GetPositionY()
            << ",\"z\":" << bot->GetPositionZ() << "}";
@@ -700,7 +842,8 @@ void ObservabilityEmitter::OnActionFailed(Player* bot,
 void ObservabilityEmitter::EmitBotActivity(std::string const& event,
                                             std::string const& info1,
                                             std::string const& info2,
-                                            Player* bot)
+                                            Player* bot,
+                                            uint32 targetLevel)
 {
     if (!IsEnabled() || !bot || !IsActivityEvent(event))
         return;
@@ -716,7 +859,9 @@ void ObservabilityEmitter::EmitBotActivity(std::string const& event,
        << ",\"class\":\"" << EscapeJson(GetBotClassName(bot->GetClass())) << "\""
        << ",\"level\":" << static_cast<uint32>(bot->GetLevel())
        << ",\"map\":" << bot->GetMapId()
-       << ",\"zone\":" << bot->GetZoneId();
+       << ",\"zone\":" << bot->GetCachedZoneId();
+    if (targetLevel)
+        ss << ",\"target_level\":" << targetLevel;
 
     if (IsItemEvent(event))
     {
@@ -815,10 +960,22 @@ void ObservabilityEmitter::PruneState(uint32 nowMs)
     }
 }
 
+void ObservabilityEmitter::NoteDeathKiller(uint32 guid, std::string const& name, uint32 level)
+{
+    if (m_deathKillers.size() >= kMaxDeathKillers && m_deathKillers.find(guid) == m_deathKillers.end())
+        return;
+    DeathKillerInfo info;
+    info.name = name.empty() ? "unknown" : name;
+    info.level = level;
+    info.time = time(nullptr);
+    m_deathKillers[guid] = std::move(info);
+}
+
 void ObservabilityEmitter::Update(uint32 diff)
 {
     if (!IsEnabled())
         return;
+    m_tickWindow.Add(diff);
 
     if (!m_hostResolved)
         RetryHostResolution(diff);
@@ -838,12 +995,15 @@ void ObservabilityEmitter::Update(uint32 diff)
 
         // Last-action name without the non-const getName() call: read once
         // here, reused for the activity check and the snapshot below.
-        char const* lastActionName = "";
+        // getName() returns a copy: keep it alive here, or c_str() dangles
+        // before NoteActivity and the snapshot read it.
+        std::string lastActionNameHolder;
         if (ai)
         {
             if (Action const* last = ai->GetLastExecutedAction(ai->GetState()))
-                lastActionName = const_cast<Action*>(last)->getName().c_str();
+                lastActionNameHolder = const_cast<Action*>(last)->getName();
         }
+        char const* lastActionName = lastActionNameHolder.c_str();
         // Fresh tracks start idle (unknown past), not busy: when the
         // first observation shows no activity, the 45 s clock starts
         // expired instead of granting a grace window. Active newcomers
@@ -858,20 +1018,37 @@ void ObservabilityEmitter::Update(uint32 diff)
             track.churnSinceMs = nowMs;
         if (fresh && track.lastActivityMs == 0)
             track.lastActivityMs = nowMs - kIdleAfterMs;
-
+        // Spawn-camp recency: a bot fighting in place or banking XP is doing
+        // real work even when standing still between pulls. Both signals are
+        // member reads already paid for (combat state) or beside (XP/level)
+        // this tick's classification.
         uint8 state = BaseMacroState(bot, ai);
+        if (state == STATE_COMBAT)
+            track.lastCombatMs = nowMs;
+        uint32 curXp = bot->GetUInt32Value(PLAYER_XP);
+        uint32 curLevel = bot->GetLevel();
+        if (track.lastSeenMs != 0 && (curXp != track.lastXp || curLevel != track.lastLevel))
+            track.lastXpMs = nowMs;
+        track.lastXp = curXp;
+        track.lastLevel = curLevel;
+
         // Idle means really doing nothing: a base IDLE bot that did anything
         // inside kIdleAfterMs is busy while it made real progress, and stalled
         // when its only activity was churn (a travel target or action-name
         // changes) for that whole window. Combat, moving, resting and dead are
-        // instant states, never gated.
+        // instant states, never gated. A recent fight or XP gain (kill, quest,
+        // ding) inside kRecentFightMs vetoes stalled: the bot is camping a
+        // spawn between pulls, not standing with a destination and getting
+        // nowhere.
         if (state == STATE_IDLE)
         {
             if (track.lastActivityMs != 0 && (nowMs - track.lastActivityMs) < kIdleAfterMs)
             {
                 bool churnOnly = track.churnSinceMs != 0 &&
                     (nowMs - track.churnSinceMs) >= kIdleAfterMs;
-                state = churnOnly ? STATE_STALLED : STATE_BUSY;
+                bool recentFight = (track.lastCombatMs != 0 && (nowMs - track.lastCombatMs) < kRecentFightMs) ||
+                    (track.lastXpMs != 0 && (nowMs - track.lastXpMs) < kRecentFightMs);
+                state = (churnOnly && !recentFight) ? STATE_STALLED : STATE_BUSY;
             }
             else
             {
@@ -933,12 +1110,39 @@ void ObservabilityEmitter::Update(uint32 diff)
         }
 
         // Anomaly 2: combat target unreachable / out of line of sight.
-        Unit* combatTarget = bot->GetSelectedUnit();
-        if (state == STATE_COMBAT && combatTarget && sServerFacade.IsHostileTo(bot, combatTarget))
+        // Judged against the AI's "current target" while its combat engine
+        // runs, not the client selection: the selection outlives the fight
+        // (combat end does not clear it), so a bot the core still held in
+        // combat on its way to a travel target reported a mob it left minutes
+        // earlier, hundreds of yards away. The value is a guid lookup plus a
+        // range and visibility test (no DB, no world scan), and it is only
+        // read while the bot is in combat.
+        Unit* combatTarget = nullptr;
+        if (state == STATE_COMBAT && ai && ai->GetState() == BotState::BOT_STATE_COMBAT &&
+            ai->GetAiObjectContext())
         {
-            bool inLos = bot->IsWithinLOSInMap(combatTarget, true);
+            if (ai::Value<Unit*>* current = ai->GetAiObjectContext()->GetValue<Unit*>("current target"))
+                combatTarget = current->Get();
+        }
+        // A new target starts its own clock: the reported duration belongs to
+        // the unit named in the event, not to the fight as a whole.
+        uint64 const combatTargetGuid = combatTarget ? combatTarget->GetObjectGuid().GetRawValue() : 0;
+        if (combatTargetGuid != track.unreachableTargetGuid)
+        {
+            track.unreachableTargetGuid = combatTargetGuid;
+            track.unreachableDurationMs = 0;
+            track.unreachableReported = false;
+        }
+        if (combatTarget && sServerFacade.IsHostileTo(bot, combatTarget))
+        {
             float dist = bot->GetDistance(combatTarget);
-            bool unreachable = (!inLos || dist > 45.0f);
+            bool inLos = true;
+            bool unreachable = (dist > 45.0f);
+            if (!unreachable && (track.unreachableDurationMs > 0 || track.lastSampleMs == nowMs))
+            {
+                inLos = bot->IsWithinLOSInMap(combatTarget, true);
+                unreachable = !inLos;
+            }
 
             if (unreachable)
             {
@@ -956,8 +1160,14 @@ void ObservabilityEmitter::Update(uint32 diff)
                     dss << "Combat target '" << combatTarget->GetName() << "' unreachable / out of LoS for "
                         << (track.unreachableDurationMs / 1000.0f) << "s (dist=" << std::fixed << std::setprecision(1) << dist
                         << ", inLos=" << (inLos ? "true" : "false") << ")";
+                    // The bot's real last action in its combat engine, read
+                    // only when the event is sent (the type already says
+                    // "unreachable"; a fixed label here hid what it did).
+                    std::string lastAction;
+                    if (Action const* last = ai->GetLastExecutedAction(ai->GetState()))
+                        lastAction = const_cast<Action*>(last)->getName();
                     EmitAnomaly("UNREACHABLE_TARGET", "WARN", bot, dss.str(), combatTarget->GetName(),
-                                FormatStrategies(ai), "combat reach");
+                                FormatStrategies(ai), lastAction);
                 }
             }
             else
@@ -999,13 +1209,28 @@ void ObservabilityEmitter::Update(uint32 diff)
     }
 
     PruneState(nowMs);
-    EmitSnapshotCycle(activeBots, diff);
+    // One session walk per cycle: the roster, the dungeon runs and the armory sweep share it.
+    std::vector<Player*> onlinePlayers;
+    CollectOnlinePlayers(onlinePlayers);
+    EmitSnapshotCycle(activeBots, onlinePlayers, diff);
+    EmitCommanders();
 
+    // Issue #872: real players' online characters get their exact-stats row
+    // too (same round-robin rate limit as bots, a few per snapshot, never per
+    // tick). Member reads only, no DB. One extra row at most, so a crowded
+    // server cannot turn the sweep into a burst.
     for (size_t i = 0; i < kArmoryBotsPerSnapshot && i < activeBots.size(); ++i)
     {
-        Player* bot = activeBots[m_armoryCursor++ % activeBots.size()];
+        Player* bot = activeBots[m_armoryOffset++ % activeBots.size()];
         if (bot && bot->IsInWorld())
             WriteArmoryStats(bot);
+    }
+    if (!onlinePlayers.empty())
+    {
+        Player* player = onlinePlayers[m_armoryOffset % onlinePlayers.size()];
+        if (player && player->IsInWorld())
+            WriteArmoryStats(player);
+        ++m_armoryOffset;
     }
 }
 
@@ -1060,7 +1285,8 @@ void ObservabilityEmitter::WriteArmoryStats(Player* bot)
         bot->GetTotalAuraModifierByMiscValue(SPELL_AURA_MOD_POWER_REGEN, POWER_MANA));
 }
 
-void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeBots, uint32 diff)
+void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeBots, std::vector<Player*> const& onlinePlayers,
+                                             uint32 diff)
 {
     std::vector<BotTelemetrySnapshot> botSnapshots;
     botSnapshots.reserve(activeBots.size());
@@ -1075,43 +1301,27 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
         uint8 state = trackIt != m_botTracking.end() ? trackIt->second.stateIndex : BaseMacroState(bot, ai);
 
         BotTelemetrySnapshot snap;
-        snap.name = bot->GetName();
-        snap.guid = bot->GetGUIDLow();
-        snap.className = GetBotClassName(bot->GetClass());
+        FillLiveUnitSnapshot(bot, snap);
+        snap.isAlt = AltBotService::Instance().IsAutonomous(bot->GetObjectGuid());
+        snap.kind = BotKindName(ResolveBotKind(bot));
         snap.role = GetBotRole(bot, ai);
-        snap.level = bot->GetLevel();
-        snap.xp = bot->GetUInt32Value(PLAYER_XP);
-        snap.nextXp = bot->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-        // A dead unit reports GetHealth() == 1 in the core, which made corpse
-        // bars read "1 HP" on the dashboard. Report the corpse as 0 HP.
-        snap.hp = bot->IsAlive() ? bot->GetHealth() : 0;
-        snap.maxHp = bot->GetMaxHealth();
-        snap.power = bot->GetPower(bot->GetPowerType());
-        snap.maxPower = bot->GetMaxPower(bot->GetPowerType());
-        // Core stores rage x10 (0-1000); every other resource is already in
-        // display units. Normalize here so all consumers agree.
-        if (bot->GetPowerType() == POWER_RAGE)
-        {
-            snap.power /= 10;
-            snap.maxPower /= 10;
-        }
-        snap.powerType = GetPowerTypeName(bot->GetPowerType());
-        snap.mapId = bot->GetMapId();
-        snap.zoneId = bot->GetZoneId();
-        snap.x = bot->GetPositionX();
-        snap.y = bot->GetPositionY();
-        snap.z = bot->GetPositionZ();
-        snap.o = bot->GetOrientation();
-        Unit* target = bot->GetSelectedUnit();
-        snap.target = target ? target->GetName() : "";
-        snap.targetLevel = 0;
-        // Any unit target (creature or player, e.g. a follow master) carries
-        // a level; only self-selection (the no-hostile-target case) is 0.
-        if (target && target != bot)
-            snap.targetLevel = static_cast<uint32>(target->GetLevel());
         snap.strategy = FormatStrategies(ai);
+        snap.worldPvpSeeker = ai && (ai->HasStrategy("world pvp", BotState::BOT_STATE_NON_COMBAT) ||
+            ai->HasStrategy("world pvp", BotState::BOT_STATE_COMBAT));
+        if (!bot->IsAlive())
+        {
+            auto killerIt = m_deathKillers.find(bot->GetGUIDLow());
+            if (killerIt != m_deathKillers.end())
+            {
+                snap.killer = killerIt->second.name;
+                snap.killerLevel = killerIt->second.level;
+            }
+        }
+        else
+            m_deathKillers.erase(bot->GetGUIDLow());
         snap.state = MacroStateName(state);
-        FillTravelInfo(ai, snap.travelPurpose, snap.travelTo);
+        FillTravelInfo(ai, snap.travelPurpose, snap.travelTo, snap.travelStatus, snap.travelDist);
+        BotManager::Instance().GetAiVisitInfo(bot->GetGUIDLow(), snap.aiVisits, snap.aiAgeMs);
 
         if (ai)
         {
@@ -1119,8 +1329,22 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
             // only read for its name here.
             if (Action const* last = ai->GetLastExecutedAction(ai->GetState()))
                 snap.lastAction = const_cast<Action*>(last)->getName();
-            snap.lastTrigger = ai->GetLastEvent().getSource();
+            snap.lastTrigger = ai->GetLastExecutedTrigger(ai->GetState());
         }
+        botSnapshots.push_back(snap);
+    }
+
+    // Real players ride the same cycle at the same cadence: list, map and
+    // details come from the roster, not from a separate feed. A player has
+    // no AI, so bot-only detail stays empty and state reflects the visible
+    // unit (combat, moving, resting, dead, else idle).
+    for (Player* player : onlinePlayers)
+    {
+        BotTelemetrySnapshot snap;
+        FillLiveUnitSnapshot(player, snap);
+        snap.isPlayer = true;
+        snap.kind = BotKindName(BotKind::Player);
+        snap.state = MacroStateName(BaseMacroState(player, nullptr));
         botSnapshots.push_back(snap);
     }
 
@@ -1140,24 +1364,22 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
     };
 
     uint64 seq = ++m_snapshotSeq;
-    // Network sessions only: headless bot sessions never enter the
-    // account-keyed network map, so GetActiveSessionCount() already excludes
-    // them. The old "sessions minus bots" math read 0 for any human count
-    // below the bot count; count real sessions with a live networked player
-    // instead.
+    // The roster now carries real players as rows, so the heartbeat reports
+    // the same population the batches deliver (no second session loop).
     uint32 humanCount = 0;
-    for (auto const& pair : sWorld.GetAllSessions())
-    {
-        WorldSession* sess = pair.second;
-        if (sess && sess->HasNetworkTransport() && sess->GetPlayer() && sess->GetPlayer()->IsInWorld())
+    for (BotTelemetrySnapshot const& b : botSnapshots)
+        if (b.isPlayer)
             ++humanCount;
-    }
-    uint32 botCount = static_cast<uint32>(botSnapshots.size());
+    uint32 botCount = static_cast<uint32>(botSnapshots.size()) - humanCount;
 
+    // Bot census only: player rows carry no role and must not pollute the
+    // per-class/role Prometheus gauges.
     std::map<std::pair<std::string, std::string>, uint32> countMap;
     for (BotTelemetrySnapshot const& b : botSnapshots)
-        countMap[{b.className, b.role}]++;
+        if (!b.isPlayer)
+            countMap[{b.className, b.role}]++;
 
+    PlayerLagWindow::Stats const tick = m_tickWindow.Compute();
     std::ostringstream ss;
     ss << "{\"v\":" << kProtocolVersion
        << ",\"session\":" << m_sessionId
@@ -1166,6 +1388,10 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
        << ",\"type\":\"HEARTBEAT\""
        << ",\"uptime\":" << sWorld.GetUptime()
        << ",\"diff\":" << diff
+       << ",\"diff_avg\":" << tick.avgMs
+       << ",\"diff_worst\":" << tick.worstMs
+       << ",\"lag_p50\":" << tick.p50Ms
+       << ",\"lag_p95\":" << tick.p95Ms
        << ",\"window_secs\":" << (kStateBucketCount * kStateBucketMs / 1000)
        << ",\"humans\":" << humanCount
        << ",\"bots\":" << botCount
@@ -1195,6 +1421,11 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
     // in when the last batch completes the cycle and publishes the roster.
     FlushBotEvents(seq);
 
+    // Mobs of every dungeon run (issue #1101), also before the batches: the
+    // dashboard joins them into the Dungeons view the browser fetches when
+    // the roster publishes, so they match the party's positions.
+    EmitDungeonMobs(activeBots, onlinePlayers, seq);
+
     // Chunked roster batches complete the cycle opened by the heartbeat.
     size_t totalBatches = (botSnapshots.size() + kBatchSize - 1) / kBatchSize;
     for (size_t bIdx = 0; bIdx < totalBatches; ++bIdx)
@@ -1218,6 +1449,10 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
             if (i > start) bss << ",";
             bss << "{\"name\":\"" << EscapeJson(b.name) << "\""
                 << ",\"guid\":" << b.guid
+                << ",\"player\":" << (b.isPlayer ? "true" : "false")
+                << ",\"alt\":" << (b.isAlt ? "true" : "false")
+                << ",\"kind\":\"" << EscapeJson(b.kind) << "\""
+                << ",\"group\":" << b.groupId
                 << ",\"class\":\"" << EscapeJson(b.className) << "\""
                 << ",\"role\":\"" << EscapeJson(b.role) << "\""
                 << ",\"level\":" << b.level
@@ -1228,25 +1463,276 @@ void ObservabilityEmitter::EmitSnapshotCycle(std::vector<Player*> const& activeB
                 << ",\"power\":" << b.power
                 << ",\"max_power\":" << b.maxPower
                 << ",\"power_type\":\"" << EscapeJson(b.powerType) << "\""
+                << ",\"guild\":\"" << EscapeJson(b.guild) << "\""
                 << ",\"map\":" << b.mapId
                 << ",\"zone\":" << b.zoneId
+                << ",\"instance\":" << b.instanceId
+                << ",\"subgroup\":" << b.subgroupId
                 << ",\"x\":" << std::fixed << std::setprecision(1) << b.x
                 << ",\"y\":" << b.y
                 << ",\"z\":" << b.z
                 << ",\"o\":" << std::setprecision(2) << b.o
                 << ",\"target\":\"" << EscapeJson(b.target) << "\""
                 << ",\"target_level\":" << b.targetLevel
+                << ",\"killer\":\"" << EscapeJson(b.killer) << "\""
+                << ",\"killer_level\":" << b.killerLevel
                 << ",\"strategy\":\"" << EscapeJson(b.strategy) << "\""
                 << ",\"state\":\"" << EscapeJson(b.state) << "\""
                 << ",\"last_action\":\"" << EscapeJson(b.lastAction) << "\""
                 << ",\"last_trigger\":\"" << EscapeJson(b.lastTrigger) << "\""
                 << ",\"travel_purpose\":\"" << EscapeJson(b.travelPurpose) << "\""
-                << ",\"travel_to\":\"" << EscapeJson(b.travelTo) << "\"}";
+                << ",\"travel_to\":\"" << EscapeJson(b.travelTo) << "\""
+                << ",\"travel_status\":\"" << b.travelStatus << "\""
+                << ",\"travel_dist\":" << b.travelDist
+                << ",\"ai_visits\":" << b.aiVisits
+                << ",\"ai_age_ms\":" << b.aiAgeMs
+                << ",\"pvp\":\"" << b.pvp << "\""
+                << ",\"pvp_bg\":\"" << EscapeJson(b.pvpWhere) << "\""
+                << ",\"world_pvp_seeker\":" << (b.worldPvpSeeker ? "true" : "false") << "}";
         }
         bss << "]}";
         SendDatagram(bss.str());
     }
 }
+
+void ObservabilityEmitter::EmitDungeonMobs(std::vector<Player*> const& bots, std::vector<Player*> const& players, uint64 seq)
+{
+    namespace DMT = DungeonMobTelemetry;
+    if (!m_dungeonMobsEnabled || !m_dungeonMobProvider)
+        return;
+    auto const started = std::chrono::steady_clock::now();
+
+    // Group the roster by instance copy: field reads over the lists this cycle already walks. Ordered by (map, instance) so
+    // the rotation below is stable from cycle to cycle.
+    struct RunGroup
+    {
+        uint32 map = 0;
+        uint32 instance = 0;
+        bool raid = false;
+        size_t bots = 0;
+        std::vector<Player*> members;
+        std::vector<DMT::MemberInfo> infos;
+    };
+    std::map<std::pair<uint32, uint32>, RunGroup> groups;
+    std::unordered_set<uint32> listed; // a character listed twice (an external roster) counts once
+    auto add = [&](Player* unit, bool isBot)
+    {
+        if (!unit || !unit->IsInWorld() || unit->InBattleGround())
+            return;
+        Map* map = unit->GetMap();
+        if (!map || !map->IsDungeon() || map->GetInstanceId() == 0)
+            return;
+        if (!listed.insert(unit->GetGUIDLow()).second)
+            return;
+        RunGroup& group = groups[{ unit->GetMapId(), map->GetInstanceId() }];
+        group.map = unit->GetMapId();
+        group.instance = map->GetInstanceId();
+        group.raid = map->IsRaid();
+        if (isBot)
+            ++group.bots;
+        DMT::MemberInfo info;
+        info.guid = unit->GetGUIDLow();
+        info.id = unit->GetObjectGuid().GetRawValue();
+        // What it has selected, else what it fights: two field reads.
+        ::ObjectGuid target = unit->GetTargetGuid();
+        if (target.IsEmpty())
+            if (Unit* victim = unit->GetVictim())
+                target = victim->GetObjectGuid();
+        info.target = target.GetRawValue();
+        info.x = unit->GetPositionX();
+        info.y = unit->GetPositionY();
+        info.bot = isBot;
+        group.members.push_back(unit);
+        group.infos.push_back(info);
+    };
+    for (Player* bot : bots)
+        add(bot, true);
+    for (Player* player : players)
+        add(player, false);
+
+    std::vector<RunGroup*> live; // runs with at least one bot (the dashboard's rule)
+    for (auto& entry : groups)
+        if (entry.second.bots)
+            live.push_back(&entry.second);
+
+    if (live.empty())
+    {
+        if (m_dungeonMobsSent)
+            for (std::string const& payload : DMT::PackRuns(kProtocolVersion, m_sessionId, seq, time(nullptr), {}))
+                SendDatagram(payload); // the end marker, once
+        m_dungeonMobsSent = false;
+        m_dungeonRunOffset = 0;
+        return;
+    }
+
+    std::vector<size_t> const window = DMT::RotationWindow(live.size(), m_dungeonRunOffset);
+    if (live.size() > DMT::kMaxRunsPerCycle)
+        m_dungeonRunOffset = (m_dungeonRunOffset + DMT::kMaxRunsPerCycle) % live.size();
+    else
+        m_dungeonRunOffset = 0;
+
+    m_dungeonRunRefs.clear();
+    m_dungeonRunRefs.reserve(window.size());
+    for (size_t idx : window)
+    {
+        RunGroup& group = *live[idx];
+        // A raid run picks its sight readers tanks first: the role is read only there.
+        if (group.members.size() > DMT::kPartySize)
+            for (size_t i = 0; i < group.members.size(); ++i)
+                if (group.infos[i].bot)
+                    group.infos[i].tank = GetBotRole(group.members[i], GET_PLAYERBOT_AI(group.members[i])) == "tank";
+        DMT::RunRef ref;
+        ref.map = group.map;
+        ref.instance = group.instance;
+        ref.raid = group.raid;
+        ref.members = group.members;
+        for (size_t i : DMT::PickSightReaders(group.infos, seq + idx))
+            ref.sightReaders.push_back(group.members[i]);
+        ref.cap = DMT::PerRunCap(window.size(), group.members.size());
+        m_dungeonRunRefs.push_back(std::move(ref));
+    }
+
+    m_dungeonMobProvider(m_dungeonRunRefs);
+
+    std::vector<DMT::RunInfo> runs;
+    runs.reserve(m_dungeonRunRefs.size());
+    size_t candidates = 0, mobs = 0;
+    for (size_t r = 0; r < m_dungeonRunRefs.size(); ++r)
+    {
+        DMT::RunRef& ref = m_dungeonRunRefs[r];
+        DMT::RunInfo info;
+        info.map = ref.map;
+        info.instance = ref.instance;
+        info.raid = ref.raid;
+        info.members = live[window[r]]->infos;
+        info.mobsReported = ref.mobsReported;
+        candidates += ref.candidates.size();
+        if (ref.mobsReported)
+            info.mobsTotal = DMT::SelectMobs(ref.candidates, info.members, ref.cap, info.mobs);
+        mobs += info.mobs.size();
+        ref.members.clear(); // no Player* kept past this cycle
+        ref.sightReaders.clear();
+        ref.candidates.clear();
+        runs.push_back(std::move(info));
+    }
+    for (std::string const& payload : DMT::PackRuns(kProtocolVersion, m_sessionId, seq, time(nullptr), runs))
+        SendDatagram(payload);
+    m_dungeonMobsSent = true;
+
+    uint64 const us = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    DungeonMobsTiming& t = m_dungeonMobsTiming;
+    ++t.cycles;
+    t.sumUs += us;
+    t.maxUs = std::max(t.maxUs, us);
+    t.maxRuns = std::max<uint32>(t.maxRuns, static_cast<uint32>(live.size()));
+    t.maxMobs = std::max<uint32>(t.maxMobs, static_cast<uint32>(mobs));
+    t.maxCandidates = std::max<uint32>(t.maxCandidates, static_cast<uint32>(candidates));
+    if (t.cycles >= 30) // 60 s of 2 s cycles with a run live
+    {
+        TB_LOG_DEBUG("TortoiseBots: DUNGEON_MOBS over %u cycles: mean %llu us, max %llu us, max %u runs, %u mobs sent, %u candidates",
+            t.cycles, static_cast<unsigned long long>(t.sumUs / t.cycles), static_cast<unsigned long long>(t.maxUs),
+            t.maxRuns, t.maxMobs, t.maxCandidates);
+        t = DungeonMobsTiming();
+    }
+}
+
+void ObservabilityEmitter::EmitCommanders()
+{
+    if (!m_commanderProvider)
+        return;
+    m_commanderRefs.clear();
+    m_commanderProvider(m_commanderRefs);
+    if (m_commanderRefs.empty() && !m_commandersSent)
+        return; // nothing stands and nothing was shown: no datagram
+
+    std::vector<CommanderTelemetry::BindingInfo> infos;
+    infos.reserve(m_commanderRefs.size());
+    for (CommanderTelemetry::BindingRef const& ref : m_commanderRefs)
+    {
+        CommanderTelemetry::BindingInfo info;
+        info.commander = ref.commander;
+        info.commanderGuid = ref.commanderGuid;
+        info.commanderOnline = ref.commanderOnline;
+        info.viewOn = ref.viewOn;
+        info.groupId = ref.groupId;
+        info.lead = ref.lead ? ref.lead->GetName() : "";
+        info.orders = ref.orders;
+        info.commanderPlaced = ref.commanderPlaced;
+        info.commanderMap = ref.commanderMap;
+        info.commanderX = ref.commanderX;
+        info.commanderY = ref.commanderY;
+        info.mobsReported = ref.mobsReported;
+        info.mobsMap = ref.mobsMap;
+        info.mobs = ref.mobs; // at most kMaxMobsPerBinding, copied once per 2 s
+        info.objectsReported = ref.objectsReported;
+        info.objects = ref.objects; // at most kMaxObjectsPerBinding, copied once per 2 s
+        info.bossesReported = ref.bossesReported;
+        info.bossesMap = ref.bossesMap;
+        info.bosses = ref.bosses; // at most kMaxBossesPerBinding, copied once per 2 s
+        // Since when the binding has stood (first seen here), for the dashboard's run timer; forgotten with the binding.
+        int64_t& since = m_commanderSince[ref.commanderGuid];
+        if (!since)
+            since = static_cast<int64_t>(time(nullptr));
+        info.boundAt = since;
+        info.run = ref.run;
+        for (Player* bot : ref.bots)
+        {
+            if (!bot || !bot->IsInWorld() || info.bots.size() >= CommanderTelemetry::kMaxBotsPerBinding)
+                continue;
+            CommanderTelemetry::BotInfo b;
+            b.name = bot->GetName();
+            b.guid = bot->GetGUIDLow();
+            b.className = GetBotClassName(bot->GetClass());
+            b.role = GetBotRole(bot, GET_PLAYERBOT_AI(bot));
+            b.level = bot->GetLevel();
+            b.alive = bot->IsAlive();
+            b.hp = b.alive ? bot->GetHealth() : 0; // a corpse reads 1 in the core
+            b.maxHp = bot->GetMaxHealth();
+            b.power = bot->GetPower(bot->GetPowerType());
+            b.maxPower = bot->GetMaxPower(bot->GetPowerType());
+            if (bot->GetPowerType() == POWER_RAGE) // the core stores rage x10
+            {
+                b.power /= 10;
+                b.maxPower /= 10;
+            }
+            b.powerType = GetPowerTypeName(bot->GetPowerType());
+            b.lead = ref.lead && bot == ref.lead;
+            b.mapId = bot->GetMapId();
+            b.zoneId = bot->GetCachedZoneId();
+            b.x = bot->GetPositionX();
+            b.y = bot->GetPositionY();
+            b.z = bot->GetPositionZ();
+            b.id = bot->GetObjectGuid().GetRawValue();
+            // What it has selected, else what it fights: two field reads.
+            ::ObjectGuid target = bot->GetTargetGuid();
+            if (target.IsEmpty())
+                if (Unit* victim = bot->GetVictim())
+                    target = victim->GetObjectGuid();
+            b.target = target.GetRawValue();
+            for (CommanderTelemetry::BotExtra const& extra : ref.botExtras) // at most kMaxBotsPerBinding of them
+                if (extra.id == b.id)
+                {
+                    b.hasExtra = true;
+                    b.extra = extra;
+                    break;
+                }
+            info.bots.push_back(std::move(b));
+        }
+        infos.push_back(std::move(info));
+    }
+    // Forget the start time of the bindings that ended.
+    for (auto it = m_commanderSince.begin(); it != m_commanderSince.end();)
+    {
+        bool standing = false;
+        for (CommanderTelemetry::BindingRef const& ref : m_commanderRefs)
+            standing = standing || ref.commanderGuid == it->first;
+        it = standing ? std::next(it) : m_commanderSince.erase(it);
+    }
+    m_commandersSent = !infos.empty();
+    SendDatagram(CommanderTelemetry::BuildPayload(kProtocolVersion, m_sessionId, m_snapshotSeq, time(nullptr), infos));
+}
+
 // Effective running settings for the dashboard Server panel. Reads live core
 // rate getters and AiPlayerbot fields — never .env or conf files — so what
 // the panel shows is what the server actually runs. Small (~1 KB) JSON,
@@ -1293,7 +1779,6 @@ void ObservabilityEmitter::EmitServerInfo()
        << ",\"raid_nearby\":\"" << flag(sPlayerbotAIConfig.randomBotRaidNearby) << "\""
        << ",\"invite_player\":\"" << flag(sPlayerbotAIConfig.randomBotInvitePlayer) << "\""
        << ",\"timed_logout\":\"" << flag(sPlayerbotAIConfig.randomBotTimedLogout) << "\""
-       << ",\"disable_random_levels\":\"" << flag(sPlayerbotAIConfig.disableRandomLevels) << "\""
        << ",\"level_ladder\":\"" << flag(sPlayerbotAIConfig.levelLadder) << "\""
        << ",\"auto_do_quests\":\"" << flag(sPlayerbotAIConfig.autoDoQuests) << "\""
        << ",\"disable_activity\":\"" << flag(sPlayerbotAIConfig.disableActivityPriorities) << "\""
@@ -1314,6 +1799,7 @@ void ObservabilityEmitter::EmitServerInfo()
        << ",\"auto_learn_quest_spells\":\"" << flag(sPlayerbotAIConfig.autoLearnQuestSpells) << "\""
        << ",\"level_up_mounts\":\"" << flag(sPlayerbotAIConfig.levelUpMounts) << "\""
        << ",\"turtle_mount_at_level\":" << sPlayerbotAIConfig.turtleMountAtLevel
+       << ",\"remote_commander\":\"" << flag(sPlayerbotAIConfig.remoteCommander) << "\""
        << "}"
        << ",\"diagnostics\":{"
        << "\"perf_mon\":\"" << flag(sPlayerbotAIConfig.perfMonEnabled) << "\""

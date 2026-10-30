@@ -48,12 +48,23 @@ void FireMageStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         NextAction::array(0, new NextAction("scorch", ACTION_NORMAL + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "hot streak",
+        NextAction::array(0, new NextAction("pyroblast", ACTION_HIGH + 2), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "pyroblast",
         NextAction::array(0, new NextAction("pyroblast", ACTION_NORMAL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "fire spells locked",
         NextAction::array(0, new NextAction("frostbolt", ACTION_NORMAL), NULL)));
+
+    // The filler has no "shoot" fallback (a GCD or threat-veto refusal
+    // must not start the wand); wand only while its mana cost is out of
+    // reach, below every spell row (NukeUnaffordable, WandPolicy.h).
+    triggers.push_back(new TriggerNode(
+        "fireball unaffordable",
+        NextAction::array(0, new NextAction("shoot", ACTION_DEFAULT), NULL)));
 }
 
 void FireMageStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -146,6 +157,17 @@ void FireMageRaidStrategy::InitDeadTriggers(std::list<TriggerNode*>& triggers)
 void FireMageAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
     MageAoeStrategy::InitCombatTriggers(triggers);
+
+    // MAG-2: own flamestrike burning under the pack — channel blizzard on
+    // top (donor: blizzard-on-active 24 above flamestrike 23).
+    triggers.push_back(new TriggerNode(
+        "flamestrike window",
+        NextAction::array(0, new NextAction("blizzard", ACTION_HIGH + 2), NULL)));
+
+    // Instant burst: no cast or channel while the pack stands on the mage.
+    triggers.push_back(new TriggerNode(
+        "arcane explosion window",
+        NextAction::array(0, new NextAction("arcane explosion", ACTION_HIGH + 1.5f), NULL)));
 
     triggers.push_back(new TriggerNode(
         "ranged medium aoe",

@@ -1,110 +1,125 @@
 ---
-id: class-hunter
-title: Hunter Bot AI & Specs
+id: classes-hunter
+title: Hunter Bot Guide
 category: classes
-summary: Guide to Hunter bot ranged and melee combat, pet care, Aspect upkeep (Viper manual-only), and custom Turtle Survival skills.
-tags: [class, hunter, dps, ranged, pet, melee]
+summary: Complete guide to Hunter bot AI, pet management, ranged rotations, melee Survival, and Aspect of the Viper logic.
+tags: [classes, hunter, dps, ranged, pet, melee]
 relates_to:
-  - class-overview
-  - guide-player-controls
+  - classes-overview
 ---
 
-# Hunter Bot AI & Specs
+# Hunter Bot Guide
 
-Hunters excel at sustained single-target ranged DPS, pet off-tanking, snares, and crowd control. In Turtle WoW 1.18.1, Hunters also possess a partially automated melee Survival combat style (ranged-first hybrid; *Carve* fires on AoE packs, *Lacerate* is manual).
+Hunters deliver consistent ranged physical damage, pet management, crowd control via traps, and dedicated melee Survival combat.
 
-## Supported Specs & Roles
+## Specs & roles
 
-- **Beast Mastery (Ranged DPS):** Focuses on pet empowerment, *Bestial Wrath*, *Kill Command*, and *Intimidation* on cooldown, with high sustained ranged output.
-- **Marksmanship (Ranged DPS):** Heavy physical burst damage centered on *Aimed Shot*, *Multi-Shot*, and *Trueshot Aura*.
-- **Survival (Melee / Ranged Hybrid):** Turtle WoW custom melee combat utilizing traps, *Carve* (automatic on AoE packs), and manual *Lacerate*.
-
----
-
-## Combat Rotations & Priorities
-
-### 1. Ranged Combat (Beast Mastery & Marksmanship)
-1. **Opener:** Casts *Hunter's Mark* on the primary target, orders pet to attack.
-2. **Shot Priority:**
-   - *Aimed Shot* when the MM talent is known, otherwise *Arcane Shot* (never both), on cooldown.
-   - *Multi-Shot* when AoE is permitted and multiple enemies are engaged.
-   - Keeps *Serpent Sting* ticking on high-health targets (skips on low-health mobs to conserve mana).
-3. **Dead-Zone Handling:** Inside the weapon's own minimum range no shot is possible, and the generic `enemy too close for spell` flee is suppressed against a fast target. A mob glued there is answered by trading into melee (`-ranged,+close`, melee auto-attack + *Raptor Strike*; *Wing Clip*/*Mongoose Bite* once known) at any level — `SwitchToMeleeTrigger` has no level gate, mirroring the donor. The switch pair uses hysteresis so a mob pacing the boundary cannot flip the kit every tick: melee when the mob is on the bot and inside 8 yd, ranged back when it is off the bot and past 8 yd (a rooted target restores ranged at any distance). `SwitchToRangedTrigger` (also ungated) hands the ranged kit back on those terms. When the switch leaves the bot alone (target rooted or too slow, or no melee weapon) the `enemy too close for auto shot` → `flee` step-back at `ACTION_MOVE − 1` still moves it out, after which it resumes …
-4. **Distance Band:** The ranged kit keeps its own band: `flee` moves the bot out when a target is inside it, and `enemy out of spell` → `reach spell` closes the distance again when the target leaves casting range.
-
-### 2. Melee Survival Combat
-- Closes into melee range.
-- Casts *Carve* automatically on AoE packs; *Lacerate* is a manual action.
-- Applies *Wing Clip* and *Mongoose Bite* reactive counter-attacks.
+| Spec | Role | Primary Focus |
+| :--- | :--- | :--- |
+| **Beast Mastery** | Ranged DPS | Pet empowerment, high physical damage, and enrage burst. |
+| **Marksmanship** | Ranged DPS | Heavy ranged shot rotations, party attack power, and *Trueshot Aura*. |
+| **Survival** | Melee / Ranged Hybrid | Front-line melee strikes, front-cone cleaves, and trap mastery (ranged-first hybrid; keeps the ranged shot kit). |
 
 ---
 
-## Turtle WoW 1.18.1 Custom Content
+## What the bot does in combat
+
+### Beast Mastery & Marksmanship (Ranged DPS)
+- Maintains maximum ranged distance from hostiles, opening with *Hunter's Mark* and *Auto Shot*. With a living tank in the group the mark goes only on the mob the tank is fighting.
+- Fires *Aimed Shot* (MM) or *Arcane Shot* on cooldown.
+- Uses *Steady Shot* as a filler timed cast fitting directly into the Auto Shot swing window.
+- Uses *Multi-Shot* only when the splash around the target catches a second fighting enemy, and never into a crowd-controlled mob standing beside it.
+- Channels *Volley* against grouped mobs, cancelling the channel if fewer than 2 mobs remain in the area.
+- Multi-Shot and Volley respect [party threat back-off](overview.md#party-threat-back-off) when holding ≥50% of the tank's threat.
+- Keeps *Serpent Sting* ticking on high-health targets (skipping targets near death).
+- Replaces Serpent Sting with *Viper Sting* when the hunter's mana is below 50% and the target has mana (≥10%); manual `sting viper` or `sting serpent` commands override this gate.
+- BM activates *Bestial Wrath* and *Kill Command* on cooldown. MM triggers *Rapid Fire*.
+- Switches between *Aspect of the Hawk* for damage and *Aspect of the Viper* when low on mana.
+- Threat handling (Feign Death, Disengage, multi-mob kiting): see [Threat drops](#threat-drops).
+
+### Survival (Melee / Ranged Hybrid)
+- Fights primarily in melee reach while keeping full access to the ranged shot kit.
+- Delivers front-cone melee cleave using *Carve* (Spell ID 51575) on AoE packs.
+- Stacks bleed damage using *Lacerate* (manual action, Spell ID 48049).
+- Uses *Raptor Strike* and *Mongoose Bite* on cooldown without requiring a dodge proc.
+- Employs *Counterattack* after parrying incoming strikes.
+
+### Dead-Zone & Melee Weaving
+- If enemies close inside Auto Shot minimum range (DBC-driven), ranged hunters trade into melee using *Wing Clip*, *Raptor Strike*, and *Mongoose Bite*, then step back out.
+- When space opens or the mob is pulled off the hunter by the tank or pet (or is rooted), the bot switches back to ranged attacks.
+
+### Threat drops
+- When the mob the hunter is fighting is on the hunter itself (or about to be) and stands in melee reach, and a living tank is in the group, the hunter casts *Disengage* to drop off the mob's threat list so the tank can take it back. *Disengage* does not move the hunter and is not used as an escape.
+- Drops threat more heavily with *Feign Death* upon reaching medium threat. The bot holds back Feign Death if the attacking mob has only the hunter on its threat list to avoid causing scripted encounters to evade.
+- When two or more mobs are on the hunter itself, it stops trading: *Wing Clip* on the nearest attacker and a step back out to shooting range, then shoots the mobs chasing it (repeating until the tank takes them back or they die).
+
+<details>
+<summary>Pet management and lifecycle details</summary>
+
+- **Lifecycle:** Hunters obtain their pet at level 10; pool hunters logging in below level 10 give up any previously seeded pet, while player-owned, hired, or adopted hunters retain theirs.
+- Automatically summons, feeds, and revives pets out of combat.
+- Sends pets to attack the primary target, holding them back for about two seconds after the group enters combat so a grouped tank can build a lead first (bot-led parties included; solo hunters and tankless groups send the pet in at once).
+- Casts *Mend Pet* below 40% in combat (channeled, when no rotation shot is ready) and below 70% out of combat.
+- Controls pets in Defensive stance. Solo hunters keep *Growl* on autocast; when grouped with a tank, *Growl* is automatically disabled and the pet uses *Cower* on threat spikes — as soon as the pet's threat on the target passes the tank's, before the mob turns on the pet.
+- When an enemy is crowd-controlled, pets are strictly prevented from attacking the controlled target.
+
+</details>
+
+---
+
+## Turtle WoW custom spells
 
 - **Aspect of the Viper (Spell ID 45651):**
-  - Custom Turtle WoW aspect that regenerates mana on ranged attacks while reducing damage output.
-  - *Aspect of the Viper* is a manual action only; the bot auto-maintains only *Aspect of the Hawk*.
-- **Carve (Spell ID 51575):**
-  - Custom Turtle WoW instant melee weapon attack hitting up to 3 nearby enemies. Integrated into Survival AoE packs.
-- **Lacerate (Spell ID 48049):**
-  - Custom Turtle WoW melee bleed ability providing sustained physical damage. Manual action only.
+  - Custom aspect converting physical damage into mana regeneration while reducing total damage output.
+  - Automatically triggered when hunter mana falls below threshold, swapping back to Hawk once mana recovers.
+- **Carve (Spell ID 51575):** Front-cone melee strike for Survival hunters hitting multiple targets.
+- **Lacerate (Spell ID 48049):** Stacking melee bleed attack for sustained melee damage.
 
 ---
 
-## Pet Management & Utility
+## Utility & interrupts
 
-- **Pet Lifecycle:**
-  - **Pets start at level 10.** *Tame Beast* (1515) and the *Call Pet* / *Revive Pet* / *Feed Pet* kit it unlocks are trainer tier 10 in the server data (`tw_world.spell_template`: `baseLevel` = `spellLevel` = 10), so a bot below that level owns no pet at all. The seam (`PlayerbotFactory::InitPet`) refuses to create one, and a pool hunter that logs in below the threshold gives up a pet an older pool seeded for it (`runtime/HunterPetPolicy.h`); player-owned, hired and adopted hunters are never touched.
-  - At the threshold (on level-up, or logging in at 10+ without a pet) the bot is granted a random tameable pet matching its level, out of combat.
-  - Automatically summons its pet out of combat. With no pet at all it will attempt to tame a nearby tameable beast.
-  - Revives dead pets using *Revive Pet* and heals injured pets during combat via *Mend Pet*.
-  - Restores an unhappy pet's happiness via the feed handler (no food items are consumed).
-  - **Autonomous upkeep:** out of combat the bot sweeps the pet's known spells and enables autocast on every non-passive one except *Prowl*, *Cower*, *Spell Lock* and *Devour Magic* (deliberate-cast abilities), and pins the pet plus guardians to *Defensive* after each (re)tame or summon. Explicit `.bot pet aggressive|defensive|passive` orders still apply immediately.
-  - **Pet ranks:** the pet learns the highest rank its family and level allow on tame and on the periodic initialize-pet tick — *Growl* plus the family kit (*Bite*/*Claw*, boar *Charge*, cat/wolf *Dash*, bird/bat *Dive*, bat/owl *Screech*, wolf *Furious Howl*, cat *Prowl*, scorpid poison, crocolisk Death Roll, raptor Savage Rend, Turtle custom Serpent/Fox/Moth abilities, ...), ranks replacing lower ones automatically. The tick teaches a live pet only (never re-creates or kills it) and walks the same table as the missing-rank check, so an unteachable row can never retrigger it. *Growl* stays autocast-on solo; *Sacrifice*-style manual spells never autocast. Pool bots never visit a pet trainer, so without this they would keep rank 1 forever.
-- **Pet Safety & CC Discipline:**
-  - When a target is crowd-controlled (e.g. *Polymorph* or *Freezing Trap*), the bot's pet is prevented from attacking the CC'd mob, preventing accidental breaks.
+- **Enrage Dispel:** Dispels enrage with *Tranquilizing Shot* via the dispel-enrage trigger.
 - **Crowd Control:**
-  - Deploys *Freezing Trap* when assigned CC via `.bot action cc <mark>`.
-  - Uses *Concussive Shot* to snare fleeing targets.
+  - Deploys *Freezing Trap* on assigned crowd control marks; without a mark (a dungeon run with none set), it traps a loose extra attacker on its own — a mob nobody in the group is fighting yet, not dotted and not already held by another crowd control — and lays the trap where the mob will walk into it.
+  - Casts *Scare Beast* on hostile beasts, withholding area attacks until the target is controlled.
+- **Combat Traps:**
+  - Lays *Immolation Trap*, *Frost Trap*, or *Explosive Trap* via *Feign Death*, avoiding melee suicide walks.
+- **Snares:** Uses *Concussive Shot* and *Wing Clip* to slow fleeing or pursuing enemies.
+- **Low Ammo Warning:** Grouped hunters out of combat with under 100 rounds remaining notify the group in local chat.
 
 ---
 
-## Diagnostics (`bot_events.csv`)
+## Talent builds
 
-Hunter ammo stacks cannot tell whether a hunter is shooting: the random-bot item cheat refills the equipped ammo stack to its maximum on every update, so the stack sits at 200 either way. These rows (`AiPlayerbot.AllowedLogFiles` must list `bot_events.csv`) carry the decision instead — one row per bot per event per 5 s, with the distance to the target and the strategy flags, captured before any switch is applied:
-
-| Event | Meaning | `info2` flags |
-| :--- | :--- | :--- |
-| `AutoShot` | The module (re)started the hunter's ranged auto-attack (the core then repeats it on its own until the target leaves the weapon's band) | `cast`, `ranged`, `close` |
-| `SwitchToMelee` | The hunter traded its ranged kit for melee (`-ranged,+close`) | pre-switch `ranged`, `close`, firing branch (`why=M,...`) |
-| `SwitchToRanged` | The hunter traded melee back for ranged (`-close,+ranged`) | pre-switch `ranged`, `close`, firing branch (`why=R,...`) |
-
-Reading it: `AutoShot` rows with `ranged=1,close=0` are a hunter firing; a `SwitchToMelee` row with `ranged=1` followed by a `SwitchToRanged` row and new `AutoShot` rows is a hunter that traded into melee for a glued mob and re-opened fire once it could.
-
----
-
-## Premade Talent Specs & Progression (1.18.1)
-
-TortoiseBots provides validated 5-level talent checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
+TortoiseBots provides pre-configured talent progressions at 5-level checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
 
 | Spec Name | Config ID | Role | 60 Allocation | Key Signatures & Synergies |
 | :--- | :--- | :--- | :--- | :--- |
-| **Beast Mastery** | `3.0` | Ranged DPS | `45 / 6 / 0` | Bestial Wrath (40), Frenzy (45), Kill Command (50), Unleashed Fury, Scent of Blood, Efficiency dip. |
-| **Marksmanship** | `3.1` | Ranged DPS | `9 / 42 / 0` | Aimed Shot (20), Mortal Shots (30), Lock and Load (50), Experimental Ammunition, Barrage, BM survivability dip. |
-| **Survival** | `3.2` | Melee DPS | `8 / 0 / 43` | Carve (35), Lacerate (50), Untamed Trapper (60), Savage Strikes, Trap Mastery, BM pet health dip. |
+| **Beast Mastery** | `3.0` | Ranged DPS | `45 / 6 / 0` | Bestial Wrath, Frenzy, Kill Command, Unleashed Fury, Scent of Blood. |
+| **Marksmanship** | `3.1` | Ranged DPS | `9 / 42 / 0` | Aimed Shot, Mortal Shots, Lock and Load, Experimental Ammunition, Barrage. |
+| **Survival** | `3.2` | Melee DPS | `8 / 0 / 43` | Carve, Lacerate, Untamed Trapper, Savage Strikes, Trap Mastery. |
 
-### Leveling Milestones & Progression Rationale
+<details>
+<summary>Leveling milestones and progression rationale</summary>
 
 - **Beast Mastery (`3.0`):**
-  - *Levels 10–35:* Pet empowerment rush: *Swift Aspects* (5/5), *Endurance Training* (5/5), *Thick Hide* (3/3), *Unleashed Fury* (5/5 pet damage), *Ferocity* (5/5 pet crit), and *Intimidation* (30).
-  - *Levels 35–45:* *Scent of Blood* (3/3), *Bestial Wrath* (40 signature enrage), *Frenzy* (5/5 pet attack speed), and *Spirit Bond* (2/2).
-  - *Levels 45–60:* *Kill Command* (50 capstone instant pet strike) and 6 points in Marksmanship (*Efficiency* 5/5 + *Improved Stings* 1/5) for shot mana sustainability.
+  - *Levels 10–35:* Takes *Swift Aspects* (5/5), *Endurance Training* (5/5), *Thick Hide* (3/3), *Unleashed Fury* (5/5), *Ferocity* (5/5), and *Intimidation* (30).
+  - *Levels 35–45:* Takes *Scent of Blood* (3/3), *Bestial Wrath* (40), *Frenzy* (5/5), and *Spirit Bond* (2/2).
+  - *Levels 45–60:* Takes *Kill Command* (50) and 6 points in Marksmanship (*Efficiency* 5/5 + *Improved Stings* 1/5).
 - **Marksmanship (`3.1`):**
-  - *Levels 10–30:* Core shot burst: *Efficiency* (5/5), *Lethal Shots* (5/5 ranged crit), *Aimed Shot* (20 signature opener), *Swiftshot* (3/3), and *Mortal Shots* (30 +30% crit damage bonus).
-  - *Levels 30–50:* *Barrage* (3/3 Multi-Shot damage), *Experimental Ammunition* (40), *Ranged Weapon Specialization* (5/5), and *Lock and Load* (50 capstone proc).
-  - *Levels 50–60:* Completes Marksmanship utility and takes 9 Beast Mastery points (*Swift Aspects* 5/5 + pet survivability) to support group dungeon grinding.
+  - *Levels 10–30:* Takes *Efficiency* (5/5), *Lethal Shots* (5/5), *Aimed Shot* (20), *Swiftshot* (3/3), and *Mortal Shots* (30).
+  - *Levels 30–50:* Takes *Barrage* (3/3), *Experimental Ammunition* (40), *Ranged Weapon Specialization* (5/5), and *Lock and Load* (50).
+  - *Levels 50–60:* Takes remaining Marksmanship talents and 9 points in Beast Mastery (*Swift Aspects* 5/5 + pet survival).
 - **Survival (`3.2`):**
-  - *Levels 10–35:* Melee toolkit rush: *Improved Slaying* (3/3), *Resourcefulness* (5/5 trap cost/cooldown), *Savage Strikes* (2/2 Raptor/Mongoose crit), *Planning Ahead* (2/2), and *Carve* (35 front-cone cleave).
-  - *Levels 35–50:* *Surefooted* (3/3 hit chance), *Killer Instinct* (3/3 crit), *Trap Mastery* (3/3), and *Lacerate* (50 stacking melee bleed).
-  - *Levels 50–60:* *Lightning Reflexes* (5/5 Agility scaling), *Untamed Trapper* (60 capstone), and 8 Beast Mastery points (*Endurance Training* 5/5 + *Thick Hide* 3/3) to keep the melee hunter's pet resilient.
+  - *Levels 10–35:* Takes *Improved Slaying* (3/3), *Resourcefulness* (5/5), *Savage Strikes* (2/2), *Planning Ahead* (2/2), and *Carve* (35).
+  - *Levels 35–50:* Takes *Surefooted* (3/3), *Killer Instinct* (3/3), *Trap Mastery* (3/3), and *Lacerate* (50).
+  - *Levels 50–60:* Takes *Lightning Reflexes* (5/5), *Untamed Trapper* (60), and 8 Beast Mastery points.
 
+</details>
+
+---
+
+## Class settings
+
+- [`AiPlayerbot.HunterViperOnLowMana`](../server/settings/class-behaviour.md#aiplayerbothunterviperonlowmana): Controls whether hunters swap to Aspect of the Viper when low on mana.

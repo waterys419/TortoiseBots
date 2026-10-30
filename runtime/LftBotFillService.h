@@ -12,11 +12,13 @@ namespace TortoiseBots
 {
 
 // Default-on bounded fill of human-waiting LFT queues with live random Headless bots.
-// The service observes the copy-only native queue API from core #416,
-// identifies human groups/instances and missing 1 tank / 1 healer / 3 dps roles,
+// The service observes the copy-only native queue API from core #416 and
+// replays the core offer match (LftCompPolicy) over entries that may join a
+// new offer - core queue order, party blocks atomic, committed in-offer
+// members excluded - to find the missing 1 tank / 1 healer / 3 dps slots,
 // then filters in-memory Headless random candidates by the authoritative
-// Soromeister/LFT v0.0.3.3 LFT.allDungeons minLevel/maxLevel range,
-// team, hardcore, group, state, and AiFactory spec role before QueuePlayer.
+// Turtle client LFT LFT_Data.lua minLevel/maxLevel range, team,
+// hardcore, group, state, and AiFactory spec role before QueuePlayer.
 // Native core owns offers, acceptance, cancellation, and group formation; the
 // service auto-accepts its own Headless participants and, independently of the
 // fill switch, managed party bots whose real-player master/group leader shares
@@ -37,12 +39,24 @@ public:
     // Must not touch the lease map; the manager owns the transition.
     void OnLeaseEvicted(uint32_t guidLow);
 
+    uint8 GetBotRoleMask(Player const* bot) const;
+    void ClearForcedRole(uint32 guidLow);
+    // The forced role and the kit rebuild `.bot role` runs; 0 clears it.
+    void ApplyForcedRole(Player* bot, uint8 role);
+    // Issue #189 Phase 4: natural-role eligibility (no borrowing by default)
+    // plus best-shield-from-bags equip for shield-class tanks. Returns the
+    // skip reason when the bot must not fill the role, empty when it may.
+    std::string RoleMismatchReason(Player* bot, uint8 needRole) const;
+    bool EquipBestShieldFromBags(Player* bot) const;
+    // Issue #966: role bits of the installed combat kit (named spec
+    // strategies only, like BotPlayerAdapter::GetBotRoles); 0 = bare kit.
+    uint8 GetCombatKitRoleMask(Player const* bot) const;
+
 private:
     LftBotFillService() = default;
     ~LftBotFillService() = default;
 
     bool IsEligibleCandidate(Player* bot) const;
-    uint8 GetBotRoleMask(Player const* bot) const;
     bool IsModuleOwnedHeadlessBot(Player const* bot) const;
     void ReconcilePending(bool cancelAll, std::vector<std::string> const* activeInstances = nullptr);
     void AcceptPendingOffers();
@@ -51,12 +65,6 @@ private:
     // real player who shares the offer. Fill-owned bots (m_pending) are never
     // touched here; solo managed bots never auto-accept.
     void AcceptPartyBotOffers();
-    void ClearForcedRole(uint32 guidLow);
-    // Issue #189 Phase 4: natural-role eligibility (no borrowing by default)
-    // plus best-shield-from-bags equip for shield-class tanks. Returns the
-    // skip reason when the bot must not fill the role, empty when it may.
-    std::string RoleMismatchReason(Player* bot, uint8 needRole) const;
-    bool EquipBestShieldFromBags(Player* bot) const;
 
     bool m_initialized = false;
     uint32_t m_elapsedMs = 0;

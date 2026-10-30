@@ -10,13 +10,28 @@ void FollowMasterStrategy::InitNonCombatTriggers(std::list<TriggerNode*> &trigge
         "master target active",
         NextAction::array(0, new NextAction("dps assist", ACTION_EMERGENCY), NULL)));
 
+    // Out-of-combat catch-up runs below the party buffs (ACTION_NORMAL+2..+4):
+    // donor follow is a 1.0 default action, so buffs always outbid it there.
+    // When a buff is pending and its target is in range the buff wins this
+    // tick; when the bot is far behind, the buff target is out of range, the
+    // buff action is impossible and the engine falls through to follow here.
+    // Combat keeps ACTION_HIGH: mid-fight positioning must never wait for a
+    // buff. Still above loot (7) and drink (6), so a far-behind bot catches
+    // up before looting.
     triggers.push_back(new TriggerNode(
         "out of free move range",
-        NextAction::array(0, new NextAction("follow", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("follow", ACTION_NORMAL), NULL)));
 
     triggers.push_back(new TriggerNode(
         "update follow",
         NextAction::array(0, new NextAction("follow", ACTION_IDLE), NULL)));
+    // Idle station-keeping: a formation slot sits inside "update follow"'s
+    // 5 yd dead zone, so without this a newly set formation (queue, circle,
+    // shield, ...) visibly does nothing until the party moves. Fires while
+    // the bot stands off its slot next to a still leader and walks it there.
+    triggers.push_back(new TriggerNode(
+        "formation station",
+        NextAction::array(0, new NextAction("formation station", ACTION_IDLE), NULL)));
 }
 
 void FollowMasterStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

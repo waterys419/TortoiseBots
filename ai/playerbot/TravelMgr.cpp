@@ -1,10 +1,14 @@
 #include "playerbot/TravelMgr.h"
-#include "playerbot/TravelRoutePolicy.h"
+#include "playerbot/policy/travel/TravelRoutePolicy.h"
 #include "playerbot/GrindSpotPolicy.h"
-#include "playerbot/PullRegenPolicy.h"
-#include "playerbot/PointDangerPolicy.h"
+#include "playerbot/policy/pull/PullRegenPolicy.h"
+#include "playerbot/policy/travel/PointDangerPolicy.h"
 // Zone migration exclusion for the leave-outgrown-zone grind errand.
-#include "playerbot/ZoneMigratePolicy.h"
+// Pure travel re-pick decisions (cooldown park, kind give-up, trap streak).
+#include "playerbot/policy/rpg/ZoneMigratePolicy.h"
+#include "playerbot/TravelRepickPolicy.h"
+#include "playerbot/policy/quest/QuestGiverStallPolicy.h"
+#include "playerbot/policy/rpg/WorkIdlePolicy.h"
 #include <numeric>
 #include <mutex>
 #include <iomanip>
@@ -55,7 +59,7 @@ PlayerTravelInfo::PlayerTravelInfo(Player* player)
     // Same scope as ShouldLeaveOutgrownZoneValue: autonomous random bots only.
     // Snapshot here so destination filtering (async, off-tick) cannot block an
     // owned/hired bot from vendoring or repairing next to its player.
-    masterlessRandom = sRandomBotFacade.IsRandomBot(player) && !ai->HasRealPlayerMaster();
+    masterlessRandom = sRandomBotFacade.IsFreeBot(player) && !ai->HasRealPlayerMaster();
     focusList = AI_VALUE(focusQuestTravelList, "focus travel target");
 
     for (auto& [valueName, value] : boolValues)
@@ -245,6 +249,29 @@ bool QuestRelationTravelDestination::IsActive(Player* bot, const PlayerTravelInf
         return false;
 
     bool forceThisQuest = info.HasFocusQuest(); //Checked in IsPossible if it's 'this' quest.
+    // Gameobject givers (negative entry, quest boards) take the same gates:
+    // with "> 0" a parked board was re-picked at once (live 2026-10-09).
+    if (GetRelation() == 0 && GetEntry() != 0 && info.IsMasterlessRandom())
+    {
+        // Giver-stall back-off (TravelAction parks the pair 30 min after 2
+        // stalls with no quest-state change): this pair's menu never offers
+        // the quest, so the search stops offering it and the next pick goes
+        // elsewhere. Owned bots keep today's behaviour. Reads only a created
+        // value (like the "no quest hand in until::<quest>" park the taker
+        // path reads) so the value store grows no entry per pair.
+        // The npc-level "can accept quest" check below passes when the giver
+        // offers any quest; this quest itself may sit behind an unfinished
+        // chain (Virulence 60113 behind 367) and never show in the menu.
+        if (Quest const* quest = sObjectMgr.GetQuestTemplate(GetQuestId()))
+            if (!bot->SatisfyQuestPreviousQuest(quest, false) || !bot->SatisfyQuestPrevChain(quest, false) ||
+                bot->GetLevel() < quest->GetMinLevel())
+                return false;
+
+        std::string const backoffKey = ai::QuestGiverBackoffKey(GetEntry(), GetQuestId());
+        if (context->HasValue("manual time", backoffKey) &&
+            context->GetValue<time_t>("manual time", backoffKey)->Get() > time(0))
+            return false;
+    }
 
     if (GetRelation() == 0)
     {
@@ -671,6 +698,19 @@ bool ExploreTravelDestination::IsPossible(const PlayerTravelInfo& info) const
     if (GetLevel() && (uint32)GetLevel() > info.GetLevel() && info.GetLevel() < DEFAULT_MAX_LEVEL)
         return false;
 
+    if (info.IsMasterlessRandom())
+    {
+        // Enemy home zone, same rule as WorldPosition::isEnemyHomeZoneFor:
+        // sub-areas usually carry no team and inherit their zone's.
+        uint32 areaTeam = area->Team;
+        if (areaTeam == AREATEAM_NONE && area->ZoneId)
+            if (AreaEntry const* zone = AreaEntry::GetById(area->ZoneId))
+                areaTeam = zone->Team;
+        Team const botTeam = info.GetTeam();
+        if ((areaTeam == AREATEAM_ALLY && botTeam == HORDE) || (areaTeam == AREATEAM_HORDE && botTeam == ALLIANCE))
+            return false;
+    }
+
     return true;
 }
 
@@ -1055,10 +1095,15 @@ bool GatherTravelDestination::IsActive(Player* bot, const PlayerTravelInfo& info
             }
             else
             {
+                // Game-object destinations keep the entry negated (entry <= 0,
+                // see EntryTravelDestination); the guid carries the positive
+                // template id. Comparing the two as-is never matched, so a
+                // mining or herb trip near a spawned node always read inactive.
+                uint32 const goEntry = uint32(-GetEntry());
                 std::list<ObjectGuid> targets = AI_VALUE(std::list<ObjectGuid>, "nearest game objects no los");
 
                 for (auto& target : targets)
-                    if (target.GetEntry() == GetEntry())
+                    if (target.IsGameObject() && target.GetEntry() == goEntry)
                         return true;
             }
 
@@ -1129,6 +1174,8 @@ void TravelTarget::SetTarget(TravelDestination* tDestination1, WorldPosition* wP
     // from the freshly chosen target. UnstuckAction saves/restores both
     // counters around the re-SetTarget it does after its reset.
     moveRetryCount = 0;
+    // The hand-in progress mark belongs to the walk toward this point.
+    handInBestDistance = -1.0f;
 
     SetStatus(TravelStatus::TRAVEL_STATUS_TRAVEL);
 }
@@ -1173,6 +1220,34 @@ void TravelTarget::SetStatus(TravelStatus status) {
     }
 }
 
+// Whether a spawned mining or herb node (any entry: pooled ores share one
+// spot) stands within the empty-spot radius of a gather trip's own point.
+// Reads the sight-range node scan the destination verdict already filled;
+// the scan lists spawned game objects only.
+static bool GatherNodeAtPoint(PlayerbotAI* ai, WorldPosition const& point)
+{
+    AiObjectContext* context = ai->GetAiObjectContext();
+    EntryTravelPurposeMap const& purposes = GAI_VALUE_REF(EntryTravelPurposeMap, "entry travel purpose");
+    uint32 const gatherMask = (uint32)TravelDestinationPurpose::GatherMining | (uint32)TravelDestinationPurpose::GatherHerbalism;
+    float const radiusSq = ai::kEmptyGatherSpotRadiusYd * ai::kEmptyGatherSpotRadiusYd;
+
+    for (ObjectGuid const& guid : AI_VALUE(std::list<ObjectGuid>, "nearest game objects no los"))
+    {
+        if (!guid.IsGameObject())
+            continue;
+
+        auto const purpose = purposes.find(-1 * (int32)guid.GetEntry());
+        if (purpose == purposes.end() || !(purpose->second & gatherMask))
+            continue;
+
+        GameObject* go = ai->GetGameObject(guid);
+        if (go && WorldPosition(go).sqDistance2d(point) <= radiusSq)
+            return true;
+    }
+
+    return false;
+}
+
 bool TravelTarget::IsDestinationActive()
 {
     Player* player = bot;
@@ -1187,6 +1262,22 @@ bool TravelTarget::IsDestinationActive()
 
     if (!PlayerbotAIStorage::Instance().GetAI(player)) //No ai so clear target.
         return false;
+
+    // A gather trip is judged at its own spawn point (GatherSpotPolicy.h).
+    // The destination verdict looks at whichever spawn of the entry is
+    // nearest, so passing within sight of another, empty spawn of the same
+    // node ended the trip half way (live 2026-10-12: median gather trip 48 s,
+    // 47 bots ping-ponging node types). Until the bot sees its own point (the
+    // node scan then covers the whole spot) only the static rules (skill,
+    // level) apply.
+    TravelDestinationPurpose const purpose = tDestination->GetPurpose();
+    if (wPosition && (purpose == TravelDestinationPurpose::GatherMining || purpose == TravelDestinationPurpose::GatherHerbalism))
+    {
+        bool const sameMap = wPosition->GetMapId() == player->GetMapId();
+        WorldPosition const playerPos(player);
+        if (!ai::GatherPointInSight(sameMap, sameMap ? wPosition->distance(playerPos) : 0.0f, sPlayerbotAIConfig.sightDistance))
+            return tDestination->IsPossible(PlayerTravelInfo(player));
+    }
 
     return tDestination->IsActive(player, PlayerTravelInfo(player));
 }
@@ -1321,9 +1412,115 @@ void TravelTarget::CheckStatus()
                 return;
             }
 
+            // A quest errand that went inactive is done (quest accepted,
+            // objective complete, reward taken): it cannot be re-picked, so the
+            // 1-minute cooldown only froze the pool bot - COOLDOWN still counts
+            // as active and the request gate refuses every new pick meanwhile
+            // (live 2026-10-09: 1-3 min idle after each hand-in). Expire it so
+            // the next tick picks the next errand. Owned bots keep the cooldown.
+            if (destinationInactive && sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster() &&
+                (tDestination->GetPurpose() == TravelDestinationPurpose::QuestGiver ||
+                 tDestination->GetPurpose() == TravelDestinationPurpose::QuestTaker ||
+                 static_cast<uint32>(tDestination->GetPurpose()) & static_cast<uint32>(TravelDestinationPurpose::QuestAllObjective)))
+            {
+                ai->TellDebug(ai->GetMaster(), "The target is expiring because its quest errand is done.", "debug travel");
+                forced = false;
+                SetStatus(TravelStatus::TRAVEL_STATUS_EXPIRED);
+                return;
+            }
+            // A gather trip that went inactive before arrival reached an empty
+            // node (looted, tapped, despawned): the static destination data
+            // still offers it, so the 1-minute cooldown only stands the pool
+            // bot at nothing - COOLDOWN still counts as active and the request
+            // gate refuses every new pick meanwhile (live 2026-10-09: ~17% of
+            // gather-stalled bot-time sits in cooldown a median 57 yd out).
+            // Expire it so the next tick walks a live node; the dead one is
+            // skipped (SetBestTarget requires IsActive). An arrived trip
+            // (WORK) keeps today's behaviour. Owned bots keep the cooldown.
+            if (destinationInactive && GetStatus() == TravelStatus::TRAVEL_STATUS_TRAVEL &&
+                sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster() &&
+                (tDestination->GetPurpose() == TravelDestinationPurpose::GatherMining ||
+                 tDestination->GetPurpose() == TravelDestinationPurpose::GatherHerbalism))
+            {
+                ai->TellDebug(ai->GetMaster(), "The target is expiring because its gather node is gone.", "debug travel");
+                // Remember the spawn point seen empty for about a respawn, so
+                // the next pick walks another spawn instead of back to this
+                // one. Only a point the bot could see, that it could still
+                // gather at (an expiry on skill or level alone says nothing
+                // about the node) and that really has no mining or herb node.
+                if (wPosition && wPosition->GetMapId() == bot->GetMapId())
+                {
+                    bool const inSight = ai::GatherPointInSight(true, wPosition->distance(WorldPosition(bot)), sPlayerbotAIConfig.sightDistance);
+                    if (ai::ShouldMarkGatherSpotEmpty(inSight, inSight && tDestination->IsPossible(PlayerTravelInfo(bot)),
+                            inSight && GatherNodeAtPoint(ai, *wPosition)))
+                        ai->MarkEmptyGatherSpot(wPosition->GetMapId(), wPosition->getX(), wPosition->getY(), WorldTimer::getMSTime());
+                }
+                forced = false;
+                SetStatus(TravelStatus::TRAVEL_STATUS_EXPIRED);
+                return;
+            }
+
             ai->TellDebug(ai->GetMaster(), "The target is cooling down because the destination was no longer active or the conditions are no longer true.", "debug travel");
             forced = false;
+            // A trip that never arrived must not re-request on expiry: the
+            // kind blacklist only covers one creature kind and the 6-fail
+            // drop never fires (the 60 s cooldown expires first), so without
+            // a park the same zone is re-picked every ~2.5 min from the same
+            // standstill (night2 capital-loop bots). Park the purpose like a
+            // drop (same keys the request gate reads); other purposes keep
+            // working. An arrived trip (WORK) keeps today's behaviour.
+            // Grind only: a quest/vendor trip also cools down when its errand
+            // completes en route, and parking those would stall questing.
+            if (tDestination->GetPurpose() == TravelDestinationPurpose::Grind &&
+                ai::TravelCooldownParksPurpose(sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster(),
+                GetStatus() == TravelStatus::TRAVEL_STATUS_TRAVEL))
+            {
+                std::string const parkKey = std::to_string(static_cast<uint32>(tDestination->GetPurpose()));
+                context->GetValue<bool>("no active travel destinations", parkKey)->Set(true);
+                context->GetValue<time_t>("manual time", "no travel purpose until::" + parkKey)->Set(time(0) + ai::TRAVEL_COOLDOWN_PARK_SECONDS);
+            }
             SetStatus(TravelStatus::TRAVEL_STATUS_COOLDOWN);
+            return;
+        }
+    }
+
+    // Empty-destination WORK release (workidle): a masterless pool bot that
+    // arrived where there is nothing to do holds WORK with the destination
+    // verdict still green (static data, not the live scene), blocking the
+    // next request and the idle drift until WORK expires (~5 min). Past the
+    // horizon with no attackable grind prey and nobody fighting the bot the
+    // target expires, so the next visit requests a new one - the donor
+    // mod-playerbots shape (GO_GRIND/WANDER_NPC return to IDLE with no
+    // target instead of holding). Both signals are already-cached engine
+    // reads ("grind target" 2 s, core attacker set + combat flag free), so
+    // no DB hit, world scan or graph rebuild here. Pool upkeep bots only;
+    // owned/hired bots keep the full WORK clock.
+    if (GetStatus() == TravelStatus::TRAVEL_STATUS_WORK &&
+        !IsForced() && !IsGroupCopy() &&
+        sRandomBotFacade.IsFreeBot(bot) && !ai->HasRealPlayerMaster())
+    {
+        AiObjectContext* workContext = ai->GetAiObjectContext();
+        Unit* grindPrey = workContext->GetValue<Unit*>("grind target")->Get();
+        bool const hasAttackers = !bot->GetAttackers().empty() || bot->IsInCombat();
+        time_t const now = time(0);
+        time_t anchor = workContext->GetValue<time_t>("manual time", ai::WorkIdleAnchorKey())->Get();
+        anchor = ai::WorkIdleAnchor(anchor, now, grindPrey != nullptr, hasAttackers);
+        workContext->GetValue<time_t>("manual time", ai::WorkIdleAnchorKey())->Set(anchor);
+        if (ai::WorkIdleStale(anchor, now, grindPrey != nullptr, hasAttackers))
+        {
+            ai->TellDebug(ai->GetMaster(), "The target is expiring because there is nothing to do here.", "debug travel");
+            sPlayerbotAIConfig.logEvent(ai, "WorkIdleStale", tDestination ? tDestination->GetShortName() : "unknown");
+            workContext->GetValue<time_t>("manual time", ai::WorkIdleAnchorKey())->Set(time_t(0));
+            // An AH visit with nothing to post or bid on: park the purpose like a
+            // fruitless sale (AhAction), or the bot walks from auctioneer to
+            // auctioneer re-picking AH every minute.
+            if (tDestination && tDestination->GetPurpose() == TravelDestinationPurpose::AH)
+            {
+                std::string const ahKey = std::to_string((uint32)TravelDestinationPurpose::AH);
+                workContext->GetValue<bool>("no active travel destinations", ahKey)->Set(true);
+                workContext->GetValue<time_t>("manual time", "no travel purpose until::" + ahKey)->Set(now + 10 * MINUTE);
+            }
+            SetStatus(TravelStatus::TRAVEL_STATUS_EXPIRED);
             return;
         }
     }
@@ -1442,38 +1639,10 @@ int32 TravelMgr::GetAreaLevel(uint32 area_id)
         return areaLevels[area_id];
     }
 
-    //Get units avarage
-    FactionTemplateEntry const* humanFaction = sFactionTemplateStore.LookupEntry(1);
-    FactionTemplateEntry const* orcFaction = sFactionTemplateStore.LookupEntry(2);
-
-    for (auto& creaturePair : WorldPosition().GetCreaturesNear())
-    {
-        if (WorldPosition(creaturePair).GetArea() != area)
-            continue;
-
-        CreatureData const cData = creaturePair->second;
-        CreatureInfo const* cInfo = sObjectMgr.GetCreatureTemplate(cData.creature_id[0]);
-
-        if (!cInfo)
-            continue;
-
-        FactionTemplateEntry const* factionEntry = sFactionTemplateStore.LookupEntry(cInfo->faction);
-        ReputationRank reactionHum = PlayerbotAI::GetFactionReaction(humanFaction, factionEntry);
-        ReputationRank reactionOrc = PlayerbotAI::GetFactionReaction(orcFaction, factionEntry);
-
-        if (reactionHum > REP_NEUTRAL || reactionOrc > REP_NEUTRAL)
-            continue;
-
-        level += cInfo->level_max;
-        cnt++;
-    }
-
-    if (cnt)
-    {
-        areaLevels[area_id] = std::max(uint32(1),level / cnt);
-        return areaLevels[area_id];
-    }
-
+    // No creature-spawn average here: GetArea() per spawn loaded the terrain
+    // under every creature in the world on the world thread (8-24 s freezes,
+    // issue #684). Areas the DBC leaves at 0 are covered by the shipped
+    // ai_playerbot_zone_level rows; anything newer falls back to its zone.
     //Use parent zone value.
     if (area->ZoneId)
     {
@@ -1609,22 +1778,22 @@ void TravelMgr::LoadQuestTravelTable()
 
     sLog.outString("Loading object locations.");
 
-    EntryGuidps guidpMap = GAI_VALUE(EntryGuidps, "entry guidps");
+    EntryGuidps const& guidpMap = GAI_VALUE_REF(EntryGuidps, "entry guidps");
 
     sLog.outString("Finding possible travel destinations.");
 
-    EntryQuestRelationMap eMap = GAI_VALUE(EntryQuestRelationMap, "entry quest relation");
+    EntryQuestRelationMap const& eMap = GAI_VALUE_REF(EntryQuestRelationMap, "entry quest relation");
 
     sLog.outString("Creating travel destinations.");
 
     BarGoLink bar(eMap.size());
 
-    for (auto& [entry, relation] : eMap)
+    for (auto const& [entry, relation] : eMap)
     {
 
 
         bar.step();
-        for (auto& [questId, flag] : relation)
+        for (auto const& [questId, flag] : relation)
         {
             if (guidpMap.find(entry) == guidpMap.end())
             {
@@ -1652,7 +1821,7 @@ void TravelMgr::LoadQuestTravelTable()
 
             if (!locs.empty())
             {
-                for (auto& guidP : guidpMap.at(entry))
+                for (auto const& guidP : guidpMap.at(entry))
                 {
                     pointsMap.insert(std::make_pair(guidP.GetRawValue(), guidP));
 
@@ -1667,7 +1836,7 @@ void TravelMgr::LoadQuestTravelTable()
 
     sLog.outString("Loading all travel locations.");
 
-    for (auto& [entry, purpose] : GAI_VALUE(EntryTravelPurposeMap, "entry travel purpose"))
+    for (auto const& [entry, purpose] : GAI_VALUE_REF(EntryTravelPurposeMap, "entry travel purpose"))
     {
         std::vector<TravelDestination*> dests;
 
@@ -1755,9 +1924,10 @@ void TravelMgr::LoadQuestTravelTable()
         sLog.outString("Running analysis.");
     }
 
-    sLog.outString("Clearing log files.");
+    sLog.outString("Opening log files (previous run retained as .1).");
 
      //Clear these logs files
+     // Start fresh per-run logs; openLog preserves the previous run.
     sPlayerbotAIConfig.openLog("zones.csv", "w");
     sPlayerbotAIConfig.openLog("creatures.csv", "w");
     sPlayerbotAIConfig.openLog("gos.csv", "w");
@@ -1782,7 +1952,6 @@ void TravelMgr::LoadQuestTravelTable()
     sPlayerbotAIConfig.openLog("player_paths.csv", "w");
     sPlayerbotAIConfig.openLog("travel_destinations.csv", "w");
     sPlayerbotAIConfig.openLog("deadzone.csv", "w");
-    sPlayerbotAIConfig.openLog("bot_test_results.log", "w", true);
 
 
     sLog.outString("Loading travel nodes.");
@@ -2419,11 +2588,11 @@ void TravelMgr::GetPopulatedGrids()
 
 void TravelMgr::GetPopulatedGrids(uint32 mapId)
 {
-    EntryGuidps guidpMap = GAI_VALUE(EntryGuidps, "entry guidps");
+    EntryGuidps const& guidpMap = GAI_VALUE_REF(EntryGuidps, "entry guidps");
 
-    for (auto& [entry, guidPs] : guidpMap)
+    for (auto const& [entry, guidPs] : guidpMap)
     {
-        for (auto& guidP : guidPs)
+        for (auto const& guidP : guidPs)
         {
             if (guidP.GetMapId() == mapId)
             {
@@ -2571,27 +2740,45 @@ DestinationList TravelMgr::GetDestinations(const PlayerTravelInfo& info, uint32 
 
     for (auto& [purpose, entryDests] : destinationMap)
     {
-
         if (purposeFlag != (uint32)TravelDestinationPurpose::None && !((uint32)purpose & (uint32)purposeFlag))
             continue;
 
-        for (auto& [destEntry, dests] : entryDests)
+        if (!entries.empty())
         {
-            if (entries.size() && std::find(entries.begin(), entries.end(), destEntry) == entries.end())
-                continue;
-
-            for (auto& dest : dests)
+            for (int32 entry : entries)
             {
-                if (onlyPossible && !dest->IsPossible(info))
+                auto it = entryDests.find(entry);
+                if (it == entryDests.end())
                     continue;
 
-                if (maxDistance > 0 && dest->DistanceTo(center) > maxDistance)
-                    continue;
+                for (auto& dest : it->second)
+                {
+                    float dist = dest->DistanceTo(center);
+                    if (dist == FLT_MAX || (maxDistance > 0 && dist > maxDistance))
+                        continue;
 
-                if (dest->DistanceTo(center) == FLT_MAX) //Do not return destinations on maps you can't path to.
-                    continue;
+                    if (onlyPossible && !dest->IsPossible(info))
+                        continue;
 
-                retDests.push_back(dest);
+                    retDests.push_back(dest);
+                }
+            }
+        }
+        else
+        {
+            for (auto& [destEntry, dests] : entryDests)
+            {
+                for (auto& dest : dests)
+                {
+                    float dist = dest->DistanceTo(center);
+                    if (dist == FLT_MAX || (maxDistance > 0 && dist > maxDistance))
+                        continue;
+
+                    if (onlyPossible && !dest->IsPossible(info))
+                        continue;
+
+                    retDests.push_back(dest);
+                }
             }
         }
     }
@@ -2627,6 +2814,9 @@ bool TravelMgr::IsLocationLevelValid(const WorldPosition& position, const Player
     {
         botLevel -= (int32)(2 + info.GetUint32Value("death count"));
     }
+
+    if (info.IsMasterlessRandom() && position.GetMapId() != info.getPosition().GetMapId())
+        return false;
 
     if (botLevel < 1)
         botLevel = 1;
@@ -2808,20 +2998,24 @@ bool TravelMgr::IsLocationLevelValid(const WorldPosition& position, const Player
                 return false;
         }
     }
-    // A quest/grind point whose surroundings hold hostile spawns past the
-    // bot's grind cap is no point: the spawn entry itself was in cap (see
+    // A quest/grind/gather point whose surroundings hold hostile spawns past
+    // the bot's grind cap is no point: the spawn entry itself was in cap (see
     // #418), but the field around it is not - a level-4 bot on the item-750
     // trip walks to a Timber Wolf point outside Northshire and dies to the
     // Defias Cutpurse 5 / Forest Spider 6 / Mangy Wolf 6 standing next to
-    // it. Pool bots below 10 only (PointDangerApplies); quest objectives,
-    // quest loot and grind. The static cell index (40 yd, one build, no
+    // it. Gather nodes are the same shape with no mob of their own at all -
+    // a level-17 bot mines a req-1 Copper Vein on the Daggerspine shore next
+    // to level-30 nagas (Oct 2026 pool). Masterless pool bots only
+    // (PointDangerApplies); quest objectives, quest loot, grind, mining and
+    // herbalism. The static cell index (40 yd, one build, no
     // world scan) keeps this cheap inside the async search; neutral camps
     // and wildlife never count (template reaction), so giver/taker walks
     // through town stay untouched. When every point of a destination is
     // dangerous the search comes back empty and the caller parks the
     // purpose like any other empty search.
     if (ai::PointDangerApplies(info.GetLevel(), info.IsMasterlessRandom()) &&
-        (purposeFlag & ((uint32)TravelDestinationPurpose::QuestAllObjective | (uint32)TravelDestinationPurpose::Grind)))
+        (purposeFlag & ((uint32)TravelDestinationPurpose::QuestAllObjective | (uint32)TravelDestinationPurpose::Grind |
+            (uint32)TravelDestinationPurpose::GatherMining | (uint32)TravelDestinationPurpose::GatherHerbalism)))
     {
         Team const botTeam = info.GetTeam();
         uint32 const highestNear = position.GetHighestHostileLevelNear(ai::POINT_DANGER_RADIUS_YD, botTeam);
@@ -2873,12 +3067,6 @@ PartitionedTravelList TravelMgr::GetPartitions(const WorldPosition& center, cons
         float minDistance = FLT_MAX;
         for (auto& position : points)
         {
-            if (!IsLocationLevelValid(*position, info, purposeFlag, grindZoneFloor, excludeZoneId))
-            {
-                probeRejectLevel++;
-                continue;
-            }
-
             float distance = position->distance(center);
 
             if (distance > maxDistance)
@@ -2892,6 +3080,12 @@ PartitionedTravelList TravelMgr::GetPartitions(const WorldPosition& center, cons
             if (info.GetLevel() <= 5 && distance > 1500.0f)
             {
                 probeRejectDistance++;
+                continue;
+            }
+
+            if (!IsLocationLevelValid(*position, info, purposeFlag, grindZoneFloor, excludeZoneId))
+            {
+                probeRejectLevel++;
                 continue;
             }
 

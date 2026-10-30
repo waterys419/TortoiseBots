@@ -1,10 +1,16 @@
 #include "Config/Config.h"
+#include <utility>
 
 #include "playerbot/playerbot.h"
 #include "TalkToQuestGiverAction.h"
+#include "playerbot/policy/quest/QuestRewardPolicy.h"
+#include "playerbot/RandomItemMgr.h"
 #include "playerbot/strategy/values/ItemUsageValue.h"
 #include "playerbot/strategy/values/QuestValues.h"
 #include "playerbot/strategy/values/GuildValues.h"
+#include "../../../runtime/policy/hire/HireSourceGuardPolicy.h"
+#include "../../../runtime/HireLifecycle.h"
+#include "../../../runtime/policy/hire/HireQuestPolicy.h"
 
 using namespace ai;
 
@@ -15,6 +21,9 @@ bool TalkToQuestGiverAction::ProcessQuest(Player* requester, Quest const* quest,
         return false;
 
     if (questGiver && (questGiver->GetEntry() == 81030 || questGiver->GetEntry() == 62609))
+        return false;
+
+    if (!TortoiseBots::HireMayDoQuests(TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid())))
         return false;
 
     bool isCompleted = false;
@@ -198,31 +207,60 @@ ItemIds TalkToQuestGiverAction::BestRewards(Quest const* quest)
             }
         }
 
-        for (uint8 i = 0; i < quest->GetRewChoiceItemsCount(); ++i)
+        // Issue #490 (bug part): hired bots skip source-gated choice rewards
+        // when another choice exists (pure rule in
+        // runtime/HireSourceGuardPolicy.h). A gated pick lands in the bags
+        // and the equip audit (also hire-gated) leaves it there, so the hire
+        // would carry dead weight. Single-choice quests (above) keep their
+        // reward; all-gated choices fall back to the plain ranking.
+        bool const hireGated = TortoiseBots::HireLifecycle::Instance().IsHired(bot->GetObjectGuid());
+        auto gatedForHire = [&](uint32 itemId)
         {
-            ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", quest->RewChoiceItemId[i]);
-            if (usage == ItemUsage::ITEM_USAGE_EQUIP)
-            {
-                bestUsage = ItemUsage::ITEM_USAGE_EQUIP;
-            }
-            else if (usage == ItemUsage::ITEM_USAGE_BAD_EQUIP && bestUsage != ItemUsage::ITEM_USAGE_EQUIP)
-            {
-                bestUsage = usage;
-            }
-            else if (usage != ItemUsage::ITEM_USAGE_NONE && bestUsage == ItemUsage::ITEM_USAGE_NONE)
-            {
-                bestUsage = usage;
-            }
-        }
-        for (uint8 i = 0; i < quest->GetRewChoiceItemsCount(); ++i)
+            return !TortoiseBots::MayHireAutoTakeSource(sRandomItemMgr.GetSourceFlags(itemId),
+                hireGated, sPlayerbotAIConfig.randomGearAllowPvP,
+                sPlayerbotAIConfig.randomGearAllowReputation);
+        };
+        auto rankChoices = [&](bool skipGated)
         {
-            ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", quest->RewChoiceItemId[i]);
-            if (usage == bestUsage)
+            ItemUsage best = ItemUsage::ITEM_USAGE_NONE;
+            ItemIds ids;
+            for (uint8 i = 0; i < quest->GetRewChoiceItemsCount(); ++i)
             {
-                returnIds.insert(i);
+                if (skipGated && gatedForHire(quest->RewChoiceItemId[i]))
+                    continue;
+                ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", quest->RewChoiceItemId[i]);
+                if (usage == ItemUsage::ITEM_USAGE_EQUIP)
+                {
+                    best = ItemUsage::ITEM_USAGE_EQUIP;
+                }
+                else if (usage == ItemUsage::ITEM_USAGE_BAD_EQUIP && best != ItemUsage::ITEM_USAGE_EQUIP)
+                {
+                    best = usage;
+                }
+                else if (usage != ItemUsage::ITEM_USAGE_NONE && best == ItemUsage::ITEM_USAGE_NONE)
+                {
+                    best = usage;
+                }
             }
-        }
-        return returnIds;
+            for (uint8 i = 0; i < quest->GetRewChoiceItemsCount(); ++i)
+            {
+                if (skipGated && gatedForHire(quest->RewChoiceItemId[i]))
+                    continue;
+                ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", quest->RewChoiceItemId[i]);
+                if (usage == best)
+                {
+                    ids.insert(i);
+                }
+            }
+            return std::make_pair(best, ids);
+        };
+        // Gated ranking first; all-gated (or all-NONE) falls back to the
+        // plain ranking so the quest still completes.
+        auto gated = rankChoices(true);
+        if (!gated.second.empty())
+            return gated.second;
+        auto plain = rankChoices(false);
+        return plain.second;
     }
 }
 
@@ -238,10 +276,23 @@ void TalkToQuestGiverAction::RewardMultipleItem(Player* requester, Quest const* 
         (questRewardOption == QuestRewardOptionType::QUEST_REWARD_CONFIG_DRIVEN && sPlayerbotAIConfig.autoPickReward == "yes") ||
         questRewardOption == QuestRewardOptionType::QUEST_REWARD_OPTION_AUTO
     ) {
-        //Pick the first item of the best rewards.
+        //Pick the best-scored item of the best rewards (AG-3/RPG-A1): usage
+        // ties are broken by live stat weight instead of vendor order.
         bestIds = BestRewards(quest);
-        ItemPrototype const* proto = sObjectMgr.GetItemPrototype(quest->RewChoiceItemId[*bestIds.begin()]);
-        if(proto)
+        uint32 rewardIndex = *bestIds.begin();
+        uint32 rewardScore = 0;
+        if (bestIds.size() > 1)
+        {
+            std::vector<std::pair<uint32, uint32>> scored;
+            for (uint32 id : bestIds)
+                scored.emplace_back(id, sRandomItemMgr.GetLiveStatWeight(bot, quest->RewChoiceItemId[id]));
+            rewardIndex = ai::QuestRewardTiebreak(scored);
+            for (auto const& candidate : scored)
+                if (candidate.first == rewardIndex)
+                    rewardScore = candidate.second;
+        }
+        ItemPrototype const* proto = sObjectMgr.GetItemPrototype(quest->RewChoiceItemId[rewardIndex]);
+        if (proto)
         {
             args["%item"] = chat->formatItem(proto);
             out = BOT_TEXT2("quest_status_complete_single_reward", args);
@@ -249,8 +300,9 @@ void TalkToQuestGiverAction::RewardMultipleItem(Player* requester, Quest const* 
             BroadcastHelper::BroadcastQuestTurnedIn(ai, bot, quest);
         }
 
-        bot->RewardQuest(quest, *bestIds.begin(), questGiver, true);
-        sPlayerbotAIConfig.logEvent(ai, "QuestRewarded", quest->GetTitle(), std::to_string(quest->GetQuestId()));
+        bot->RewardQuest(quest, rewardIndex, questGiver, true);
+        sPlayerbotAIConfig.logEvent(ai, "QuestRewarded", quest->GetTitle(),
+            std::to_string(quest->GetQuestId()) + (bestIds.size() > 1 ? " score " + std::to_string(rewardScore) : ""));
     }
     else if ((questRewardOption == QuestRewardOptionType::QUEST_REWARD_CONFIG_DRIVEN && sPlayerbotAIConfig.autoPickReward == "no") ||
              questRewardOption == QuestRewardOptionType::QUEST_REWARD_OPTION_LIST

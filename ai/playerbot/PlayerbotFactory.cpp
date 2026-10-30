@@ -3,14 +3,24 @@
 #include "playerbot/PlayerbotFactory.h"
 #include "playerbot/PerformanceMonitor.h"
 #include "playerbot/SurvivePolicy.h"
-#include "playerbot/SpellRankPolicy.h"
+#include "playerbot/policy/gear/SpellRankPolicy.h"
+#include "playerbot/policy/gear/TalentSpellSavePolicy.h"
+#include "playerbot/AmmoStackPolicy.h"
+#include "../../runtime/BotNameService.h"
 #include "../../runtime/HunterPetPolicy.h"
-#include "../../runtime/PetSpellRankPolicy.h"
-#include "../../runtime/StarterKitPolicy.h"
+#include "../../runtime/policy/pet/PetSpellRankPolicy.h"
+#include "../../runtime/policy/provision/StarterKitPolicy.h"
 #include "../../runtime/ProfessionGrantPolicy.h"
+#include "../../runtime/OwnedBotQolPolicy.h"
+#include "../../runtime/policy/class/ShamanTankKitPolicy.h"
+#include "../../runtime/GearItemLevelCapPolicy.h"
+#include "../../runtime/policy/provision/GearBlacklistPolicy.h"
+#include "../../runtime/PlayerAutogearPolicy.h"
+#include "Database/DBCStores.h"
 
 #include "Database/SQLStorages.h"
 #include "Objects/ItemPrototype.h"
+#include "Mail/Mail.h"
 #include "playerbot/PlayerbotAIConfig.h"
 #include "AccountMgr.h"
 #include "Database/DBCStore.h"
@@ -22,6 +32,8 @@
 
 #include "strategy/ItemVisitors.h"
 #include "strategy/values/MountValues.h"
+#include "policy/gear/EmptySlotFillPolicy.h"
+#include "playerbot/policy/travel/MountShopPolicy.h"
 
 using namespace ai;
 
@@ -32,26 +44,22 @@ namespace
 uint32 const STARTER_PLAIN_BAG = TortoiseBots::STARTER_PLAIN_BAG_ENTRY;
 uint32 const STARTER_SOUL_BAG = TortoiseBots::STARTER_SOUL_BAG_ENTRY;
 
-std::vector<std::pair<uint32, uint32>> const& CollectionMounts()
+// Ammo type a ranged-slot item needs: gun -> bullets, bow/crossbow -> arrows;
+// thrown, wands and relics need none. Policy in runtime/OwnedBotQolPolicy.h.
+TortoiseBots::RangedAmmoKind RangedAmmoKindOf(ItemPrototype const* proto)
 {
-    static std::vector<std::pair<uint32, uint32>> mounts;
-    static bool loaded = false;
-    if (loaded)
-        return mounts;
-
-    loaded = true;
-    std::unique_ptr<QueryResult> result(WorldDatabase.Query("SELECT itemId, spellId FROM collection_mount"));
-    if (!result)
-        return mounts;
-
-    do
+    if (!proto)
+        return TortoiseBots::RangedAmmoKind::Empty;
+    if (proto->Class == ITEM_CLASS_WEAPON)
     {
-        Field* fields = result->Fetch();
-        mounts.emplace_back(fields[0].GetUInt32(), fields[1].GetUInt32());
-    } while (result->NextRow());
-
-    return mounts;
+        if (proto->SubClass == ITEM_SUBCLASS_WEAPON_GUN)
+            return TortoiseBots::RangedAmmoKind::Bullet;
+        if (proto->SubClass == ITEM_SUBCLASS_WEAPON_BOW || proto->SubClass == ITEM_SUBCLASS_WEAPON_CROSSBOW)
+            return TortoiseBots::RangedAmmoKind::Arrow;
+    }
+    return TortoiseBots::RangedAmmoKind::NoAmmo;
 }
+
 }
 
 
@@ -73,6 +81,10 @@ void PlayerbotFactory::MakeComplete()
     // Gear last and incremental only — never wipe earned gear.
     // Enchants apply per item inside InitEquipment (ApplyBestEnchant) plus
     // the EnchantEquipment() sweep below; both read the candidate pool.
+    // Owner rule (Oct 2026): a pool bot is seeded (and later re-geared) within
+    // level + RandomGearMaxItemLevelAboveLevel, so a wandering bot never wears
+    // raid-level loot it could not have earned.
+    UsePoolGearCap();
     InitEquipment(true, false);
     // Missing kit, idempotent: thrown top-up FIRST (Issue #401: 76
     // rogues/warriors missed it with EQUIP_ERR_INVENTORY_FULL - the bulky
@@ -103,20 +115,50 @@ void PlayerbotFactory::MakeComplete()
     bot->SaveToDB();
 }
 
+// The world DB name differs per install (tw_world, i1_world, t4_world, ...);
+// a hard-coded literal fails with MySQL error 1142 on any other name. Read it
+// from WorldDatabase.Info, the same string mangosd uses (the 5th token).
+static std::string const& WorldDatabaseName()
+{
+    // Resolved once (thread-safe static init); a bad value is logged here once.
+    static std::string const name = []() -> std::string
+    {
+        std::string const info = sConfig.GetStringDefault("WorldDatabase.Info", "");
+        Tokens const tokens = StrSplit(info, ";");
+        std::string db = tokens.size() >= 5 ? tokens[4] : std::string();
+        db.erase(0, db.find_first_not_of(" \t"));
+        db.erase(db.find_last_not_of(" \t") + 1);
+
+        // The name is quoted with backticks in the query, so only a backtick
+        // could break out of it; any other character MySQL allows is fine.
+        if (db.empty() || db.find('`') != std::string::npos)
+        {
+            sLog.outError("PruneDuplicateEquipRows: cannot read a valid world DB name from WorldDatabase.Info, skipping duplicate equip prune");
+            return std::string();
+        }
+        return db;
+    }();
+    return name;
+}
+
 void PlayerbotFactory::PruneDuplicateEquipRows()
 {
     if (!bot)
         return;
 
     uint32 guid = bot->GetGUIDLow();
-    CharacterDatabase.PExecute(
-        "DELETE ci FROM character_inventory ci WHERE ci.guid = %u AND ci.bag = 0 "
-        "AND ci.slot IN (4,6,7,15,16,17) "
-        "AND ci.item NOT IN (SELECT item FROM (SELECT x.item, "
-        "ROW_NUMBER() OVER (PARTITION BY x.slot ORDER BY it.item_level DESC, it.Quality DESC, x.item DESC) rn "
-        "FROM character_inventory x JOIN tw_world.item_template it ON it.entry = x.item_template "
-        "WHERE x.guid = %u AND x.bag = 0 AND x.slot IN (4,6,7,15,16,17)) t WHERE t.rn = 1)",
-        guid, guid);
+    std::string const& worldDb = WorldDatabaseName();
+    if (!worldDb.empty())
+    {
+        CharacterDatabase.PExecute(
+            "DELETE ci FROM character_inventory ci WHERE ci.guid = %u AND ci.bag = 0 "
+            "AND ci.slot IN (4,6,7,15,16,17) "
+            "AND ci.item NOT IN (SELECT item FROM (SELECT x.item, "
+            "ROW_NUMBER() OVER (PARTITION BY x.slot ORDER BY it.item_level DESC, it.Quality DESC, x.item DESC) rn "
+            "FROM character_inventory x JOIN `%s`.item_template it ON it.entry = x.item_template "
+            "WHERE x.guid = %u AND x.bag = 0 AND x.slot IN (4,6,7,15,16,17)) t WHERE t.rn = 1)",
+            guid, worldDb.c_str(), guid);
+    }
     CharacterDatabase.PExecute(
         "DELETE ii FROM item_instance ii LEFT JOIN character_inventory ci ON ci.item = ii.guid "
         "WHERE ci.item IS NULL AND ii.owner_guid = %u",
@@ -136,8 +178,122 @@ void PlayerbotFactory::AutogearOwned(uint32 cappedQuality, uint32 ilvlCap)
     if (cappedQuality > ITEM_QUALITY_LEGENDARY)
         cappedQuality = ITEM_QUALITY_LEGENDARY;
     itemQuality = cappedQuality;
+    ammoAwareRanged = true;
     InitEquipment(true, false, sPlayerbotAIConfig.randomGearProgression, false, ilvlCap);
+    ammoAwareRanged = false;
     bot->SaveToDB();
+}
+
+void PlayerbotFactory::AutogearPlayer(uint32 specId, uint32 ilvlCap, bool raisedCeiling)
+{
+    if (!bot || !specId)
+        return;
+    forcedSpecId = specId;
+    playerUpgrade = true;
+    playerRaisedCeiling = raisedCeiling;
+    itemQuality = 0;
+    autogearUpgrades.clear();
+    InitEquipment(true, false, sPlayerbotAIConfig.randomGearProgression, false, ilvlCap);
+    forcedSpecId = 0;
+    playerUpgrade = false;
+    playerRaisedCeiling = false;
+    bot->SaveToDB();
+}
+
+// A real player never loses a replaced piece: to the bags, or to their own
+// mailbox (no expiry) when the bags are full. Same remove/store/mail pattern
+// as the core's AutoUnequipItemFromSlot; the receiver is the owner, so the
+// usual soulbound mail restriction is moot.
+bool PlayerbotFactory::StoreReplacedItem(Item* oldItem)
+{
+    if (!bot || !oldItem)
+        return true;
+
+    uint8 const bag = oldItem->GetBagSlot();
+    uint8 const slot = oldItem->GetSlot();
+    ItemPosCountVec dest;
+    if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, oldItem, false) == EQUIP_ERR_OK)
+    {
+        // StoreItem (not MoveItemToInventory): the piece already has a
+        // character_inventory row, so the save must run an UPDATE
+        // (ITEM_CHANGED), not an INSERT (ITEM_NEW) — same pattern as the
+        // core's AutoUnequipItemFromSlot.
+        bot->RemoveItem(bag, slot, true);
+        bot->StoreItem(dest, oldItem, true);
+        return true;
+    }
+
+    bot->MoveItemFromInventory(bag, slot, true);
+    CharacterDatabase.BeginTransaction(bot->GetGUIDLow());
+    oldItem->DeleteFromInventoryDB();
+    oldItem->SaveToDB();
+    CharacterDatabase.CommitTransaction();
+    MailDraft draft("Replaced by autogear", "Your previous equipment is attached.");
+    draft.AddItem(oldItem);
+    // expire_delay UINT32_MAX: the core's mail row keeps the items ~136 years,
+    // i.e. no expiry (0 would give the default 30 days).
+    draft.SendMailTo(MailReceiver(bot), MailSender(bot, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED, 0, 0xFFFFFFFF);
+    return false;
+}
+
+bool PlayerbotFactory::HasAmmoInBagsFor(uint32 weaponSubClass)
+{
+    if (!bot)
+        return true;
+    if (weaponSubClass != ITEM_SUBCLASS_WEAPON_GUN && weaponSubClass != ITEM_SUBCLASS_WEAPON_BOW &&
+        weaponSubClass != ITEM_SUBCLASS_WEAPON_CROSSBOW)
+        return true;
+    // Real players have no bot AI to iterate their inventory; scan the bags
+    // directly with the same projectile rule (gun -> bullets, bow/crossbow -> arrows).
+    if (!ai)
+    {
+        uint32 const ammoSubClass = weaponSubClass == ITEM_SUBCLASS_WEAPON_GUN ? ITEM_SUBCLASS_BULLET : ITEM_SUBCLASS_ARROW;
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        {
+            Bag* bagItem = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
+            if (!bagItem || !bagItem->IsBag())
+                continue;
+            for (uint8 slot = 0; slot < bagItem->GetBagSize(); ++slot)
+                if (Item* item = bagItem->GetItemByPos(slot))
+                {
+                    ItemPrototype const* proto = item->GetProto();
+                    if (proto && proto->Class == ITEM_CLASS_PROJECTILE && proto->SubClass == ammoSubClass)
+                        return true;
+                }
+        }
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                ItemPrototype const* proto = item->GetProto();
+                if (proto && proto->Class == ITEM_CLASS_PROJECTILE && proto->SubClass == ammoSubClass)
+                    return true;
+            }
+        return false;
+    }
+    FindAmmoVisitor ammoVisitor(bot, weaponSubClass);
+    ai->InventoryIterateItems(&ammoVisitor, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
+    return !ammoVisitor.GetResult().empty();
+}
+
+void PlayerbotFactory::LearnSeedLevelSpells()
+{
+    if (!bot)
+        return;
+    InitAvailableSpells();
+    // Seeded hunters now know Call Pet: without a pet they cast it forever
+    // (41% of pool hunters frozen on "call pet", Oct 2026). Same pet step as
+    // ProvisionSpellsAndGear below. A login that just moved the bot off an
+    // isolated start zone is mid far-teleport with no map, and pet creation
+    // needs one (GetMap asserted, Oct 2026); the "initialize pet" action
+    // covers that bot once it lands.
+    if (!bot->FindMap() || bot->IsBeingTeleportedFar())
+        return;
+    if ((bot->GetClass() == CLASS_HUNTER && bot->GetLevel() >= TortoiseBots::HUNTER_PET_MIN_LEVEL) ||
+        bot->GetClass() == CLASS_WARLOCK)
+    {
+        InitPet();
+        InitPetSpells();
+    }
 }
 
 // Issue #192: spells + skills + incremental gear for a hired companion.
@@ -151,6 +307,12 @@ void PlayerbotFactory::ProvisionSpellsAndGear()
     InitAllSkills();
     InitAvailableSpells();
     InitSpecialSpells();
+    // Owner rule (Oct 2026): the standard (tier 0) companion kit is generated
+    // within level + HireGearMaxItemLevelAboveLevel - a little above the pool
+    // rule, still below the curated tier-2 kit. The curated tier 1-7 rows
+    // (HireProvisionService::ProvisionHireGear) replace this gear afterwards
+    // and are not touched.
+    UseStandardHireGearCap();
     InitEquipment(true, false);
     // Field kit, idempotent like the pool path: thrown top-up first (single
     // slot before the bulky kit), then bags, tools, mounts, ammo, reagents,
@@ -172,7 +334,11 @@ void PlayerbotFactory::ProvisionSpellsAndGear()
     if ((bot->GetClass() == CLASS_HUNTER && bot->GetLevel() >= TortoiseBots::HUNTER_PET_MIN_LEVEL) ||
         bot->GetClass() == CLASS_WARLOCK)
     {
-        InitPet();
+        // Issue #1043: no pet save here. Each SavePetToDB is its own async
+        // transaction, and back-to-back saves of one pet ran in parallel on
+        // the character DB workers and hit "Duplicate entry" on character_pet.
+        // The hire provisioner saves the bot (and so the pet) once at the end.
+        InitPet(false);
         InitPetSpells();
     }
     // Issue #381: a hire at a level below the character's own (or a stale
@@ -181,7 +347,8 @@ void PlayerbotFactory::ProvisionSpellsAndGear()
     // rank the level still allows.
     PruneOverLevelSpellRanks();
     EnchantEquipment();
-    bot->SaveToDB();
+    // No SaveToDB here: the only caller (HireProvisionService::ProvisionHeavy)
+    // saves the bot once after its own gear step (issue #1043).
 }
 
 
@@ -406,7 +573,7 @@ void PlayerbotFactory::AddConsumables()
    }
 }
 
-void PlayerbotFactory::InitPet()
+void PlayerbotFactory::InitPet(bool saveToDb)
 {
     // Randomize a new pet (only for hunters)
     if (bot->GetClass() != CLASS_HUNTER)
@@ -482,11 +649,16 @@ void PlayerbotFactory::InitPet()
             pet->LearnPetPassives();
             pet->CastPetAuras(true);
             pet->UpdateAllStats();
+            // Issue #1003: a name from the pet pool instead of the core's "Pet".
+            std::string petName = TortoiseBots::PickBotPetName();
+            if (!petName.empty())
+                pet->SetName(petName);
             bot->SetPet(pet);
             bot->SetPetGuid(pet->getObjectGuid());
 
             sLog.outDebug(  "Bot %s: assign pet %d (%d level)", bot->GetName(), co->entry, bot->GetLevel());
-            pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+            if (saveToDb)
+                pet->SavePetToDB(PET_SAVE_AS_CURRENT);
             bot->PetSpellInitialize();
             break;
         }
@@ -502,6 +674,14 @@ void PlayerbotFactory::InitPet()
         pet->SetHealth(pet->GetMaxHealth());
         pet->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
         pet->SetReactState(REACT_DEFENSIVE);
+        // Pets created before issue #1003 are still called "Pet".
+        std::string petName = std::string(pet->GetName()) == "Pet" ? TortoiseBots::PickBotPetName() : std::string();
+        if (!petName.empty())
+        {
+            pet->SetName(petName);
+            if (saveToDb)
+                pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+        }
     }
     else
     {
@@ -600,7 +780,7 @@ bool PlayerbotFactory::SelectPremadeSpecNo()
     // getPremadePath(cls, specNo - 1) by TalentPath::id, so store id + 1.
     uint32 totalProbability = 0;
     for (TalentPath& path : paths)
-        totalProbability += std::max(0, path.probability);
+        totalProbability += TortoiseBots::PremadePathRollWeight(cls, path.id, path.probability, sPlayerbotAIConfig.shamanTankEnabled);
 
     TalentPath* chosen = &paths.front();
     if (totalProbability > 0)
@@ -609,7 +789,7 @@ bool PlayerbotFactory::SelectPremadeSpecNo()
         uint32 cumulative = 0;
         for (TalentPath& path : paths)
         {
-            cumulative += std::max(0, path.probability);
+            cumulative += TortoiseBots::PremadePathRollWeight(cls, path.id, path.probability, sPlayerbotAIConfig.shamanTankEnabled);
             if (roll < cumulative)
             {
                 chosen = &path;
@@ -622,6 +802,24 @@ bool PlayerbotFactory::SelectPremadeSpecNo()
         chosen->name.c_str(), uint32(cls), uint32(paths.size()), totalProbability);
 
     sRandomBotFacade.SetValue(bot, "specNo", chosen->id + 1);
+    // A pool bot that rolls the 7.3 tank build is a tank from birth
+    // (issue #1125): set the forced role so IsTank, the kit branches, and
+    // the talent respec guard all agree, and rebuild the strategies the
+    // engines already installed without it. The role itself is memory only -
+    // the build read in AiFactory (key tank talents) is what carries the
+    // identity across a restart. Other specs keep whatever the bot already
+    // had (a re-seed must not clear an operator designation).
+    if (cls == TortoiseBots::kShamanTankPremadeClass && chosen->id == TortoiseBots::kShamanTankPremadeSpec && ai)
+    {
+        ai->SetForcedRole(BOT_ROLE_TANK);
+        // The engines were already built for this login (PlayerbotAI's
+        // constructor), without the role, so the bot would play the
+        // enhancement DPS kit until the next rebuild - the bug in issue
+        // #1125. Same order as `.bot role`: the stored snapshot is
+        // spec-dependent, so drop its strategy rows first.
+        sPlayerbotDbStore.InvalidateStrategySnapshots(ai);
+        ai->ResetStrategies();
+    }
     return true;
 }
 
@@ -1025,10 +1223,10 @@ void PlayerbotFactory::QuerySeedCandidates(Player* bot, uint32 specId, uint8 slo
     }
 }
 
-bool PlayerbotFactory::TrySeedEpicIds(Player* bot, uint32 specId, uint8 slot, uint32 searchLevel, std::vector<uint32>& ids)
+bool PlayerbotFactory::TrySeedEpicIds(Player* bot, uint32 specId, uint8 slot, uint32 searchLevel, uint32 maxItemLevel, std::vector<uint32>& ids)
 {
     ids.clear();
-    QuerySeedCandidates(bot, specId, slot, searchLevel, sPlayerbotAIConfig.randomGearMaxLevel, ITEM_QUALITY_EPIC, ids);
+    QuerySeedCandidates(bot, specId, slot, searchLevel, maxItemLevel, ITEM_QUALITY_EPIC, ids);
     if (ids.empty())
         return false;
     // Strip non-attested epics; the caller shuffles the survivors. The EPIC
@@ -1106,6 +1304,29 @@ static bool PassesSeedProvenance(Player* bot, uint32 newItemId)
     return false;
 }
 
+// Pieces of this item set the player currently wears (equipment slots only).
+static uint32 CountEquippedSetPieces(Player* player, uint32 setId)
+{
+    uint32 count = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (ItemPrototype const* proto = item->GetProto())
+                if (proto->ItemSet == setId)
+                    ++count;
+    return count;
+}
+
+// Copies of this item entry the player currently wears (equipment slots only).
+static uint32 CountEquippedCopies(Player* player, uint32 itemId)
+{
+    uint32 count = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            if (item->GetEntry() == itemId)
+                ++count;
+    return count;
+}
+
 void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool progressive, bool partialUpgrade, uint32 maxItemLevelOverride)
 {
     // Bots below level 5 stay in their starting outfit: gear DB has little for them,
@@ -1118,7 +1339,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
         return;
     }
 
-    uint32 oldGS = ai->GetEquipGearScore(bot, false, false);
+    uint32 oldGS = ai ? ai->GetEquipGearScore(bot, false, false) : 0;
     uint32 masterGS = 0;
     if(syncWithMaster && ai->GetMaster())
     {
@@ -1127,8 +1348,10 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
     // Check spec before wiping gear. Unknown spent-talents fall back to a
     // class-generic scale (issue #189 Phase 2) so gear never skips entirely.
-    uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
-    if (specId == 0)
+    // A forced spec (real-player autogear) wins over spent talents and needs
+    // no fallback: the command validated it against the weightscale table.
+    uint32 specId = forcedSpecId ? forcedSpecId : sRandomItemMgr.GetPlayerSpecId(bot);
+    if (specId == 0 && !forcedSpecId)
         specId = sRandomItemMgr.GetFallbackSpecId(bot->GetClass());
     if (specId == 0)
     {
@@ -1237,8 +1460,28 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
     // Randomize) keep deterministic best-first behaviour.
     bool const seedSpread = incremental && !syncWithMaster && itemQuality == 0;
 
+    // Autogear ranged pick (owned bots): which ammo the bags hold now, so a
+    // gun is not picked for a bot that only carries arrows (auto shot would
+    // be dead). Read once; the ranged slot never changes the bags.
+    bool bagsHaveArrows = false;
+    bool bagsHaveBullets = false;
+    if (ammoAwareRanged)
+    {
+        bagsHaveArrows = HasAmmoInBagsFor(ITEM_SUBCLASS_WEAPON_BOW);
+        bagsHaveBullets = HasAmmoInBagsFor(ITEM_SUBCLASS_WEAPON_GUN);
+    }
+
+    // A real player and an owned bot keep whatever they wear: the blacklist
+    // only filters candidates, never scores worn gear down or removes it.
+    bool const keepsWornGear = playerUpgrade || (ai && ai->IsOwnedBot());
+
     for(uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
     {
+        // Player upgrades: shirts and tabards are cosmetic, a random swap is
+        // not an upgrade, so they keep whatever they wear.
+        if (playerUpgrade && (slot == EQUIPMENT_SLOT_BODY || slot == EQUIPMENT_SLOT_TABARD))
+            continue;
+
         if (slot == EQUIPMENT_SLOT_TABARD)
         {
             if (!sPlayerbotAIConfig.randomGearTabards || (urand(0, 100) < 100 * sPlayerbotAIConfig.randomGearTabardsChance))
@@ -1258,7 +1501,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
         // here is how fresh protection bots lost their starter shield for good.
         // Only an item this class can never use, or one the bags no longer have
         // room for, is cleared.
-        if (seedSpread && slot == EQUIPMENT_SLOT_OFFHAND)
+        if (seedSpread && !playerUpgrade && slot == EQUIPMENT_SLOT_OFFHAND)
         {
             Item* mhItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
             Item* ohItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
@@ -1278,7 +1521,11 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
         uint32 searchLevel = level;
         uint32 quality = ITEM_QUALITY_POOR;
-        uint32 maxItemLevel = maxItemLevelOverride != 0 ? maxItemLevelOverride : sPlayerbotAIConfig.randomGearMaxLevel;
+        // Generated-gear ceiling for this bot: the explicit override wins,
+        // otherwise the population cap (level + configured allowance, never
+        // above RandomGearMaxLevel). See GearItemLevelCapPolicy.h.
+        uint32 maxItemLevel = maxItemLevelOverride != 0 ? maxItemLevelOverride
+            : TortoiseBots::GearItemLevelCap(bot->GetLevel(), generatedGearIlvlAboveLevel, sPlayerbotAIConfig.randomGearMaxLevel);
         bool progressiveGear = progressive;
         if(syncWithMaster && ai->GetMaster())
         {
@@ -1356,6 +1603,8 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(newItemId);
                     if (!proto)
                         continue;
+                    if (TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, newItemId))
+                        continue;
 
                     // use only common items
                     if (proto->Quality > ITEM_QUALITY_UNCOMMON)
@@ -1368,6 +1617,10 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     if (proto->MaxCount && bot->HasItemCount(proto->ItemId, proto->MaxCount))
                         continue;
 
+                    // Fresh-seed provenance gate, like the main loop below:
+                    // honor tabards and rep-gated shirts never seed.
+                    if (seedSpread && !PassesSeedProvenance(bot, newItemId))
+                        continue;
                     if (proto->ItemLevel > maxItemLevel)
                         continue;
 
@@ -1405,10 +1658,13 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                 // (or the roll misses) — at 50-60 half the raw pool is epic,
                 // so a merged shuffle would flood epics.
                 bool seedEpic = false;
-                if (seedSpread && !setQuality && level >= 30 &&
+                // A deterministic run matters for the real-player upgrade
+                // (running it twice changes nothing), so the random epic roll
+                // stays a bot-seed feature only.
+                if (seedSpread && !playerUpgrade && !setQuality && level >= 30 &&
                     sPlayerbotAIConfig.randomGearSeedEpicChance > 0.0f &&
                     frand(0.0f, 1.0f) < sPlayerbotAIConfig.randomGearSeedEpicChance)
-                    seedEpic = TrySeedEpicIds(bot, specId, slot, searchLevel, ids);
+                    seedEpic = TrySeedEpicIds(bot, specId, slot, searchLevel, maxItemLevel, ids);
                 // Fresh-seed quality band (owner spec): greens and blues mixed
                 // from level 20, the progressive poor/normal floor below that.
                 // Epics only through the rare world-epic gate above (a fresh
@@ -1421,7 +1677,10 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     qBegin = level < 10 ? ITEM_QUALITY_POOR
                            : level < 20 ? ITEM_QUALITY_NORMAL
                                         : ITEM_QUALITY_UNCOMMON;
-                    qEnd = ITEM_QUALITY_RARE + 1;
+                    // Spawn band tops out at rare; a raised level-60 ilvl
+                    // ceiling opens the band up to epic (deterministically).
+                    qEnd = (playerUpgrade ? TortoiseBots::AutogearMaxQuality(level, TortoiseBots::kAutogearMaxLevel, playerRaisedCeiling)
+                                          : ITEM_QUALITY_RARE) + 1;
                 }
                 else if (seedEpic)
                 {
@@ -1436,8 +1695,8 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
                     QuerySeedCandidates(bot, specId, slot, searchLevel, maxItemLevel, q, ids);
 
-                    // add one hand weapons for tanks
-                    if ((specId == 3 || specId == 5) && slot == EQUIPMENT_SLOT_MAINHAND)
+                    // add one hand weapons for tanks (prot warrior/paladin, shaman tank id 16)
+                    if ((specId == 3 || specId == 5 || specId == 16) && slot == EQUIPMENT_SLOT_MAINHAND)
                     {
                         std::vector<uint32> oneHanded = sRandomItemMgr.Query(level, bot->GetClass(), uint8(specId), EQUIPMENT_SLOT_OFFHAND, q);
                         if (oneHanded.size())
@@ -1486,7 +1745,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                 // shuffles: a uniform roll over its green/blue band, so two
                 // fresh bots never converge on the same best-in-slot kit
                 // (owner spec: not super min-max).
-                if (seedSpread)
+                if (seedSpread && !playerUpgrade)
                 {
                     Shuffle(ids);
                 }
@@ -1519,6 +1778,27 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                 Item* oldItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
                 ItemPrototype const* oldProto = oldItem ? oldItem->GetProto() : nullptr;
                 uint32 oldStatValue = oldItem ? sRandomItemMgr.GetLiveStatWeight(bot, oldProto->ItemId, specId) : 0;
+                // A pool or hired bot already wearing a blocked item re-gears
+                // the slot: the worn piece scores nothing, so any passing
+                // candidate replaces it.
+                if (oldProto && TortoiseBots::GearWornCountsAsEmpty(keepsWornGear, sPlayerbotAIConfig.randomGearBlacklist, oldProto->ItemId))
+                    oldStatValue = 0;
+
+                // Keep the pieces of a set that currently gives an active
+                // bonus: breaking a live set is never an upgrade (real
+                // players only; bots gear per slot as before).
+                if (playerUpgrade && oldProto && oldProto->ItemSet)
+                {
+                    ItemSetEntry const* set = sItemSetStore.LookupEntry(oldProto->ItemSet);
+                    if (set && TortoiseBots::AutogearSetBonusActive(
+                            CountEquippedSetPieces(bot, oldProto->ItemSet),
+                            set->spells, set->items_to_triggerspell, 8))
+                    {
+                        sLog.outDetail("Player autogear: %s slot %u keeps <%s>, item set %u is active",
+                            bot->GetName(), slot, oldProto->Name1, oldProto->ItemSet);
+                        continue;
+                    }
+                }
 
                 for (uint32 index = 0; index < ids.size(); ++index)
                 {
@@ -1534,9 +1814,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     if (reqLevelGate > (uint32)bot->GetLevel())
                         continue;
 
-                    // Owner-configured exclusion list: applies to every gear
-                    // path (seed, hire, upgrade), not just the fresh seed.
-                    if (std::find(sPlayerbotAIConfig.randomGearBlacklist.begin(), sPlayerbotAIConfig.randomGearBlacklist.end(), newItemId) != sPlayerbotAIConfig.randomGearBlacklist.end())
+                    if (TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, newItemId))
                         continue;
 
                     // Fresh-seed provenance gate: tier cap + REP/PVP flags in
@@ -1557,8 +1835,20 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(newItemId);
                     if (!proto)
                         continue;
-                    // filter tank weapons
-                    if (slot == EQUIPMENT_SLOT_OFFHAND && (specId == 3 || specId == 5) && !(proto->Class == ITEM_CLASS_ARMOR && proto->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD))
+                    // QuerySeedCandidates only stops its level descent once one
+                    // candidate fits the cap; the rest of the list can sit above it.
+                    if (proto->ItemLevel > maxItemLevel)
+                        continue;
+                    // Never two equipped copies of a unique-equipped item,
+                    // counting what is already worn (real players only; the
+                    // paired-slot guard above covers the twin slot).
+                    if (playerUpgrade &&
+                        !TortoiseBots::AutogearUniqueAllowed(
+                            (proto->Flags & ITEM_FLAG_UNIQUE_EQUIPPED) != 0,
+                            CountEquippedCopies(bot, newItemId)))
+                        continue;
+                    // filter tank weapons (prot warrior/paladin, shaman tank id 16)
+                    if (slot == EQUIPMENT_SLOT_OFFHAND && (specId == 3 || specId == 5 || specId == 16) && !(proto->Class == ITEM_CLASS_ARMOR && proto->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD))
                         continue;
 
                     if (slot == EQUIPMENT_SLOT_MAINHAND && proto->Class == ITEM_CLASS_ARMOR && proto->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD)
@@ -1575,12 +1865,17 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                         (bot->GetClass() == CLASS_WARRIOR || bot->GetClass() == CLASS_ROGUE || bot->GetClass() == CLASS_HUNTER))
                         continue;
 
-                    // filter tank weapons
-                    if (slot == EQUIPMENT_SLOT_MAINHAND && (specId == 3 || specId == 5) && !(proto->Class == ITEM_CLASS_WEAPON && proto->InventoryType != INVTYPE_HOLDABLE))
+                    // filter tank weapons (prot warrior/paladin, shaman tank id 16)
+                    if (slot == EQUIPMENT_SLOT_MAINHAND && (specId == 3 || specId == 5 || specId == 16) && !(proto->Class == ITEM_CLASS_WEAPON && proto->InventoryType != INVTYPE_HOLDABLE))
                         continue;
 
                     // make fury wear slow weapon as main hand
                     if (slot == EQUIPMENT_SLOT_MAINHAND && specId == 2 && proto->IsWeapon() && proto->Delay < 2000)
+                        continue;
+
+                    // shaman tank (id 16) wants a slow 1H main hand for threat;
+                    // same 2.0s bar as fury so fast stat sticks never seed over it
+                    if (slot == EQUIPMENT_SLOT_MAINHAND && specId == 16 && proto->IsWeapon() && proto->InventoryType != INVTYPE_2HWEAPON && proto->Delay < 2000)
                         continue;
 
                     // classic enh shaman and retri paladin 60+ use weapon speed >= 3.0
@@ -1693,7 +1988,30 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                                 continue;
                         }
 
-                    if (incremental && oldItem && oldStatValue >= newStatValue && oldStatValue > 1)
+                    // A two-hander over an occupied main+off pair replaces the
+                    // pair as a whole: it must beat both pieces' combined
+                    // score (real players only; bots keep the per-slot rule).
+                    if (playerUpgrade && slot == EQUIPMENT_SLOT_MAINHAND && proto->InventoryType == INVTYPE_2HWEAPON)
+                    {
+                        if (Item* offItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+                            if (ItemPrototype const* offProto = offItem->GetProto())
+                                if (newStatValue <= oldStatValue + sRandomItemMgr.GetLiveStatWeight(bot, offProto->ItemId, specId))
+                                    continue;
+                    }
+
+                    // Autogear: an equipped ranged weapon without ammo in the bags is
+                    // replaced by any weapon the bags do have ammo for, even a lower-scored one.
+                    bool const rangedDudFixed = ammoAwareRanged && slot == EQUIPMENT_SLOT_RANGED &&
+                        TortoiseBots::OwnedBotRangedReplacesDud(RangedAmmoKindOf(oldProto), RangedAmmoKindOf(proto),
+                            bagsHaveArrows, bagsHaveBullets);
+                    if (incremental && oldItem && oldStatValue >= newStatValue && oldStatValue > 1 && !rangedDudFixed)
+                        continue;
+
+                    // Autogear ranged pick: bow/crossbow only with arrows, gun
+                    // only with bullets; with no ammo, keep the previous type.
+                    if (ammoAwareRanged && slot == EQUIPMENT_SLOT_RANGED &&
+                        !TortoiseBots::OwnedBotAcceptRangedPick(RangedAmmoKindOf(oldProto), oldStatValue,
+                            RangedAmmoKindOf(proto), newStatValue, bagsHaveArrows, bagsHaveBullets))
                         continue;
 
                     // replace grey items right away
@@ -1711,6 +2029,15 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                     if (seedSpread && passingIds.size() >= kSeedCandidateSample)
                         break;
                 }
+
+                // Player-mode bookkeeping across retry attempts: a piece freed
+                // in a failed attempt is reported once with its real
+                // destination and never touched twice.
+                uint32 oldStoredId = oldProto ? oldProto->ItemId : 0;
+                bool oldStoredMailed = false;
+                uint32 displacedOldId = 0;
+                bool displacedMailed = false;
+                bool displacedStored = false;
 
                 // Retry every passing candidate until one actually equips
                 // (owner spec: every slot filled). Seed order = uniform
@@ -1730,22 +2057,71 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                             newStatValue += sRandomItemMgr.CalculateEnchantWeight(bot->GetClass(), specId, randomEnchBestId);
                         }
                         uint16 eDest;
-                        if (RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, newItemId) == EQUIP_ERR_OK)
+                        Item* displacedOff = nullptr;
+                        if (playerUpgrade && !displacedStored && slot == EQUIPMENT_SLOT_MAINHAND && proto->InventoryType == INVTYPE_2HWEAPON)
+                            displacedOff = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
+                        InventoryResult canEquip = RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, newItemId);
+                        // The equip check needs a free bag slot for the displaced
+                        // off-hand (it fails CANT_BE_SWAPPED, and only for that)
+                        // — with full bags the piece is mailed first, then the
+                        // check can pass. Any other failure (proficiency, ...)
+                        // is left untouched.
+                        if (canEquip == EQUIP_ERR_ITEMS_CANT_BE_SWAPPED && displacedOff)
                         {
-                            if (oldItem)
-                                bot->DestroyItem(oldItem->GetBagSlot(), oldItem->GetSlot(), true);
-                            Item* pItem = bot->EquipNewItem(eDest, newItemId, true);
-                            if (pItem)
+                            ItemPosCountVec offDest;
+                            if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, offDest, displacedOff, false) != EQUIP_ERR_OK)
                             {
-                                if (randomEnchBestId)
-                                {
-                                    pItem->SetItemRandomProperties(randomEnchBestId);
-                                    bot->TransmogSetVisibleItemSlot(pItem->GetSlot(), pItem);
-                                }
-                                pItem->SetOwnerGuid(bot->getObjectGuid());
-                                EnchantItem(pItem);
-                                found = true;
+                                displacedOldId = displacedOff->GetProto()->ItemId;
+                                displacedMailed = !StoreReplacedItem(displacedOff);
+                                displacedStored = true;
+                                autogearUpgrades.push_back({EQUIPMENT_SLOT_OFFHAND, displacedOldId, 0, displacedMailed});
+                                canEquip = RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, newItemId);
                             }
+                        }
+                        if (canEquip != EQUIP_ERR_OK)
+                            continue;
+                        if (displacedOff)
+                        {
+                            // Free the displaced piece before the equip: the
+                            // core's EquipItem does not move it itself.
+                            if (!displacedStored)
+                            {
+                                displacedOldId = displacedOff->GetProto()->ItemId;
+                                displacedMailed = !StoreReplacedItem(displacedOff);
+                                displacedStored = true;
+                                autogearUpgrades.push_back({EQUIPMENT_SLOT_OFFHAND, displacedOldId, 0, displacedMailed});
+                            }
+                        }
+                        bool toBags = true;
+                        if (oldItem)
+                        {
+                            if (playerUpgrade)
+                            {
+                                toBags = StoreReplacedItem(oldItem);
+                                oldStoredMailed = !toBags;
+                                oldItem = nullptr;
+                            }
+                            else
+                                bot->DestroyItem(oldItem->GetBagSlot(), oldItem->GetSlot(), true);
+                        }
+                        Item* pItem = bot->EquipNewItem(eDest, newItemId, true);
+                        if (pItem)
+                        {
+                            if (playerUpgrade)
+                                autogearUpgrades.push_back({slot, oldStoredId, newItemId, oldStoredMailed});
+                            // Issue #960: EquipNewItem never rolls a suffix; when no suffix
+                            // scores for this spec (e.g. resistance-only jewelry groups),
+                            // roll one like loot instead of wearing it stat-less.
+                            if (!randomEnchBestId && proto->RandomProperty)
+                                randomEnchBestId = Item::GenerateItemRandomPropertyId(newItemId);
+                            if (randomEnchBestId)
+                            {
+                                pItem->SetItemRandomProperties(randomEnchBestId);
+                                bot->TransmogSetVisibleItemSlot(pItem->GetSlot(), pItem);
+                            }
+                            pItem->SetOwnerGuid(bot->getObjectGuid());
+                            EnchantItem(pItem);
+                            found = true;
                         }
                         if (found && incremental)
                         {
@@ -1758,13 +2134,17 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
                 // Rejection forensics: pool>0 but nothing equipped — say whether
                 // the filter chain emptied the list or the core equip check
-                // refused every candidate (and why).
+                // refused every candidate (and why). Player runs log to the
+                // visible channel: an operator debugging `.autogear` has no
+                // detail-log build to fall back on.
                 if (!found)
                 {
                     if (passingIds.empty())
                     {
                         sLog.outDetail("Bot #%d <%s>: slot %u: pool %zu, 0 passed filters (spec %u, weaponType %u)",
                             bot->GetGUIDLow(), bot->GetName(), slot, ids.size(), specId, weaponType);
+                        if (playerUpgrade)
+                            sLog.outString("PlayerAutogear debug: slot %u pool %zu, 0 passed filters (spec %u)", slot, ids.size(), specId);
                     }
                     else
                     {
@@ -1772,6 +2152,9 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
                         uint32 err = RandomBotFacade::CanEquipUnseenItem(bot, slot, probeDest, passingIds[0]);
                         sLog.outDetail("Bot #%d <%s>: slot %u: %zu passed filters, all equip attempts failed; first CanEquip err=%u, id=%u",
                             bot->GetGUIDLow(), bot->GetName(), slot, passingIds.size(), err, passingIds[0]);
+                        if (playerUpgrade)
+                            sLog.outString("PlayerAutogear debug: slot %u %zu passed filters, equip failed; first err=%u id=%u",
+                                slot, passingIds.size(), err, passingIds[0]);
                     }
                 }
             }
@@ -1785,51 +2168,111 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
             // The seed's quality band is level-derived, so quality degradation
             // cannot widen it — one round is the whole search on that path.
         } while (!found && !seedSpread && attempts < 3 && quality != ITEM_QUALITY_POOR);
-        if (!found && seedSpread && level < 30 &&
-            (slot == EQUIPMENT_SLOT_HEAD || slot == EQUIPMENT_SLOT_SHOULDERS ||
-             slot == EQUIPMENT_SLOT_NECK || slot == EQUIPMENT_SLOT_FINGER1 ||
-             slot == EQUIPMENT_SLOT_FINGER2 || slot == EQUIPMENT_SLOT_TRINKET1 ||
-             slot == EQUIPMENT_SLOT_TRINKET2 || slot == EQUIPMENT_SLOT_RANGED) &&
-            !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        // Nothing passed and a pool or hired bot still wears a blocked piece:
+        // the slot counts as empty, so the piece is removed before the
+        // backstop guard below can see the slot as occupied.
+        if (!found && !keepsWornGear)
+            if (Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (worn->GetProto() && TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, worn->GetProto()->ItemId))
+                    bot->DestroyItem(worn->GetBagSlot(), worn->GetSlot(), true);
+        if (!found && !bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot) &&
+            slot != EQUIPMENT_SLOT_BODY && slot != EQUIPMENT_SLOT_TABARD)
         {
-            // Low-level coverage (§9): the scored pools for these slots are
-            // thin at 10-29, so a usable item of the right slot/level beats
-            // an empty slot. Sweep every cached quality for the slot and
-            // take the first wearable, tier-passing candidate — no stat
-            // gate beyond wearable, no junk force-fill above 30. Empty
-            // slots only: never destroys anything.
-            for (uint32 q = ITEM_QUALITY_POOR; q <= ITEM_QUALITY_RARE && !found; ++q)
+            // Empty-slot backstop: a slot the normal pass left empty takes the
+            // best candidate that passes the same hard gates (required level,
+            // item-level cap, quality band, fresh-seed provenance, paired
+            // duplicate, game equip check). Stat weight is a preference, not a
+            // filter: weighted candidates for the spec are tried first, then
+            // every item the item info cache holds for the slot. Shirt and
+            // tabard are cosmetic and stay as they are. The slot is empty by the
+            // guard above, so nothing is destroyed.
+            EmptySlotGates gates;
+            gates.botLevel = bot->GetLevel();
+            gates.maxItemLevel = maxItemLevel;
+            gates.minQuality = level < 10 ? ITEM_QUALITY_POOR
+                : level < 20 ? ITEM_QUALITY_NORMAL
+                : ITEM_QUALITY_UNCOMMON;
+            gates.maxQuality = seedSpread
+                ? (playerUpgrade
+                    ? TortoiseBots::AutogearMaxQuality(level, TortoiseBots::kAutogearMaxLevel, playerRaisedCeiling)
+                    : ITEM_QUALITY_RARE)
+                : ITEM_QUALITY_ARTIFACT;
+            uint32 pairSlot = PairedSlot(slot);
+            // Cheap gates first: provenance and the equip check only run on
+            // candidates that already pass them.
+            auto collect = [&](RandomItemList const& ids, std::vector<EmptySlotCandidate>& out)
             {
-                std::vector<uint32> fallback = sRandomItemMgr.Query(level, bot->GetClass(), uint8(specId), slot, q);
-                Shuffle(fallback);
-                for (uint32 fallbackId : fallback)
+                for (uint32 fallbackId : ids)
                 {
                     ItemPrototype const* proto = sObjectMgr.GetItemPrototype(fallbackId);
                     if (!proto)
                         continue;
-                    if (sRandomItemMgr.GetMinLevelFromCache(fallbackId) > (uint32)bot->GetLevel())
+                    if (TortoiseBots::GearBlacklistBlocks(sPlayerbotAIConfig.randomGearBlacklist, fallbackId))
                         continue;
-                    if (!PassesSeedProvenance(bot, fallbackId))
+                    // Caster off-hand on a melee class (Issue #219), as in the normal pass.
+                    if (slot == EQUIPMENT_SLOT_OFFHAND && proto->InventoryType == INVTYPE_HOLDABLE &&
+                        (bot->GetClass() == CLASS_WARRIOR || bot->GetClass() == CLASS_ROGUE || bot->GetClass() == CLASS_HUNTER))
                         continue;
-                    uint32 pairSlot = PairedSlot(slot);
-                    if (pairSlot != EQUIPMENT_SLOT_END)
+                    EmptySlotCandidate c;
+                    c.itemId = fallbackId;
+                    c.itemLevel = proto->ItemLevel;
+                    c.requiredLevel = sRandomItemMgr.GetMinLevelFromCache(fallbackId);
+                    c.quality = proto->Quality;
+                    // Novelty, toy and keepsake items (Mood Ring, Forever-Lovely Rose,
+                    // Steamwheedle Wormhole) do nothing when worn: skip them.
+                    c.hasEffect = proto->Armor > 0 || proto->Block > 0 || proto->Damage[0].DamageMax > 0 ||
+                        proto->HolyRes > 0 || proto->FireRes > 0 || proto->NatureRes > 0 ||
+                        proto->FrostRes > 0 || proto->ShadowRes > 0 || proto->ArcaneRes > 0;
+                    for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS && !c.hasEffect; ++i)
+                        c.hasEffect = proto->ItemStat[i].ItemStatValue > 0;
+                    for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS && !c.hasEffect; ++i)
+                        c.hasEffect = proto->Spells[i].SpellId != 0;
+                    Item* pairItem = pairSlot != EQUIPMENT_SLOT_END ? bot->GetItemByPos(INVENTORY_SLOT_BAG_0, pairSlot) : nullptr;
+                    c.pairedDuplicate = pairItem && pairItem->GetEntry() == fallbackId;
+                    c.equippable = true;
+                    if (!EmptySlotAccepts(gates, c))
+                        continue;
+                    c.passesProvenance = !seedSpread || PassesSeedProvenance(bot, fallbackId);
+                    if (!c.passesProvenance)
+                        continue;
+                    uint16 eDest = 0;
+                    c.equippable = RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, fallbackId) == EQUIP_ERR_OK;
+                    if (c.equippable)
+                        out.push_back(c);
+                }
+            };
+            auto equipBest = [&](std::vector<EmptySlotCandidate> const& cands) -> bool
+            {
+                for (size_t idx : RankEmptySlotCandidates(gates, cands))
+                {
+                    uint32 const itemId = cands[idx].itemId;
+                    ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
+                    uint16 eDest = 0;
+                    if (RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, itemId) != EQUIP_ERR_OK)
+                        continue;
+                    if (Item* pItem = bot->EquipNewItem(eDest, itemId, true))
                     {
-                        Item* pairItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, pairSlot);
-                        if (pairItem && pairItem->GetEntry() == fallbackId)
-                            continue;
-                    }
-                    uint16 eDest;
-                    if (RandomBotFacade::CanEquipUnseenItem(bot, slot, eDest, fallbackId) != EQUIP_ERR_OK)
-                        continue;
-                    // Guarded empty above: equip directly, destroy nothing.
-                    if (bot->EquipNewItem(eDest, fallbackId, true))
-                    {
-                        sLog.outDetail("Bot #%d <%s>: slot %u low-level fallback equipped %u",
-                            bot->GetGUIDLow(), bot->GetName(), slot, fallbackId);
-                        found = true;
-                        break;
+                        // Issue #960: same suffix-blind create as the main loop above.
+                        if (proto->RandomProperty)
+                            pItem->SetItemRandomProperties(Item::GenerateItemRandomPropertyId(itemId));
+                        if (playerUpgrade)
+                            autogearUpgrades.push_back({slot, 0, itemId, false});
+                        sLog.outDetail("Bot #%d <%s>: slot %u empty-slot backstop equipped %u (ilvl %u)",
+                            bot->GetGUIDLow(), bot->GetName(), slot, itemId, proto->ItemLevel);
+                        return true;
                     }
                 }
+                return false;
+            };
+            std::vector<EmptySlotCandidate> weighted;
+            for (uint32 q = gates.minQuality; q <= gates.maxQuality; ++q)
+                collect(sRandomItemMgr.Query(level, bot->GetClass(), uint8(specId), slot, q), weighted);
+            found = equipBest(weighted);
+            if (!found)
+            {
+                std::vector<EmptySlotCandidate> unweighted;
+                collect(sRandomItemMgr.GetSlotItemIds(slot), unweighted);
+                found = equipBest(unweighted);
             }
         }
         if (!found)
@@ -1842,7 +2285,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool syncWithMaster, bool
 
     sLog.outDetail("Bot #%d %s:%d <%s>: InitEquipment done, GS %u -> %u",
         bot->GetGUIDLow(), bot->GetTeam() == ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName(),
-        oldGS, ai->GetEquipGearScore(bot, false, false));
+        oldGS, ai ? ai->GetEquipGearScore(bot, false, false) : 0);
 
     // Update stats here so the bots will benefit from the new equipped items' stats
     bot->InitStatsForLevel(true);
@@ -1980,6 +2423,11 @@ void PlayerbotFactory::EnchantItem(Item* item)
 void PlayerbotFactory::ApplyBestEnchant(Item* item)
 {
     if (!item)
+        return;
+
+    // Enchanting is a bot-kit behaviour (enchant candidates, bot AI spell
+    // path); a real player keeps their own enchants.
+    if (!ai)
         return;
 
     uint32 specId = sRandomItemMgr.GetPlayerSpecId(bot);
@@ -2309,6 +2757,20 @@ void PlayerbotFactory::InitSkills()
         SetRandomSkill(SKILL_CROSSBOWS);
         SetRandomSkill(SKILL_FIST_WEAPONS);
         SetRandomSkill(SKILL_THROWN);
+        // Owner rule (auto-tools kit): rogues always pick at max-for-level
+        // (5 per level, cap 300) so lockbox unlocks never silently fail.
+        // Pure value so bonuses can't mask a low base; SetSkill only raises,
+        // never lowers a hand-trained value. The 1804 ability row carries
+        // learn_on_get_skill = 0, so the skill alone never teaches Pick
+        // Lock — grant the spell alongside (UnlockItemAction gates on it).
+        if (bot->GetLevel() >= 15)
+        {
+            uint32 lockpickMax = std::min<uint32>(bot->GetLevel() * 5, 300);
+            if (bot->GetSkillValuePure(SKILL_LOCKPICKING) < lockpickMax)
+                bot->SetSkill(SKILL_LOCKPICKING, lockpickMax, lockpickMax);
+            if (!bot->HasSpell(1804))
+                bot->LearnSpell(1804, false);
+        }
         break;
     }
 
@@ -2546,6 +3008,50 @@ void PlayerbotFactory::EnsureSkillRewardedSpells(Player* bot)
     }
 }
 
+// A talent rank spell must never stay "dependent": Player::_SaveSpells writes
+// only non-dependent spells to `character_spell`, this core keeps talents
+// nowhere else, and the core's spell-chain pass marks the lower ranks dependent
+// whenever a higher rank of the chain is learned (Player::AddSpell ->
+// "learn low ranks (recursive call)", Player.cpp:4436-4442). Turtle's data heads
+// a few trainer chains with a *talent* rank-1 spell - Lightning Strike 51387
+// (talent 258 rank 1) -> 52420 (trainer row 52423) -> 52422 (row 52424), Mortal
+// Strike 12294 -> 21551 -> 21552 (rows 21555/21557), Bloodthirst, Shield Slam,
+// Moonkin Form, Repentance and five more - so InitClassLevelSpells' trainer
+// ranks, and the same chain re-derived at every login, used to drop the talent
+// out of the DB: a 51-point shaman tank hire ended with 16 of its spec's 17 rank
+// spells in character_spell while its live spellbook (and the intro) said
+// 15/36, so the armory dashboard read 15/35.
+//
+// The core has no API to clear the flag (LearnSpell/AddSpell only set it,
+// Player.cpp:4344-4347) and RemoveSpell + LearnSpell would cascade into
+// disabling every higher rank the bot trained (Player.cpp:4638-4641), so the
+// entry is re-asserted directly - the same rule the core applies to the sibling
+// flag ("talents should never be marked as disabled", Player.cpp:4633). See
+// TalentSpellSavePolicy.h.
+void PlayerbotFactory::EnsureTalentSpellsSaved(Player* bot)
+{
+    if (!bot)
+        return;
+
+    for (auto& known : bot->GetSpellMap())
+    {
+        ai::TalentSpellSaveInputs entry;
+        entry.isTalentSpell = GetTalentSpellCost(known.first) != 0;
+        entry.dependent     = known.second.dependent;
+        entry.removed       = known.second.state == PLAYERSPELL_REMOVED;
+        entry.disabled      = known.second.disabled;
+
+        if (!ai::TalentSpellMustStaySaved(entry))
+            continue;
+
+        known.second.dependent = false;
+        // A row loaded from the DB is UNCHANGED, and _SaveSpells writes only
+        // NEW/CHANGED spells - without this the repair would never reach disk.
+        if (known.second.state == PLAYERSPELL_UNCHANGED)
+            known.second.state = PLAYERSPELL_CHANGED;
+    }
+}
+
 void PlayerbotFactory::SetRandomSkill(uint16 id)
 {
     uint32 maxValue = level * 5; // vanilla 60*5 = 300
@@ -2584,7 +3090,8 @@ void PlayerbotFactory::InitClassLevelSpells()
     }
 
     std::set<std::pair<bool, uint32>> processedTrainers;
-    auto learnTrainerSpells = [this, classFamily = classEntry->spellfamily](TrainerSpellData const* trainerSpells)
+    uint32 learnedThisPass = 0;
+    auto learnTrainerSpells = [this, classFamily = classEntry->spellfamily, &learnedThisPass](TrainerSpellData const* trainerSpells)
     {
         if (!trainerSpells)
             return;
@@ -2629,7 +3136,11 @@ void PlayerbotFactory::InitClassLevelSpells()
                     learnedSpell->spellLevel != 0, true))
                 continue;
 
-            if (teachingSpell->SpellFamilyName != classFamily)
+            // Turtle trainer rows teach through generic-family (0) spells, so
+            // the taught spell's family decides too: checking the teaching
+            // spell alone sent every mage/priest rank into the skill filter
+            // below, and seeded mages knew no Fireball (Oct 2026).
+            if (teachingSpell->SpellFamilyName != classFamily && learnedSpell->SpellFamilyName != classFamily)
             {
                 SkillLineAbilityMapBounds bounds = sSpellMgr.GetSkillLineAbilityMapBoundsBySpellId(learnedSpellId);
                 if (bounds.first == bounds.second)
@@ -2670,11 +3181,15 @@ void PlayerbotFactory::InitClassLevelSpells()
                     !teachingSpell->EffectTriggerSpell[effect])
                     continue;
 
+                if (!bot->HasSpell(teachingSpell->EffectTriggerSpell[effect]))
+                    ++learnedThisPass;
                 bot->LearnSpell(teachingSpell->EffectTriggerSpell[effect], false);
             }
         }
     };
 
+    // Collect this class's trainer lists once (one scan of the creature map).
+    std::vector<TrainerSpellData const*> trainerLists;
     for (auto const& creatureEntry : sObjectMgr.GetCreatureInfoMap())
     {
         CreatureInfo const* creature = creatureEntry.second.get();
@@ -2682,15 +3197,31 @@ void PlayerbotFactory::InitClassLevelSpells()
             creature->trainer_class != bot->GetClass())
             continue;
 
-        if (creature->trainer_id)
-        {
-            if (processedTrainers.insert({ true, creature->trainer_id }).second)
-                learnTrainerSpells(sObjectMgr.GetNpcTrainerTemplateSpells(creature->trainer_id));
-        }
+        if (creature->trainer_id && processedTrainers.insert({ true, creature->trainer_id }).second)
+            trainerLists.push_back(sObjectMgr.GetNpcTrainerTemplateSpells(creature->trainer_id));
 
         if (processedTrainers.insert({ false, creature->entry }).second)
-            learnTrainerSpells(sObjectMgr.GetNpcTrainerSpells(creature->entry));
+            trainerLists.push_back(sObjectMgr.GetNpcTrainerSpells(creature->entry));
     }
+
+    // A rank is GREEN only once the rank below it is known, so one pass over
+    // the lists teaches little beyond rank 1 (pool mages seeded at 50+ knew no
+    // Fireball rank past 1, Oct 2026). Repeat until a pass adds nothing; each
+    // pass climbs every chain by at least one rank.
+    for (uint32 pass = 0; pass < 20; ++pass)
+    {
+        learnedThisPass = 0;
+        for (TrainerSpellData const* trainerSpells : trainerLists)
+            learnTrainerSpells(trainerSpells);
+        if (!learnedThisPass)
+            break;
+    }
+
+    // Those trainer ranks can chain onto a *talent* rank-1 spell (Lightning
+    // Strike, Mortal Strike, Bloodthirst, ...): the core then marks the talent
+    // rank dependent and _SaveSpells would drop it from character_spell. Re-assert
+    // it so the hire/seed's talents reach the DB. See EnsureTalentSpellsSaved.
+    EnsureTalentSpellsSaved(bot);
 }
 
 void PlayerbotFactory::InitAvailableSpells()
@@ -3064,10 +3595,10 @@ void PlayerbotFactory::InitAmmo()
             entry = 0;
     }
     uint32 count = entry ? bot->GetItemCount(entry) / 200 : 0;
-    uint32 maxCount = 5 + level / 10;
-
-    if (ai->HasCheat(BotCheatMask::item))
-        maxCount = 1;
+    // Hunters keep 5 + level / 10 stacks; warriors and rogues carry
+    // AiPlayerbot.AmmoStacksNonHunter (default 2); the item cheat keeps 1.
+    uint32 maxCount = AmmoStackTarget(bot->GetClass() == CLASS_HUNTER, level,
+        sPlayerbotAIConfig.ammoStacksNonHunter, ai->HasCheat(BotCheatMask::item));
 
     if (!entry || count <= 2)
     {
@@ -3231,77 +3762,48 @@ void PlayerbotFactory::InitMounts()
     if (bot->GetLevel() < firstmount)
         return;
 
+    // Ensure riding skill if missing: riding 75 at 40, riding 150 at 60.
+    if (bot->GetLevel() >= secondmount && bot->GetSkillValue(SKILL_RIDING) < 150)
+        bot->SetSkill(SKILL_RIDING, 150, 150);
+    else if (bot->GetLevel() >= firstmount && bot->GetSkillValue(SKILL_RIDING) < 75)
+        bot->SetSkill(SKILL_RIDING, 75, 75);
+
     std::map<uint8, std::map<uint32, std::vector<uint32> > > mounts;
     std::vector<uint32> slow, fast;
-    switch (bot->GetRace())
+
+    // Strict own-race racial vendor mounts (100%, no cross-race chance)
+    for (uint32 itemId : MountShopPolicy::GetRacialMounts(bot->GetRace(), MountShopPolicy::MountTier::Normal))
     {
-    case RACE_HUMAN:
-        slow = { 470, 6648, 458, 472 };
-        fast = { 23228, 23227, 23229 };
-        break;
-    case RACE_ORC:
-        slow = { 6654, 6653, 580 };
-        fast = { 23250, 23252, 23251 };
-        break;
-    case RACE_DWARF:
-        slow = { 6899, 6777, 6898 };
-        fast = { 23238, 23239, 23240 };
-        break;
-    case RACE_NIGHTELF:
-        slow = { 10789, 8394, 10793 };
-        fast = { 23221, 23219, 23338 };
-        break;
-    case RACE_UNDEAD:
-        slow = { 17463, 17464, 17462 };
-        fast = { 17465, 23246 };
-        break;
-    case RACE_TAUREN:
-        slow = { 18990, 18989 };
-        fast = { 23249, 23248, 23247 };
-        break;
-    case RACE_GNOME:
-        slow = { 10969, 17453, 10873, 17454 };
-        fast = { 23225, 23223, 23222 };
-        break;
-    case RACE_TROLL:
-        slow = { 8395, 10796, 10799 };
-        fast = { 23241, 23242, 23243 };
-        break;
-    default:
-        // Tortoise/custom races do not have a safe racial spell list in this
-        // donor-era switch. Leave the lists empty and rely only on the
-        // authoritative collection_mount rows below, whose item class/race
-        // masks are checked against the actual core character data.
-        sLog.outDetail("Bot %d (%u) has no donor racial mount list; using core collection mounts only.",
-            bot->GetGUIDLow(), bot->GetRace());
-        break;
+        if (uint32 spellId = MountValue::GetMountSpell(itemId))
+            slow.push_back(spellId);
+    }
+    for (uint32 itemId : MountShopPolicy::GetRacialMounts(bot->GetRace(), MountShopPolicy::MountTier::Epic))
+    {
+        if (uint32 spellId = MountValue::GetMountSpell(itemId))
+            fast.push_back(spellId);
     }
 
-    // Tortoise collection mounts are represented by a generic item spell and a
-    // core-owned collection_mount mapping. Include eligible mapped spells in
-    // the factory pool so randomized characters do not lose custom mounts
-    // merely because their item has no classic per-item mount spell. Factory
-    // initialization intentionally teaches the mapped spell, matching the
-    // existing classic factory mount path; real item use remains owned by the
-    // core collection spell script.
-    for (auto const& [itemId, spellId] : CollectionMounts())
+    if (sPlayerbotAIConfig.randomBotShopMounts)
     {
-        ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
-        SpellEntry const* spellInfo = sServerFacade.LookupSpellInfo(spellId);
+        for (auto const& [itemId, spellId] : CollectionMounts())
+        {
+            ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
+            SpellEntry const* spellInfo = sServerFacade.LookupSpellInfo(spellId);
 
-        if (!proto || !spellInfo || MountValue::GetSpeed(spellId) == 0)
-            continue;
-        if (proto->RequiredLevel > bot->GetLevel())
-            continue;
-        if (proto->AllowableClass && (proto->AllowableClass & bot->GetClassMask()) == 0)
-            continue;
-        if (proto->AllowableRace && (proto->AllowableRace & bot->GetRaceMask()) == 0)
-            continue;
+            if (!proto || !spellInfo || MountValue::GetSpeed(spellId) == 0)
+                continue;
+            if (proto->RequiredLevel > bot->GetLevel())
+                continue;
+            if (proto->AllowableClass && (proto->AllowableClass & bot->GetClassMask()) == 0)
+                continue;
+            if (proto->AllowableRace && (proto->AllowableRace & bot->GetRaceMask()) == 0)
+                continue;
 
-        if (MountValue::GetSpeed(spellId) >= 100)
-            fast.push_back(spellId);
-        else
-            slow.push_back(spellId);
+            if (MountValue::GetSpeed(spellId) >= 100)
+                fast.push_back(spellId);
+            else
+                slow.push_back(spellId);
+        }
     }
 
     mounts[bot->GetRace()][0] = slow;
@@ -3352,9 +3854,16 @@ void PlayerbotFactory::InitPotions()
         if (effect == SPELL_EFFECT_ENERGIZE && bot->GetPowerType() != POWER_MANA) // Do not give manapots to non-mana users.
             continue;
 
+        // Top up below half a stack instead of only when empty: a raid
+        // healer drinks one per cooldown, and live H9 (Patchwerk) had 18 of
+        // 35 hired mana users bone-dry by the 4th minute with the hourly
+        // restock still far off.
         FindPotionVisitor visitor(bot, effect);
         ai->InventoryIterateItems(&visitor, IterateItemsMask::ITERATE_ITEMS_IN_BAGS);
-        if (!visitor.GetResult().empty()) continue;
+        uint32 held = 0;
+        for (Item* item : visitor.GetResult())
+            held += item->GetCount();
+        if (held && held >= visitor.GetResult().front()->GetProto()->GetMaxStackSize() / 2) continue;
 
         uint32 itemId = sRandomItemMgr.GetRandomPotion(level, effect);
         if (!itemId)
@@ -3368,6 +3877,23 @@ void PlayerbotFactory::InitPotions()
 
         uint32 maxCount = proto->GetMaxStackSize();
         Item* newItem = bot->StoreNewItemInInventorySlot(itemId, urand(maxCount / 2, maxCount));
+    }
+
+    // Long-fight mana battery for every mana user (generic, not a raid
+    // special case): Dark Rune 20520 sits on its own cooldown line from
+    // the mana potion, so it doubles the mana returns on fights past the
+    // potion's 2 min cadence. Live H8: healers with granted runes used
+    // them ~hourly-on-cooldown while rune-less DPS casters never fired
+    // the row. Bounded like the potion seed (half stack when none held);
+    // RestockCompanion re-runs this for hired companions hourly.
+    if (bot->GetPowerType() == POWER_MANA && bot->GetLevel() >= 45)
+    {
+        static uint32 const DARK_RUNE_ITEM = 20520;
+        if (bot->GetItemCount(DARK_RUNE_ITEM) == 0)
+        {
+            if (ItemPrototype const* runeProto = sObjectMgr.GetItemPrototype(DARK_RUNE_ITEM))
+                bot->StoreNewItemInInventorySlot(DARK_RUNE_ITEM, runeProto->GetMaxStackSize() / 2);
+        }
     }
 }
 
@@ -3636,6 +4162,12 @@ void PlayerbotFactory::InitInventorySkill()
     // tool ownership is 0% in every band. StoreItem is already idempotent.
     if (bot->HasSkill(SKILL_FISHING)) {
         StoreItem(6256, 1); // Fishing Pole
+    }
+    // Owner rule (auto-tools kit): every rogue 15+ carries Thieves' Tools
+    // (5060, Pick Lock 1804 totem1) so unlocks and PR #614 trade unlocks
+    // never fail on a missing tool. StoreItem is idempotent.
+    if (bot->GetClass() == CLASS_ROGUE && bot->GetLevel() >= 15) {
+        StoreItem(5060, 1); // Thieves' Tools
     }
 }
 

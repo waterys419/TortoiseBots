@@ -86,6 +86,25 @@ void PaladinStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "critical health",
         NextAction::array(0, new NextAction("lay on hands", ACTION_EMERGENCY + 2), NULL)));
+
+    // Judgement upkeep (opt-in, AiPlayerbot.PaladinJudgementUpkeep): the group's
+    // Judgement of Wisdom / Light owner swaps to the matching Seal and judges
+    // as the debuff on the boss runs out (runtime/JudgementUpkeepPolicy.h).
+    // Above the spec rotations' own Seal / Judgement rows (NORMAL + 2..4), below
+    // every heal, emergency and mana row; each trigger stands down on its own
+    // unless this bot owns that debuff. Rows exist only with the toggle on.
+    if (sPlayerbotAIConfig.paladinJudgementUpkeep)
+    {
+        triggers.push_back(new TriggerNode(
+            "judgement upkeep seal of wisdom",
+            NextAction::array(0, new NextAction("seal of wisdom", ACTION_NORMAL + 6), NULL)));
+        triggers.push_back(new TriggerNode(
+            "judgement upkeep seal of light",
+            NextAction::array(0, new NextAction("seal of light", ACTION_NORMAL + 6), NULL)));
+        triggers.push_back(new TriggerNode(
+            "judgement upkeep",
+            NextAction::array(0, new NextAction("judgement", ACTION_NORMAL + 7), NULL)));
+    }
 }
 
 void PaladinStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -219,29 +238,31 @@ void PaladinCureStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "party member rooted",
         NextAction::array(0, new NextAction("blessing of freedom on party", ACTION_DISPEL), NULL)));
 
+    // Donor staggers self (DISPEL+2) above party (DISPEL+1): a paladin
+    // locked down by disease/poison/magic cleanses itself before others.
     triggers.push_back(new TriggerNode(
         "cleanse cure disease",
-        NextAction::array(0, new NextAction("cleanse disease", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse disease", ACTION_DISPEL + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "cleanse party member cure disease",
-        NextAction::array(0, new NextAction("cleanse disease on party", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse disease on party", ACTION_DISPEL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "cleanse cure poison",
-        NextAction::array(0, new NextAction("cleanse poison", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse poison", ACTION_DISPEL + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "cleanse party member cure poison",
-        NextAction::array(0, new NextAction("cleanse poison on party", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse poison on party", ACTION_DISPEL + 1), NULL)));
 
     triggers.push_back(new TriggerNode(
         "cleanse cure magic",
-        NextAction::array(0, new NextAction("cleanse magic", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse magic", ACTION_DISPEL + 2), NULL)));
 
     triggers.push_back(new TriggerNode(
         "cleanse party member cure magic",
-        NextAction::array(0, new NextAction("cleanse magic on party", ACTION_DISPEL), NULL)));
+        NextAction::array(0, new NextAction("cleanse magic on party", ACTION_DISPEL + 1), NULL)));
 }
 
 void PaladinCureStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -523,6 +544,13 @@ void PaladinAuraStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& trigger
     triggers.push_back(new TriggerNode(
         "no paladin aura",
         NextAction::array(0, new NextAction("paladin aura", ACTION_NORMAL), NULL)));
+
+    // After a raid boss resist swap: back to the spec aura once out of
+    // combat. Lives here, not in the raid strategy, so it still runs when
+    // the bot ends the fight outside the instance (released after a wipe).
+    triggers.push_back(new TriggerNode(
+        "resist aura swap over",
+        NextAction::array(0, new NextAction("restore spec aura", ACTION_NORMAL + 2), NULL)));
 }
 
 void PaladinAuraPvpStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)

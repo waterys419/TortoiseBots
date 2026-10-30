@@ -31,15 +31,16 @@ void ReactionStrategy::InitReactionTriggers(std::list<TriggerNode*> &triggers)
         NextAction::array(0, new NextAction("move away from hazard", ACTION_EMERGENCY + 5), NULL)));
 
     // Universal raid survival (any raid map): bomb carriers run 30yd clear,
-    // 4H mark carriers rotate out, non-tanks flank dragons, stacked ranged
-    // split. Reaction engine ticks regardless of combat state.
+    // non-tanks flank dragons, stacked ranged split, Four Horsemen mark
+    // carriers (3+ stacks) rotate to the next horseman's corner. Reaction
+    // engine ticks regardless of combat state.
     triggers.push_back(new TriggerNode(
         "raid bomb debuff",
         NextAction::array(0, new NextAction("raid bomb runout", ACTION_EMERGENCY + 6), NULL)));
 
     triggers.push_back(new TriggerNode(
         "four horsemen mark",
-        NextAction::array(0, new NextAction("move away from hazard", ACTION_EMERGENCY + 6), NULL)));
+        NextAction::array(0, new NextAction("four horsemen rotate", ACTION_EMERGENCY + 6), NULL)));
 
     triggers.push_back(new TriggerNode(
         "dragon breath risk",

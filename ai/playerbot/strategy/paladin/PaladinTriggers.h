@@ -72,6 +72,23 @@ namespace ai
 		bool IsActive() override;
 	};
 
+    // Opt-in Judgement upkeep (AiPlayerbot.PaladinJudgementUpkeep): the
+    // owner of Judgement of Wisdom / Light on the group's boss or elite
+    // swaps to the matching Seal and judges as the debuff runs out. One
+    // trigger per step; the decision lives in runtime/JudgementUpkeepPolicy.h.
+    class JudgementUpkeepTrigger : public Trigger
+    {
+    public:
+        enum class Step { SealWisdom, SealLight, Judge };
+
+        JudgementUpkeepTrigger(PlayerbotAI* ai, std::string const& name, Step step)
+            : Trigger(ai, name, 1), step(step) {}
+        bool IsActive() override;
+
+    private:
+        Step step;
+    };
+
     // judgements
     DEBUFF_TRIGGER(JudgementTrigger, "judgement");
     DEBUFF_TRIGGER(JudgementOfLightTrigger, "judgement of light");
@@ -98,7 +115,15 @@ namespace ai
     // repentance triggers
     INTERRUPT_HEALER_TRIGGER(RepentanceOnHealerTrigger, "repentance on enemy healer");
     SNARE_TRIGGER(RepentanceSnareTrigger, "repentance on snare target");
-    INTERRUPT_TRIGGER(RepentanceInterruptTrigger, "repentance");
+    // The "repentance" action is shared with the "repentance or shield"
+    // critical-health row, which repents the current target, so this trigger
+    // stays on the current target too.
+    class RepentanceInterruptTrigger : public InterruptSpellTrigger
+    {
+    public:
+        RepentanceInterruptTrigger(PlayerbotAI* ai) : InterruptSpellTrigger(ai, "repentance") {}
+        virtual Value<Unit*>* GetTargetValue() override { return context->GetValue<Unit*>("current target"); }
+    };
 
     class BlessingOnPartyTrigger : public BuffOnPartyTrigger
     {
@@ -438,6 +463,12 @@ namespace ai
     {
     public:
         HammerOfJusticeInterruptSpellTrigger(PlayerbotAI* ai) : InterruptSpellTrigger(ai, "hammer of justice") {}
+
+        // Stays on the current target: the "hammer of justice" action is
+        // shared with the "hammer of justice on enemy" stun rows, which
+        // stun the current target, so the trigger must not point at a
+        // different mob than its action hits.
+        virtual Value<Unit*>* GetTargetValue() override { return context->GetValue<Unit*>("current target"); }
     };
 
     class HammerOfJusticeSnareTrigger : public SnareTargetTrigger
@@ -517,7 +548,7 @@ namespace ai
     class BlessingOfSacrificeTrigger : public PartyMemberLowHealthTrigger
     {
     public:
-        BlessingOfSacrificeTrigger(PlayerbotAI* ai) : PartyMemberLowHealthTrigger(ai, "blessing of sacrifice", sPlayerbotAIConfig.criticalHealth, 0, true) {}
+        BlessingOfSacrificeTrigger(PlayerbotAI* ai) : PartyMemberLowHealthTrigger(ai, "hand of sacrifice", sPlayerbotAIConfig.criticalHealth, 0, true) {}
     };
 
 }

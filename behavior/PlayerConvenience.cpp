@@ -1,6 +1,10 @@
 #include "PlayerConvenience.h"
 
 #include "../runtime/BotManager.h"
+#include "../runtime/PlayerbotAIStorage.h"
+#include "../ai/playerbot/PlayerbotAI.h"
+#include "../ai/playerbot/WorldPosition.h"
+#include "../ai/playerbot/strategy/values/PositionValue.h"
 
 // pi-lens-ignore: clang:pp_file_not_found
 #include "ObjectAccessor.h"
@@ -27,6 +31,28 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr uint32 kSummonDelayMs = 3000;
 constexpr uint32 kSummonArrivalTimeoutMs = 10000;
 constexpr float kMaxSummonGroundDrop = 4.0f;
+
+// A bot that keeps holding after a summon (stay/guard/hold ordered while it
+// was pending) must hold where it lands: move its stay/guard/return anchors
+// there and drop any move toward the old spot, so the stay triggers never send
+// it back. Only anchors already set are moved.
+void AnchorHeldBot(Player* bot, WorldPosition const& landing)
+{
+    if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot))
+    {
+        ai::PositionMap& posMap = ai->GetAiObjectContext()->GetValue<ai::PositionMap&>("position")->Get();
+        for (char const* posName : { "return", "stay", "guard" })
+        {
+            ai::PositionEntry pos = posMap[posName];
+            if (!pos.isSet())
+                continue;
+            pos.Set(landing);
+            posMap[posName] = pos;
+        }
+    }
+    bot->GetMotionMaster()->Clear(false);
+    bot->StopMoving();
+}
 }
 
 PlayerConvenience& PlayerConvenience::Instance()
@@ -35,10 +61,14 @@ PlayerConvenience& PlayerConvenience::Instance()
     return instance;
 }
 
-bool PlayerConvenience::RequestSummon(Player* requester, Player* bot)
+bool PlayerConvenience::RequestSummon(Player* requester, Player* bot, Player* anchor)
 {
-    if (!requester || !bot || !requester->IsInWorld() || !requester->IsAlive() ||
-        requester->IsBeingTeleported() || requester->IsTaxiFlying())
+    if (!requester || !bot)
+        return false;
+    // The summon point: the master, or the anchor the caller names.
+    Player* origin = anchor ? anchor : requester;
+    if (origin == bot || !origin->IsInWorld() || !origin->IsAlive() ||
+        origin->IsBeingTeleported() || origin->IsTaxiFlying())
         return false;
     if (!bot->IsInWorld() || !bot->GetSession() || !bot->GetSession()->IsHeadless() ||
         bot->IsBeingTeleported() || !bot->IsAlive() || bot->IsInCombat() || bot->IsTaxiFlying())
@@ -62,36 +92,38 @@ bool PlayerConvenience::RequestSummon(Player* requester, Player* bot)
     if (IsBusy(bot->GetObjectGuid()))
         return false;
 
-    float angle = requester->getOrientation() + (std::rand() % 60 - 30) * kPi / 180.0f;
+    float angle = origin->getOrientation() + (std::rand() % 60 - 30) * kPi / 180.0f;
     constexpr float distance = 5.0f;
-    float destX = requester->getPositionX() + std::cos(angle) * distance;
-    float destY = requester->getPositionY() + std::sin(angle) * distance;
-    float destZ = requester->getPositionZ();
+    float destX = origin->getPositionX() + std::cos(angle) * distance;
+    float destY = origin->getPositionY() + std::sin(angle) * distance;
+    float destZ = origin->getPositionZ();
 
     // The visual portal used by the first implementation was not part of the
     // Tortoise data contract. Reuse the mature summon action's conservative
     // ground/line-of-sight policy instead, then fall back to the master's
     // exact position when there is no safe nearby point.
-    requester->UpdateGroundPositionZ(destX, destY, destZ);
-    if (std::fabs(destZ - requester->getPositionZ()) > kMaxSummonGroundDrop ||
-        !requester->IsWithinLOS(destX, destY, destZ + bot->GetCollisionHeight(), true))
+    origin->UpdateGroundPositionZ(destX, destY, destZ);
+    if (std::fabs(destZ - origin->getPositionZ()) > kMaxSummonGroundDrop ||
+        !origin->IsWithinLOS(destX, destY, destZ + bot->GetCollisionHeight(), true))
     {
-        destX = requester->getPositionX();
-        destY = requester->getPositionY();
-        destZ = requester->getPositionZ();
+        destX = origin->getPositionX();
+        destY = origin->getPositionY();
+        destZ = origin->getPositionZ();
     }
 
     constexpr uint32 kSummonPortalEntry = 179944; // Meeting Stone Summoning Portal (Spells\Ritual_Portal.mdx)
-    GameObject* portal = requester->SummonGameObject(kSummonPortalEntry, destX, destY, destZ, requester->getOrientation(), 0.0f, 0.0f, 0.0f, 0.0f, 5, false);
+    GameObject* portal = origin->SummonGameObject(kSummonPortalEntry, destX, destY, destZ, origin->getOrientation(), 0.0f, 0.0f, 0.0f, 0.0f, 5, false);
 
     SummonState state;
     state.botGuid = bot->GetObjectGuid();
     state.masterGuid = requester->GetObjectGuid();
+    if (origin != requester)
+        state.anchorGuid = origin->GetObjectGuid();
     state.destX = destX;
     state.destY = destY;
     state.destZ = destZ;
-    state.destO = requester->getOrientation();
-    state.destMap = requester->GetMapId();
+    state.destO = origin->getOrientation();
+    state.destMap = origin->GetMapId();
     if (portal)
         state.portalGuid = portal->GetObjectGuid();
     m_summons.emplace(key, state);
@@ -162,6 +194,24 @@ bool PlayerConvenience::IsBusy(ObjectGuid botGuid) const
     return m_summons.find(key) != m_summons.end();
 }
 
+bool PlayerConvenience::NoteHoldOrder(ObjectGuid botGuid)
+{
+    auto it = m_summons.find(botGuid.GetCounter());
+    if (it == m_summons.end())
+        return false;
+    it->second.restore.NoteHoldOrder();
+    return true;
+}
+
+bool PlayerConvenience::NoteComeOrder(ObjectGuid botGuid)
+{
+    auto it = m_summons.find(botGuid.GetCounter());
+    if (it == m_summons.end())
+        return false;
+    it->second.restore.NoteComeOrder();
+    return true;
+}
+
 void PlayerConvenience::Update(uint32 diff)
 {
     UpdateSummons(diff);
@@ -189,12 +239,15 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
 
         Player* bot = sObjectAccessor.FindPlayer(state.botGuid);
         Player* master = sObjectAccessor.FindPlayer(state.masterGuid);
-        if (!bot || !bot->GetSession() || !bot->GetSession()->IsHeadless() ||
-            !master || !master->IsInWorld() || !master->IsAlive() || master->IsBeingTeleported() ||
-            master->IsTaxiFlying() ||
-            master->GetMapId() != state.destMap)
+        // The summon point: the master, or the anchor named at the request
+        // (issue #884). It holds the portal and must stay where it was.
+        Player* origin = state.anchorGuid.IsEmpty() ? master : sObjectAccessor.FindPlayer(state.anchorGuid);
+        if (!bot || !bot->GetSession() || !bot->GetSession()->IsHeadless() || !master ||
+            !origin || !origin->IsInWorld() || !origin->IsAlive() || origin->IsBeingTeleported() ||
+            origin->IsTaxiFlying() ||
+            origin->GetMapId() != state.destMap)
         {
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
@@ -204,7 +257,7 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
         {
             sLog.outString("TortoiseBots: Summon cancelled for bot %s because its master changed",
                 state.botGuid.GetString().c_str());
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
@@ -225,7 +278,7 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
                 {
                     sLog.outError("TortoiseBots: Summon arrival timed out for bot %s",
                         state.botGuid.GetString().c_str());
-                    cleanupPortal(state, master);
+                    cleanupPortal(state, origin);
                     it = m_summons.erase(it);
                 }
                 else
@@ -237,7 +290,21 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
             {
                 sLog.outString("TortoiseBots: Summon cancelled bot %s became incompatible before follow restore",
                     bot->GetName());
-                cleanupPortal(state, master);
+                cleanupPortal(state, origin);
+                it = m_summons.erase(it);
+                continue;
+            }
+
+            if (!state.restore.ShouldRestoreFollow())
+            {
+                // The player ordered stay/guard/hold after asking for the
+                // summon: the bot keeps holding, anchored where it landed.
+                // Normally already done right after the teleport; repeated
+                // here for an order that came in after it.
+                AnchorHeldBot(bot, WorldPosition(bot));
+                sLog.outString("TortoiseBots: Summon completed for bot %s; follow restore skipped because a stay/guard/hold order came after the request",
+                    bot->GetName());
+                cleanupPortal(state, origin);
                 it = m_summons.erase(it);
                 continue;
             }
@@ -246,21 +313,21 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
             {
                 sLog.outError("TortoiseBots: Summon follow restore failed for bot %s",
                     state.botGuid.GetString().c_str());
-                cleanupPortal(state, master);
+                cleanupPortal(state, origin);
                 it = m_summons.erase(it);
                 continue;
             }
 
             sLog.outString("TortoiseBots: Summon completed for bot %s with follow restored to %s",
                 bot->GetName(), master->GetName());
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
 
         if (!bot->IsInWorld())
         {
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
@@ -269,7 +336,7 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
         {
             sLog.outString("TortoiseBots: Summon cancelled bot %s became incompatible before teleport",
                 bot->GetName());
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
@@ -282,12 +349,12 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
         if (bot->IsInCombat())
         {
             sLog.outString("TortoiseBots: Summon aborted bot %s still in combat", bot->GetName());
-            cleanupPortal(state, master);
+            cleanupPortal(state, origin);
             it = m_summons.erase(it);
             continue;
         }
 
-        cleanupPortal(state, master);
+        cleanupPortal(state, origin);
         bot->GetMotionMaster()->Clear(false);
         bot->StopMoving();
         if (!bot->TeleportTo(state.destMap, state.destX, state.destY, state.destZ, state.destO, 0))
@@ -307,6 +374,10 @@ void PlayerConvenience::UpdateSummons(uint32 diff)
             else if (bot->IsBeingTeleportedFar())
                 bot->GetSession()->HandleMoveWorldportAckOpcode();
         }
+        // The bot AI ticks before this update: re-anchor a holding bot now,
+        // before its next tick can walk it back to the old stay spot.
+        if (!state.restore.ShouldRestoreFollow())
+            AnchorHeldBot(bot, WorldPosition(state.destMap, state.destX, state.destY, state.destZ));
         state.phase = SummonState::Phase::AwaitingArrival;
         state.elapsedMs = 0;
         sLog.outString("TortoiseBots: Summon teleport requested for bot %s to master %s",

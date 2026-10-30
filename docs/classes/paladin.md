@@ -1,88 +1,113 @@
 ---
-id: class-paladin
-title: Paladin Bot AI & Specs
+id: classes-paladin
+title: Paladin Bot Guide
 category: classes
-summary: Guide to Paladin bot behavior across Holy healing, Protection tanking, and Retribution DPS, including custom Holy Strike and Bulwark.
-tags: [class, paladin, tank, healer, dps]
+summary: Complete guide to Paladin bot AI, Holy healing, Protection tanking, Retribution DPS, blessing coordination, and Judgement upkeep.
+tags: [classes, paladin, tank, healer, dps, hybrid]
 relates_to:
-  - class-overview
-  - guide-player-controls
+  - classes-overview
 ---
 
-# Paladin Bot AI & Specs
+# Paladin Bot Guide
 
-Paladins provide exceptional party utility, versatile auras, class blessings, and fill Tank, Healer, or Melee DPS roles.
+Paladins provide resilient group utility, customizable auras, coordinated blessings, and capable Tank, Healer, or Melee DPS performance.
 
-## Supported Specs & Roles
+## Specs & roles
 
-- **Holy (Healer):** Single-target healing powerhouse. Relies on *Flash of Light* for efficient maintenance, *Holy Light* for heavy damage spikes, and *Holy Shock* for instant reaction heals.
-- **Protection (Tank):** High AoE threat tanking using *Consecration*, *Holy Shield*, and *Righteous Fury*.
-- **Retribution (Melee DPS):** Two-handed melee damage leveraging *Seal of Command* and Judgement bursts.
-
----
-
-## Combat Rotations & Priorities
-
-### 1. Holy (Healing)
-- **Emergency:** Casts *Lay on Hands* on any party member at critical health (default 20). Casts *Divine Favor* as a standalone buff trigger on medium/low mana; no code chains it into *Holy Light*.
-- **Maintenance:** Maintains *Flash of Light* on injured allies. Casts *Holy Shock* on low-health bands only (no movement condition).
-- **Self-Defense:** Pops *Divine Shield* (Bubble) if personal health drops into danger, continuing to heal the group while immune.
-
-### 2. Protection (Tank)
-- **Aggro Mechanics:** Always keeps *Righteous Fury* active.
-- **AoE Holding:** Drops *Consecration* on mob clusters to maintain lock on multiple targets. Keeps *Holy Shield* active on cooldown for block rating and reflective holy damage.
-- **Burst Threat:** Judges *Seal of Righteousness* on primary target.
-
-### 3. Retribution (DPS)
-- **Seals & Judgement:** Maintains *Seal of Command* (falling back to *Seal of Righteousness* on spell availability, with no weapon-speed check) and unleashes *Judgement* on cooldown. The rotation also wires *Exorcism* (instant with the Art of War proc), *Holy Strike*, and *Crusader Strike*.
-- **Finishers:** Casts *Hammer of Wrath* when target falls below 20% health.
+| Spec | Role | Primary Focus |
+| :--- | :--- | :--- |
+| **Holy** | Healer | Efficient single-target healing, emergency saves, and raid upkeep. |
+| **Protection** | Tank | High AoE threat, Consecration holding, and Holy Shield mitigation. |
+| **Retribution** | Melee DPS | Two-handed melee holy burst, Seal cycling, and Judgement maintenance. |
 
 ---
 
-## Turtle WoW 1.18.1 Custom Content
+## What the bot does in combat
 
-- **Holy Strike (Spell ID 679, per game data):**
-  - Custom Turtle WoW instant holy melee strike (0.71 weapon coefficient + Mending Light bonus, per game data).
-  - Gives Retribution and Protection Paladins an active on-demand melee filler and sustained holy damage.
-- **Bulwark of the Righteous (Spell ID 51346, per game data):**
-  - Protection talent granting an active shield-slam ability with damage reduction.
-  - Auto-cast whenever ready at high priority (not held as an emergency cooldown); the cooldown length is game data, not bot logic.
-- **Exorcism Targeting:**
-  - In Vanilla, *Exorcism* can only hit Undead and Demons. In Turtle WoW with the *Art of War* talent, it becomes usable on all creature types on proc. The bot's trigger explicitly verifies target type or proc status before attempting cast, eliminating wasted mana.
+### Holy (Healer)
+- Casts *Lay on Hands* on party members at critical health (default 20), claiming the target to prevent duplicate casts.
+- Uses *Flash of Light* for efficient maintenance and *Holy Light* for heavy damage spikes.
+- Downranks direct heals (*Holy Light*, *Flash of Light*) to match wounds per [shared downranking rules](overview.md#spell-downranking).
+- Casts *Holy Shock* on allies below 50% health.
+- Weaves *Crusader Strike* only when already in melee reach, without moving out of healing position.
+- Casts *Divine Shield* (Bubble) when personally critically wounded, continuing to heal while immune.
+
+### Protection (Tank)
+- Maintains *Righteous Fury* in and out of combat to boost holy threat generation.
+- Taunts loose mobs with *Hand of Reckoning* (Spell ID 51303), falling back to *Righteous Defense*.
+- Drops *Consecration* against 3 or more attackers in melee reach while above medium mana (40% default), or against 2 at 70%+ mana.
+- Keeps *Holy Shield* active on cooldown for block rating and reflective holy damage.
+- Judges *Seal of Righteousness* on the primary target for sustained threat.
+
+### Retribution (Melee DPS)
+- Maintains *Seal of Command* (falling back to *Seal of Righteousness*) and unleashes *Judgement* on cooldown.
+- Uses *Crusader Strike* as primary builder ahead of *Holy Strike*.
+- Fires *Exorcism* instantly upon *Art of War* procs.
+- Casts *Hammer of Wrath* as an execute when targets drop below 20% health.
+
+<details>
+<summary>Judgement upkeep in groups</summary>
+
+When enabled, paladin bots coordinate to maintain *Judgement of Wisdom* and *Judgement of Light* on bosses or elite targets:
+- **Assignment:** Retribution paladins maintain *Judgement of Wisdom*; Holy paladins maintain *Judgement of Light*. A second non-tank paladin takes the unassigned debuff.
+- **Protection Exemption:** Protection tanks never upkeep group judgements, keeping *Seal of Righteousness* for threat.
+- **Timing:** Debuffs are refreshed when 4 seconds or fewer remain.
+- **Mana Gates:** Everyone needs at least medium mana; a healing paladin needs 50% mana and judges only while nobody is below the medium-health line (see [Combat settings](../server/settings/combat.md#aiplayerbotmediummana)).
+- **Player Paladins:** Active judgements placed by human players are respected and never overwritten.
+
+</details>
 
 ---
 
-## Utility, Blessings & Auras
+## Turtle WoW custom spells
 
-- **Blessings:** Coordinates blessings across party classes (*Blessing of Kings*, *Might*, *Wisdom*, *Salvation*, *Sanctuary*, *Light*). Automatically avoids overriding higher-tier blessings.
-- **Auras:** Each spec keeps a fixed default aura (Holy → Concentration, Protection → Retribution, Retribution → Sanctity); otherwise the bot casts the first missing aura in a fixed list. No damage-type or group-composition detection exists.
-- **Cleansing:** Uses *Cleanse* and *Purify* to remove poisons, diseases, and magic debuffs from party members.
-- **Crowd Control:** Stuns dangerous casters or runners using *Hammer of Justice*. *Repentance* fires automatically from interrupt, enemy-healer and snare triggers with no humanoid restriction; the Paladin CC-strategy spell is *Turn Undead*, and `.bot action cc` assigns marks rather than ordering a spell.
+- **Holy Strike (Spell ID 679):** Instant holy melee strike providing Retribution and Protection paladins an active physical/holy damage builder.
+- **Bulwark of the Righteous (Spell ID 51346):** Protection talent granting an active shield-slam mitigation strike with damage reduction, auto-cast whenever ready.
+- **Exorcism Targeting & Art of War:** Checks target creature types and *Art of War* procs, allowing *Exorcism* to damage any enemy when procced.
 
 ---
 
-## Premade Talent Specs & Progression (1.18.1)
+## Utility & interrupts
 
-TortoiseBots configures verified 5-level talent checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
+- **Blessings Coordination:** Coordinates blessings across party classes (*Kings*, *Might*, *Wisdom*, *Salvation*, *Sanctuary*, *Light*). Each paladin assigns one blessing per member, and multiple paladins stack distinct blessing families. Buff claims prevent duplicate casts.
+- **Hands:** Casts *Hand of Protection* on non-tank allies facing physical danger and *Hand of Freedom* on rooted allies. Checks for *Forbearance* to prevent wasted casts.
+- **Auras:** Holy runs *Concentration Aura*, Protection runs *Retribution Aura*, and Retribution runs *Sanctity Aura*. In raids, the first paladin bot in the fight auto-swaps to *Fire* or *Shadow Resistance Aura* on applicable bosses, then drops it out of combat.
+- **Cleansing:** Uses *Cleanse* and *Purify* to remove poisons, diseases, and magic debuffs from self and allies.
+- **Crowd Control & Stuns:** Casts *Hammer of Justice* to stun dangerous casters or runners. *Repentance* interrupts with no humanoid restriction and *Turn Undead* covers assigned-CC undead.
+- **Solo Survival:** Solo paladins with mana at or above the low-mana line stand their ground and heal through combat rather than fleeing when outnumbered.
+
+---
+
+## Talent builds
+
+TortoiseBots provides pre-configured talent progressions at 5-level checkpoints (levels 10–60) tailored for Turtle WoW 1.18.1:
 
 | Spec Name | Config ID | Role | 60 Allocation | Key Signatures & Synergies |
 | :--- | :--- | :--- | :--- | :--- |
-| **Holy** | `2.0` | Healer | `40 / 11 / 0` | Holy Shock (35), Divine Favor (40), Daybreak (45 shielding heal), Blessed Strikes, Illumination, 11 Prot dip. |
-| **Protection** | `2.1` | Tank | `5 / 38 / 8` | Holy Shield (40), Bulwark of the Righteous (50), Righteous Strikes, Reckoning, Blessing of Sanctuary, Ret/Holy dips. |
-| **Retribution** | `2.2` | Melee DPS | `11 / 0 / 40` | Seal of Command (35), Repentance (45), Vengeful Strikes, Sanctity Aura (+10% Holy damage aura, per game data), Benediction (-15% mana, per game data). |
+| **Holy** | `2.0` | Healer | `40 / 11 / 0` | Holy Shock, Divine Favor, Daybreak, Blessed Strikes, Illumination, 11 Prot dip. |
+| **Protection** | `2.1` | Tank | `5 / 38 / 8` | Holy Shield, Bulwark of the Righteous, Righteous Strikes, Reckoning, Sanctuary. |
+| **Retribution** | `2.2` | Melee DPS | `11 / 0 / 40` | Seal of Command, Repentance, Vengeful Strikes, Sanctity Aura, Benediction. |
 
-### Leveling Milestones & Progression Rationale
+<details>
+<summary>Leveling milestones and progression rationale</summary>
 
 - **Holy (`2.0`):**
-  - *Levels 10–35:* Sustained healing path: *Divine Intellect* (5/5), *Healing Light* (3/3), *Illumination* (5/5 mana return on crit), and *Holy Shock* (35 signature instant heal).
-  - *Levels 35–45:* *Divine Favor* (40 guaranteed crit, depends on Holy Shock) and *Daybreak* (45 shielding heal on critical heal).
-  - *Levels 45–60:* *Blessed Strikes* (5/5 Holy Shock cooldown reset on Crusader Strike) and *Holy Power* (3/3), finished with 11 Protection points (*Improved Devotion Aura* + *Guardian's Favor* + *Toughness*).
+  - *Levels 10–35:* Takes *Divine Intellect* (5/5), *Healing Light* (3/3), *Illumination* (5/5), and *Holy Shock* (35).
+  - *Levels 35–45:* Takes *Divine Favor* (40) and *Daybreak* (45).
+  - *Levels 45–60:* Takes *Blessed Strikes* (5/5) and *Holy Power* (3/3), then dips 11 points into Protection (*Improved Devotion Aura* + *Guardian's Favor* + *Toughness*).
 - **Protection (`2.1`):**
-  - *Levels 10–40:* Mitigation rush through *Redoubt* (5/5), *Precision* (3/3), *Improved Righteous Fury* (3/3 threat), *Blessing of Sanctuary* (20), *Shield Specialization* (3/3), and *Holy Shield* (40).
-  - *Levels 40–50:* *Reckoning* (5/5), *Righteous Strikes* (5/5 Holy Strike threat/damage), and *Bulwark of the Righteous* (50 capstone mitigation slam).
-  - *Levels 50–60:* Retribution dip (*Benediction* 5/5 + *Improved Judgement* 2/2) for mana efficiency and Holy dip (*Divine Strength* 5/5) for attack power.
+  - *Levels 10–40:* Takes *Redoubt* (5/5), *Precision* (3/3), *Improved Righteous Fury* (3/3), *Blessing of Sanctuary* (20), *Shield Specialization* (3/3), and *Holy Shield* (40).
+  - *Levels 40–50:* Takes *Reckoning* (5/5), *Righteous Strikes* (5/5), and *Bulwark of the Righteous* (50).
+  - *Levels 50–60:* Dips into Retribution (*Benediction* 5/5 + *Improved Judgement* 2/2) and Holy (*Divine Strength* 5/5).
 - **Retribution (`2.2`):**
-  - *Levels 10–35:* Mana-efficient damage rush: *Benediction* (5/5 reducing Seal/Judgement cost by 15%), *Improved Judgement* (2/2), *Conviction* (5/5 crit), *Blessing of Kings* (20), *Two-Handed Weapon Specialization* (3/3), and *Seal of Command* (35).
-  - *Levels 35–45:* *Vengeance* (5/5 +15% physical/holy damage on crit), *Vengeful Strikes* (5/5 Zeal attack speed / Holy Strike strength buff), and *Repentance* (45 CC).
-  - *Levels 45–60:* Completes Retribution utility (*Improved Seal of the Crusader* + *Eye for an Eye*), then takes 11 Holy points into *Divine Strength* (5/5), *Divine Intellect* (5/5), and *Sanctity Aura* (60), granting +10% Holy damage to the entire party to amplify Judgements, Seal procs, and Holy Strikes.
+  - *Levels 10–35:* Takes *Benediction* (5/5), *Improved Judgement* (2/2), *Conviction* (5/5), *Blessing of Kings* (20), *Two-Handed Weapon Specialization* (3/3), and *Seal of Command* (35).
+  - *Levels 35–45:* Takes *Vengeance* (5/5), *Vengeful Strikes* (5/5), and *Repentance* (45).
+  - *Levels 45–60:* Dips 11 points into Holy for *Divine Strength* (5/5), *Divine Intellect* (5/5), and *Sanctity Aura* (60).
 
+</details>
+
+---
+
+## Class settings
+
+- [`AiPlayerbot.PaladinJudgementUpkeep`](../server/settings/class-behaviour.md#aiplayerbotpaladinjudgementupkeep): Controls whether paladins coordinate to maintain Judgement of Wisdom and Judgement of Light on bosses and elite targets.

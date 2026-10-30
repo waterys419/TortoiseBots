@@ -4,6 +4,8 @@
 #include "../../runtime/BotManager.h"
 #include "../../runtime/PlayerbotAIStorage.h"
 #include "playerbot/GroupMembers.h"
+#include "playerbot/WorldPosition.h"
+#include "playerbot/policy/pull/PullReachPolicy.h"
 #include "PullStrategy.h"
 
 using namespace ai;
@@ -18,6 +20,11 @@ void ai::ReleaseHeldPartyNow(Player* tank)
             continue;
         PlayerbotAI* memberAi = PlayerbotAIStorage::Instance().GetAI(member);
         if (!memberAi || !memberAi->GetAiObjectContext())
+            continue;
+        // Only the bots this pull holds. Zeroing the delay ends their window
+        // on the next tick, which then puts their own delay back; a bot with a
+        // "wait for attack" of the player's own and no pull window keeps it.
+        if (!memberAi->HasPullWindow())
             continue;
         memberAi->GetAiObjectContext()->GetValue<uint8>("wait for attack time")->Set(0);
         memberAi->GetAiObjectContext()->GetValue<time_t>("combat start time")->Set(time(0));
@@ -62,9 +69,15 @@ PullStrategy::PullStrategy(PlayerbotAI* ai, std::string pullAction, std::string 
 , pendingToStart(false)
 , pullActionCompleted(false)
 , pullStartTime(0)
+, approachHeadwayTime(0)
+, approachDistance(-1.0f)
 , pullActionCastMs(0)
 , commandPullback(false)
 , commandActive(false)
+, commandRangedOrder(false)
+, commandWantsRanged(false)
+, openingReason(PullOpeningReason::BodyPull)
+, pathReachable(true)
 , hadPullBack(false)
 , pullBackIntent(false)
 , commandJoinDelay(0)
@@ -77,9 +90,100 @@ PullStrategy::PullStrategy(PlayerbotAI* ai, std::string pullAction, std::string 
         return;
 }
 
+namespace
+{
+// The spell a ranged weapon fires. Built from the item, not from the strategy:
+// GetSpellName() calls back into GetPullActionName(), so asking it from inside
+// the ranged-weapon checks would recurse.
+std::string ShootSpellOf(const ItemPrototype* proto)
+{
+    if (proto)
+    {
+        switch (proto->SubClass)
+        {
+            case ITEM_SUBCLASS_WEAPON_GUN: return "shoot gun";
+            case ITEM_SUBCLASS_WEAPON_BOW: return "shoot bow";
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW: return "shoot crossbow";
+            case ITEM_SUBCLASS_WEAPON_THROWN: return "throw";
+            default: break;
+        }
+    }
+    return "shoot";
+}
+} // namespace
+
+PullRangedBlocker PullStrategy::GetRangedBlocker(float distance) const
+{
+    const Item* rangedWeapon = ai->GetBot()->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    if (!rangedWeapon)
+        return PullRangedBlocker::NoWeapon;
+
+    const ItemPrototype* proto = rangedWeapon->GetProto();
+    if (proto)
+    {
+        // Untrained weapon skill: the shoot cast would fail CanCastSpell
+        // forever, so body-pull instead of aborting the request.
+        bool trained = true;
+        switch (proto->SubClass)
+        {
+            case ITEM_SUBCLASS_WEAPON_BOW: trained = ai->HasSkill(SKILL_BOWS); break;
+            case ITEM_SUBCLASS_WEAPON_GUN: trained = ai->HasSkill(SKILL_GUNS); break;
+            case ITEM_SUBCLASS_WEAPON_CROSSBOW: trained = ai->HasSkill(SKILL_CROSSBOWS); break;
+            case ITEM_SUBCLASS_WEAPON_THROWN: trained = ai->HasSkill(SKILL_THROWN); break;
+            case ITEM_SUBCLASS_WEAPON_WAND: trained = ai->HasSkill(SKILL_WANDS); break;
+            default: break;
+        }
+        if (!trained)
+            return PullRangedBlocker::Untrained;
+
+        // The skill alone does not let the bot shoot. The cast resolves the
+        // shoot spell by name against the bot's own spellbook, and a bot that
+        // owns the weapon skill without the spell (skills are written
+        // directly, no trainer visit) fails CanCastSpell on every tick, so
+        // the pull would stand still until its timeout.
+        if (!ai->HasSpell(ShootSpellOf(proto)))
+            return PullRangedBlocker::NoSpell;
+
+        if (proto->SubClass != ITEM_SUBCLASS_WEAPON_THROWN && proto->SubClass != ITEM_SUBCLASS_WEAPON_WAND)
+        {
+            if (ai->GetBot()->GetUInt32Value(PLAYER_AMMO_ID) == 0)
+            {
+                std::list<Item*> ammo = ai->GetAiObjectContext()->GetValue<std::list<Item*>>("inventory items", "ammo")->Get();
+                if (!ammo.empty() && ammo.front())
+                    ai->GetBot()->SetAmmo(ammo.front()->GetEntry());
+                else
+                    return PullRangedBlocker::NoAmmo;
+            }
+        }
+    }
+
+    // Shoot deadzone: inside the 8-yard minimum range (or with no spell range
+    // data) a shoot cast cannot land, so melee/body-pull instead.
+    if (distance >= 0.0f)
+    {
+        float maxRange = 0.0f;
+        float minRange = 0.0f;
+        bool const hasRange = ai->GetSpellRange(ShootSpellOf(proto), &maxRange, &minRange);
+        if ((!hasRange && distance < 8.0f) ||
+            (hasRange && minRange > 0.0f && distance < minRange) ||
+            (hasRange && minRange <= 0.0f && distance < 8.0f))
+            return PullRangedBlocker::TooClose;
+    }
+
+    return PullRangedBlocker::None;
+}
+
 std::string PullStrategy::GetPullActionName() const
 {
     std::string modPullActionName = pullActionName;
+
+    // A plain pull command is a melee engagement: the tank walks in on its own
+    // and builds threat while the party waits out the join delay. A pullback,
+    // an order that says `ranged`, and a mob nobody can walk to (or that is
+    // too far to walk to) open from range - see DecideOpening. The tank's own
+    // automatic pulls always do.
+    if (commandActive && !commandWantsRanged)
+        return "reach pull";
 
     // Select the faerie fire based on druid strategy
     if (ai->GetBot()->GetClass() == CLASS_DRUID)
@@ -95,73 +199,12 @@ std::string PullStrategy::GetPullActionName() const
 
     if (modPullActionName == "shoot")
     {
-        const Item* rangedWeapon = ai->GetBot()->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
-        if (!rangedWeapon)
-            return "reach pull";
-
-        const ItemPrototype* proto = rangedWeapon->GetProto();
-        if (proto)
-        {
-            // Untrained weapon skill: the shoot cast would fail CanCastSpell
-            // forever, so body-pull instead of aborting the request.
-            bool trained = true;
-            switch (proto->SubClass)
-            {
-                case ITEM_SUBCLASS_WEAPON_BOW: trained = ai->HasSkill(SKILL_BOWS); break;
-                case ITEM_SUBCLASS_WEAPON_GUN: trained = ai->HasSkill(SKILL_GUNS); break;
-                case ITEM_SUBCLASS_WEAPON_CROSSBOW: trained = ai->HasSkill(SKILL_CROSSBOWS); break;
-                case ITEM_SUBCLASS_WEAPON_THROWN: trained = ai->HasSkill(SKILL_THROWN); break;
-                case ITEM_SUBCLASS_WEAPON_WAND: trained = ai->HasSkill(SKILL_WANDS); break;
-                default: break;
-            }
-            if (!trained)
-                return "reach pull";
-
-            if (proto->SubClass != ITEM_SUBCLASS_WEAPON_THROWN && proto->SubClass != ITEM_SUBCLASS_WEAPON_WAND)
-            {
-                if (ai->GetBot()->GetUInt32Value(PLAYER_AMMO_ID) == 0)
-                {
-                    std::list<Item*> ammo = ai->GetAiObjectContext()->GetValue<std::list<Item*>>("inventory items", "ammo")->Get();
-                    if (!ammo.empty() && ammo.front())
-                    {
-                        ai->GetBot()->SetAmmo(ammo.front()->GetEntry());
-                    }
-                    else
-                    {
-                        return "reach pull";
-                    }
-                }
-            }
-        }
-
-        // Shoot deadzone: inside the 8-yard minimum range (or with no spell
-        // range data) a shoot cast cannot land, so melee/body-pull instead.
-        // Build the shoot spell name locally: GetSpellName() calls back into
-        // GetPullActionName(), so querying it here would recurse.
+        // Distance for the shoot deadzone check; negative = no live target yet.
         Unit* pullTarget = GetTarget();
-        if (pullTarget && pullTarget->IsInWorld())
-        {
-            std::string shootSpell = "shoot";
-            if (proto)
-            {
-                switch (proto->SubClass)
-                {
-                    case ITEM_SUBCLASS_WEAPON_GUN: shootSpell = "shoot gun"; break;
-                    case ITEM_SUBCLASS_WEAPON_BOW: shootSpell = "shoot bow"; break;
-                    case ITEM_SUBCLASS_WEAPON_CROSSBOW: shootSpell = "shoot crossbow"; break;
-                    case ITEM_SUBCLASS_WEAPON_THROWN: shootSpell = "throw"; break;
-                    default: break;
-                }
-            }
-            float maxRange = 0.0f;
-            float minRange = 0.0f;
-            bool hasRange = ai->GetSpellRange(shootSpell, &maxRange, &minRange);
-            float distance = ai->GetBot()->GetDistance(pullTarget);
-            if ((!hasRange && distance < 8.0f) ||
-                (hasRange && minRange > 0.0f && distance < minRange) ||
-                (hasRange && minRange <= 0.0f && distance < 8.0f))
-                return "reach pull";
-        }
+        float const distance = (pullTarget && pullTarget->IsInWorld())
+            ? ai->GetBot()->GetDistance(pullTarget) : -1.0f;
+        if (GetRangedBlocker(distance) != PullRangedBlocker::None)
+            return "reach pull";
     }
 
     return modPullActionName;
@@ -367,14 +410,41 @@ uint32 PullStrategy::GetPullActionCastAgeMs() const
     return WorldTimer::getMSTimeDiff(pullActionCastMs, WorldTimer::getMSTime());
 }
 
+void PullStrategy::NotePullApproach(float distanceNow, bool moving)
+{
+    // The reach re-requests every tick while out of range, before the walk
+    // has moved: the policy's first sample always anchors, so this never
+    // expires a pull that just started.
+    if (PullApproachHeadway(distanceNow, approachDistance, approachDistance >= 0.0f, moving))
+    {
+        approachHeadwayTime = time(0);
+        approachDistance = distanceNow;
+    }
+}
+
+bool PullStrategy::HasPullApproachExpired() const
+{
+    PullApproachFacts facts;
+    facts.elapsedOrderSec = pullStartTime ? (long)(time(0) - pullStartTime) : 0;
+    facts.elapsedHeadwaySec = approachHeadwayTime ? (long)(time(0) - approachHeadwayTime) : facts.elapsedOrderSec;
+    facts.baseWindowSec = GetMaxPullTime();
+    return PullApproachExpired(facts);
+}
+
 void PullStrategy::OnPullEnded()
 {
     pendingToStart = false;
     pullActionCompleted = false;
     pullStartTime = 0;
+    approachHeadwayTime = 0;
+    approachDistance = -1.0f;
     pullActionCastMs = 0;
     commandActive = false;
     commandPullback = false;
+    commandRangedOrder = false;
+    commandWantsRanged = false;
+    openingReason = PullOpeningReason::BodyPull;
+    pathReachable = true;
     hadPullBack = false;
     pullBackIntent = false;
     commandJoinDelay = 0;
@@ -382,10 +452,17 @@ void PullStrategy::OnPullEnded()
     SetTarget(nullptr);
 }
 
-void PullStrategy::BeginCommand(bool pullback, bool hadPullBackStrategy, uint32 joinDelaySeconds)
+void PullStrategy::BeginCommand(bool pullback, bool hadPullBackStrategy, uint32 joinDelaySeconds, bool rangedOrder)
 {
     commandActive = true;
     commandPullback = pullback;
+    commandRangedOrder = rangedOrder;
+    // Until the target is known (RequestPull) the order's own words decide:
+    // a pullback and a `ranged` order open from range, a plain pull walks in.
+    commandWantsRanged = pullback || rangedOrder;
+    openingReason = rangedOrder ? PullOpeningReason::Explicit
+        : pullback ? PullOpeningReason::Pullback : PullOpeningReason::BodyPull;
+    pathReachable = true;
     hadPullBack = hadPullBackStrategy;
     commandJoinDelay = joinDelaySeconds;
     returnStartTime = 0;
@@ -410,7 +487,57 @@ void PullStrategy::RequestPull(Unit* target, bool resetTime)
         pullActionCompleted = false;
         pullStartTime = time(0);
         pullActionCastMs = 0;
+        // Anchor the approach-headway clock with the order: the first
+        // approach sample always counts (PullReachPolicy.h), so a pull whose
+        // walk starts late still gets its full first window.
+        approachHeadwayTime = pullStartTime;
+        approachDistance = -1.0f;
+        // The opening is decided once per pull, on the first request: a mob
+        // that moves while the tank approaches must not flip the pull between
+        // walking in and shooting.
+        if (commandActive)
+            DecideOpening(target);
     }
+}
+
+void PullStrategy::DecideOpening(Unit* target)
+{
+    Player* bot = ai->GetBot();
+    if (!bot || !target)
+        return;
+
+    PullOpeningInput input;
+    input.pullback = commandPullback;
+    input.explicitRanged = commandRangedOrder;
+    input.autoEnabled = sPlayerbotAIConfig.rangedPull;
+    input.meleeApproach = sPlayerbotAIConfig.rangedPullMeleeApproach;
+    input.distance = bot->GetDistance(target);
+    input.inLos = bot->IsWithinLOSInMap(target, true);
+
+    // What the tank would fire, and how far. The weapon classes shoot with the
+    // spell their weapon teaches; hunters and casters use their pull spell.
+    std::string spell = pullActionName;
+    if (spell == "shoot")
+    {
+        const Item* weapon = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        spell = ShootSpellOf(weapon ? weapon->GetProto() : nullptr);
+    }
+    float maxRange = 0.0f;
+    if (!spell.empty() && ai->GetSpellRange(spell, &maxRange))
+        input.maxRange = maxRange - CONTACT_DISTANCE;
+    else
+        input.maxRange = (pullActionName == "shoot") ? ai->GetRange("shoot") : ai->GetRange("spell");
+
+    // One navmesh query per pull, and only when a path could change the answer.
+    pathReachable = true;
+    if (!input.explicitRanged && !input.pullback && input.autoEnabled && input.inLos &&
+        input.distance <= input.maxRange)
+        pathReachable = WorldPosition(bot).canPathTo(WorldPosition(target), bot);
+    input.pathReachable = pathReachable;
+
+    PullOpeningDecision const decision = DecidePullOpening(input);
+    commandWantsRanged = decision.wantRanged;
+    openingReason = decision.reason;
 }
 float PullMultiplier::GetValue(Action* action)
 {

@@ -76,6 +76,7 @@ inline HireSpecOption const* HireSpecOptions(uint8_t classId, uint32_t& count)
         { "Restoration (Healer)", kHireRoleHealer, "restoration" },
         { "Elemental (DPS)", kHireRoleDps, "elemental" },
         { "Enhancement (DPS)", kHireRoleDps, "enhancement" },
+        { "Enhancement (Tank) (experimental)", kHireRoleTank, "tank" },
     };
     static HireSpecOption const mage[] = {
         { "Frost (DPS)", kHireRoleDps, "frost" },
@@ -103,7 +104,8 @@ inline HireSpecOption const* HireSpecOptions(uint8_t classId, uint32_t& count)
         case kHireClassHunter: count = 3; return hunter;
         case kHireClassRogue: count = 3; return rogue;
         case kHireClassPriest: count = 3; return priest;
-        case kHireClassShaman: count = 3; return shaman;
+        // Shaman has the 4th Enhancement (Tank) row; druid keeps Bear.
+        case kHireClassShaman: count = 4; return shaman;
         case kHireClassMage: count = 3; return mage;
         case kHireClassWarlock: count = 3; return warlock;
         case kHireClassDruid: count = 4; return druid;
@@ -123,6 +125,52 @@ inline char const* HireSpecPathName(uint8_t classId, int specIndex)
     if (!options || static_cast<uint32_t>(specIndex) >= count)
         return nullptr;
     return options[specIndex].pathName;
+}
+
+// `.bot hire` spec word -> gossip spec index, so "mage frost" picks the same
+// option (and premade tree) as the recruiter's "Frost (DPS)" row instead of a
+// role-only draw. word is lower case. It matches an option when it contains
+// the option's path name ("frost", "firemage"), abbreviates it with at least
+// three letters ("prot", "ret", "resto") or shares its first four letters
+// ("destro"). The four-letter stems are unique within every class. -1 when
+// the word names no spec of that class. Druid words (bear/cat/feral/balance/
+// resto) keep their own handling in HandleHire.
+inline int HireSpecIndexForWord(uint8_t classId, std::string const& word)
+{
+    if (word.size() < 3)
+        return -1;
+    uint32_t count = 0;
+    HireSpecOption const* options = HireSpecOptions(classId, count);
+    if (!options)
+        return -1;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        std::string const path = options[i].pathName;
+        if (path.compare(0, word.size(), word) == 0 || word.find(path) != std::string::npos ||
+            (word.size() >= 4 && word.compare(0, 4, path, 0, 4) == 0))
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Shaman Enhancement (Tank) needs the level-10 taunt (Earthshaker Slam): the
+// gossip spec menu hides the row below that level instead of hiring a tank
+// that cannot taunt (issue #1125). Pure: the caller passes the hirer's level
+// (the hire arrives at it) and AiPlayerbot.ShamanTankEnabled. Every other
+// option is always offered.
+inline bool HireSpecOffered(uint8_t classId, int specIndex, uint32_t hirerLevel, bool shamanTankEnabled)
+{
+    if (classId == kHireClassShaman && specIndex == 3)
+        return shamanTankEnabled && hirerLevel >= 10;
+    return true;
+}
+
+// The shaman tank role is the 7.3 build alone. With AiPlayerbot.ShamanTankEnabled
+// off, no shaman may be hired into the tank role by any path: recruiter, `.bot
+// hire`, raid roster or raid preset. Existing tanks keep their kit (issue #1125).
+inline bool ShamanTankRoleOffered(uint8_t classId, uint8_t role, bool shamanTankEnabled)
+{
+    return shamanTankEnabled || classId != kHireClassShaman || role != kHireRoleTank;
 }
 
 // Post-provision check: does the build that was applied honour the request?

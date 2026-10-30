@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>TortoiseBots — Server & Bot Observability</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=9">
+  <link rel="stylesheet" href="/static/css/app.css?v=13">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%232ea043%22 stroke-width=%222%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22><polygon points=%2212 2 2 7 12 12 22 7 12 2%22/><polyline points=%222 17 12 22 22 17%22/><polyline points=%222 12 12 17 22 12%22/></svg>">
 </head>
 <body>
@@ -41,7 +41,29 @@
         <span>Map</span>
       </a>
 
+      <a class="menu-item" data-tab="dungeons" href="#/dungeons" title="Live view of every dungeon or raid copy that has bots in it">
+        <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 21h18"/><path d="M5 21V8l4-4 2 3 3-5 3 5 2-3v17"/><path d="M9 21v-4h6v4"/></svg>
+        <span>Dungeons</span>
+      </a>
+
+      <a class="menu-item" data-tab="agentmaps" href="#/agent-maps" style="display: none;" title="turtle-agent run maps (SVG and single-file HTML replays) from the folder the daemon was given">
+        <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 20l-5.5 2V6L9 4l6 2 5.5-2v16L15 22l-6-2z"/><line x1="9" y1="4" x2="9" y2="20"/><line x1="15" y1="6" x2="15" y2="22"/></svg>
+        <span>Agent maps</span>
+      </a>
+
+      <a class="menu-item" data-tab="commanders" href="#/commanders" style="display: none;" title="Remote commanders: the bots each one leads, where they are and the orders it gave">
+        <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 22V4"/><path d="M4 4h12l-2 4 2 4H4"/><circle cx="19" cy="19" r="2"/></svg>
+        <span>Commanders</span>
+        <span class="menu-badges">
+          <span id="commanders-count" class="badge badge-info" style="display: none;">0</span>
+        </span>
+      </a>
+
       <div class="menu-category">Insight</div>
+      <a class="menu-item" data-tab="dungeon-runs" href="#/dungeon-runs" title="Dungeon runs: success rate, clear times, boss kill times and where the party wiped (run trace summaries)">
+        <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 21V10a9 9 0 0 1 18 0v11"/><path d="M9 21v-6a3 3 0 0 1 6 0v6"/><line x1="2" y1="21" x2="22" y2="21"/></svg>
+        <span>Dungeon runs</span>
+      </a>
       <a class="menu-item" data-tab="progress" href="#/progress" title="Levelling speed, XP and gear behind level">
         <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
         <span>Progress</span>
@@ -49,6 +71,10 @@
       <a class="menu-item" data-tab="activity" href="#/activity" title="Quests, kills, loot, money and the live event stream">
         <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         <span>Activity</span>
+      </a>
+      <a class="menu-item" data-tab="auctions" href="#/auctions" title="What is on the auction house right now (view only)">
+        <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 13l-7.5 7.5a2.12 2.12 0 0 1-3-3L11 10"/><path d="M16 16l6-6"/><path d="M8 8l6-6"/><path d="M9 7l8 8"/><path d="M21 11l-8-8"/></svg>
+        <span>Auction House</span>
       </a>
 
       <div class="menu-category">Operations</div>
@@ -67,7 +93,7 @@
 
     <div class="sidebar-footer">
       <a href="/metrics" target="_blank" class="footer-link" title="Prometheus metrics endpoint">Prometheus ↗</a>
-      <a href="/api/v1/auth/logout" class="footer-link">Logout</a>
+      <button type="button" id="logoutBtn" class="footer-link">Logout</button>
     </div>
   </aside>
 
@@ -100,20 +126,33 @@
           <span id="status-dot" class="status-dot"></span>
           <span id="status-label">offline · <strong id="top-bots-val">0</strong> bots · <strong id="players-val">0</strong> players</span>
         </div>
+        <button type="button" class="refresh-badge" data-refresh-badge hidden title="The live views are frozen. Click to resume at the default rate (or pick a rate)">Paused &middot; click to resume</button>
+        <label class="refresh-picker" title="How often the live views (roster, maps, Commanders) show new data. The game server still reports every 2 s; this only changes what this page shows. Kept in this browser.">
+          <span>Refresh every</span>
+          <select data-refresh-select aria-label="Refresh every"></select>
+        </label>
         <button id="refresh-btn" class="btn btn-icon" title="Reload data from the daemon">Refresh</button>
       </div>
     </header>
+
+    <!-- Shown only while the numbers below are not live (server down, stale, dashboard unreachable). -->
+    <div id="health-banner" class="health-banner" role="alert" hidden></div>
 
     <!-- Page Content -->
     <div class="content-area">
 
       <!-- TAB: OVERVIEW — is everything running? -->
       <section id="tab-overview" class="tab-view">
+        <!-- Glance panel: the last run of each dungeon. Off by default, one toggle, kept in this browser. -->
+        <div class="dg-glance-bar">
+          <label class="dg-filter" title="Show the last run of each dungeon (result, time, difference to the best). Read from the run trace summaries."><input type="checkbox" id="dg-glance-toggle"> Dungeon runs</label>
+          <div id="dg-glance" class="dg-glance" hidden></div>
+        </div>
         <div class="kpi-row">
-          <div class="kpi" title="World update tick time for the most recent loop. ~50 ms is the normal 20 Hz cadence; sustained values above 100 ms indicate lag.">
-            <div class="kpi-label">World tick</div>
+          <div class="kpi" title="How long the server takes to react to a player's action (cast, move, loot), last 30 s: 95 % of actions are handled faster than this. Players feel their own ping on top; the in-game latency meter shows only the ping. Green under 100 ms, red over 150 ms.">
+            <div class="kpi-label">Player lag (p95)</div>
             <div id="metric-tick" class="kpi-value">–</div>
-            <div class="kpi-sub">nominal 50 ms</div>
+            <div class="kpi-sub" id="metric-tick-avg">median – · worst –</div>
           </div>
           <div class="kpi">
             <div class="kpi-label">Bots online</div>
@@ -130,6 +169,11 @@
             <div id="snapshot-age-val" class="kpi-value">–</div>
             <div class="kpi-sub">live &lt; 6 s</div>
           </div>
+          <a class="kpi kpi-link" id="kpi-pvp" href="#/roster" title="Bots taking part in PvP: inside a battleground (count per battleground below) plus bots waiting in a battleground queue. Click to list them.">
+            <div class="kpi-label">In PvP</div>
+            <div id="metric-pvp" class="kpi-value">0</div>
+            <div class="kpi-sub" id="metric-pvp-sub">0 queued</div>
+          </a>
           <a class="kpi kpi-link" href="#/issues" title="Active issue episodes. Red = at least one running 10+ minutes.">
             <div class="kpi-label">Active issues</div>
             <div id="metric-issues" class="kpi-value">0</div>
@@ -150,7 +194,7 @@
           </div>
           <div class="card chart-card">
             <div class="card-head">
-              <h2 class="card-title">World tick <span class="card-hint">last 10 min</span></h2>
+              <h2 class="card-title" title="Server-side delay before a player's action is handled. Orange: 95th percentile, blue: median. Dashed lines: 100 ms (good) and 150 ms (players notice). Add the player's ping.">Player lag <span class="card-hint">last 10 min</span></h2>
               <span id="tick-now" class="mono card-hint">–</span>
             </div>
             <div class="chart-box"><canvas id="tick-chart"></canvas></div>
@@ -182,11 +226,16 @@
       <section id="tab-roster" class="tab-view" style="display: none;">
         <div class="card toolbar-card">
           <div class="toolbar">
-            <input type="text" id="bot-search" placeholder="Filter by name, class or spec…" class="input grow" autocomplete="off">
+            <input type="text" id="bot-search" placeholder="Name, class or spec — or fields: lvl:50-60 ilvl:>40 zone:tanaris guild:knights gold:<10" title="Words match name, class or spec. Fields filter any column: lvl:50-60, ilvl:>=40, gold:<10, hp:<30, xp:>90, kills:>100, deaths:0, zone:barrens, guild:knights, target:wolf, state:stalled. Numbers take N, A-B, >N, >=N, <N, <=N; all terms must match." class="input grow" autocomplete="off">
             <div class="seg" id="bots-presence" role="group" aria-label="Show bots">
               <button class="seg-btn active" data-v="all">All</button>
               <button class="seg-btn" data-v="online">Online</button>
               <button class="seg-btn" data-v="offline">Offline</button>
+            </div>
+            <div class="seg" id="bots-kind" role="group" aria-label="Bots or players">
+              <button class="seg-btn active" data-v="all">Bots + players</button>
+              <button class="seg-btn" data-v="bot">Bots</button>
+              <button class="seg-btn" data-v="player">Players</button>
             </div>
             <div class="seg" id="bots-view" role="group" aria-label="Columns">
               <button class="seg-btn active" data-v="live" title="Status, health, target and zone">Live</button>
@@ -195,7 +244,9 @@
             </div>
           </div>
           <div class="chip-row" id="state-chips" aria-label="Filter by state"></div>
+          <div class="chip-row" id="kind-chips" aria-label="Filter by kind"></div>
           <div class="chip-row" id="class-chips" aria-label="Filter by class"></div>
+          <div class="chip-row" id="spec-chips" aria-label="Filter by spec"></div>
         </div>
 
         <div class="card table-card">
@@ -210,6 +261,59 @@
                 <tr><td colspan="9" class="table-empty">Loading bots…</td></tr>
               </tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: AUCTIONS — read-only auction house view -->
+      <section id="tab-auctions" class="tab-view" style="display: none;">
+        <div class="kpi-row" id="ah-summary"></div>
+
+        <div class="card toolbar-card">
+          <div class="toolbar">
+            <input type="text" id="ah-search" placeholder="Item name…" class="input grow" autocomplete="off">
+            <select id="ah-quality" class="input" title="Minimum quality">
+              <option value="">Any quality</option>
+              <option value="1">Common+</option>
+              <option value="2">Uncommon+</option>
+              <option value="3">Rare+</option>
+              <option value="4">Epic+</option>
+            </select>
+            <input type="number" id="ah-min-level" class="input input-num" placeholder="Min lvl" min="0" max="60" title="Minimum required level">
+            <input type="number" id="ah-max-level" class="input input-num" placeholder="Max lvl" min="0" max="60" title="Maximum required level">
+            <input type="text" id="ah-seller" placeholder="Seller…" class="input" autocomplete="off">
+            <div class="seg" id="ah-kind" role="group" aria-label="Seller">
+              <button class="seg-btn active" data-v="">All</button>
+              <button class="seg-btn" data-v="bot">Bots</button>
+              <button class="seg-btn" data-v="player">Players</button>
+            </div>
+            <div class="seg" id="ah-house" role="group" aria-label="Auction house" style="display: none;">
+              <button class="seg-btn active" data-v="">All houses</button>
+              <button class="seg-btn" data-v="alliance">Alliance</button>
+              <button class="seg-btn" data-v="horde">Horde</button>
+              <button class="seg-btn" data-v="neutral">Neutral</button>
+            </div>
+            <button class="btn" id="ah-refresh" title="Reload the auction house from the database">Refresh</button>
+          </div>
+        </div>
+
+        <div class="card table-card">
+          <div class="card-head">
+            <h2 class="card-title"><span id="ah-count">Auctions</span></h2>
+            <span class="card-hint">View only · read from the database, may trail the game by a few seconds</span>
+          </div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead id="ah-head"></thead>
+              <tbody id="ah-body">
+                <tr><td colspan="7" class="table-empty">Loading auctions…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="toolbar" id="ah-pager">
+            <button class="btn" id="ah-prev">‹ Prev</button>
+            <span id="ah-page" class="cell-muted"></span>
+            <button class="btn" id="ah-next">Next ›</button>
           </div>
         </div>
       </section>
@@ -252,6 +356,7 @@
               <img class="map-img" id="world-img" src="/maps/azeroth.webp" alt="Continent Map">
               <canvas id="world-canvas" class="map-overlay" style="pointer-events: none;"></canvas>
               <div id="world-overlay" class="map-overlay"></div>
+              <div id="world-noart" class="zone-noart" style="display: none;"></div>
             </div>
             <div id="world-offmap" class="map-note"></div>
           </div>
@@ -312,6 +417,7 @@
             <div class="seg" id="feed-seg" role="group" aria-label="Event feed">
               <button class="seg-btn active" data-v="quests">Quests</button>
               <button class="seg-btn" data-v="loot">Loot &amp; money</button>
+              <button class="seg-btn" data-v="pvp">World PvP</button>
               <button class="seg-btn" data-v="console">Live console</button>
             </div>
             <div class="feed-filters" data-feed="quests">
@@ -328,8 +434,10 @@
               <input type="number" id="loot-min-level" class="input input-num" placeholder="Min level" min="1" max="60">
               <input type="text" id="loot-bot-search" placeholder="Bot name…" class="input">
             </div>
+            <div class="feed-filters" data-feed="pvp" hidden>
+              <input type="text" id="pvp-bot-search" placeholder="Bot name…" class="input">
+            </div>
           </div>
-
           <div class="feed-pane" data-feed="quests">
             <div class="table-container scroll-y">
               <table class="data-table">
@@ -352,6 +460,17 @@
             </div>
           </div>
 
+          <div class="feed-pane" data-feed="pvp" hidden>
+            <div class="table-container scroll-y">
+              <table class="data-table">
+                <thead><tr><th>Time</th><th>Bot</th><th>Class / level</th><th>Event</th><th>Other side</th><th>Zone</th></tr></thead>
+                <tbody id="pvp-table-body">
+                  <tr><td colspan="6" class="table-empty">Loading world PvP events...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <div class="feed-pane" data-feed="console" hidden>
             <div class="console-container">
               <div class="console-header">
@@ -364,6 +483,114 @@
             </div>
           </div>
         </div>
+      </section>
+
+      <!-- TAB: DUNGEON RUNS — how do the dungeon runs go: success rate, clear and boss times, wipes (run trace summaries) -->
+      <section id="tab-dungeon-runs" class="tab-view" style="display: none;">
+        <div id="dg-root"></div>
+      </section>
+
+      <!-- TAB: DUNGEONS — every live instance copy (dungeon or raid) that has bots in it, one run per copy (issue #895) -->
+      <section id="tab-dungeons" class="tab-view" style="display: none;">
+        <div id="dgn-empty" class="card cmd-empty">
+          <h2 class="cmd-empty-title">No dungeon run right now</h2>
+          <p class="empty-hint">A run appears here within a couple of seconds of a bot entering an instance (a dungeon or raid copy; bots enter with a real player today, alt-bots may enter alone). Two groups in the same dungeon are two runs, each with its own live map. Read-only: this tab shows, it never orders.</p>
+        </div>
+        <div id="dgn-stale" class="card cmd-empty" style="display: none;">
+          <p class="empty-hint">The game server runs an older module that reports no instance id, so all copies of one dungeon appear as one run per map. Update the module to tell copies apart.</p>
+        </div>
+        <!-- The list of runs -->
+        <div id="dgn-list" class="card"></div>
+        <!-- The live view of one run: back link, header and the Commanders map card -->
+        <div id="dgn-view" style="display: none;">
+          <div class="card dgn-head">
+            <button type="button" id="dgn-back" class="btn" title="Back to the list of runs">&larr; All runs</button>
+            <h2 id="dgn-run-title"></h2>
+            <div id="dgn-run-sub" class="muted"></div>
+          </div>
+          <div id="dgn-card"></div>
+        </div>
+      </section>
+
+      <!-- TAB: AGENT MAPS — turtle-agent run maps from --agent-maps-dir, read-only and off unless the folder is set (issue #1102) -->
+      <section id="tab-agentmaps" class="tab-view" style="display: none;">
+        <div id="am-off" class="card cmd-empty" style="display: none;">
+          <h2 class="cmd-empty-title">Agent maps are off</h2>
+          <p class="empty-hint">Start the daemon with <code>--agent-maps-dir DIR</code> (or <code>TBDASH_AGENT_MAPS_DIR=DIR</code>), pointing at the folder <code>turtle-agent map</code> writes its <code>.svg</code> maps and single-file <code>.html</code> replays into. The tab then lists that folder read-only; nothing is uploaded, written or deleted.</p>
+        </div>
+        <div id="am-list-card" class="card table-card" style="display: none;">
+          <div class="card-head">
+            <h2 class="card-title">Run maps <span class="card-hint" id="am-count"></span></h2>
+            <button type="button" id="am-refresh" class="btn" title="Read the folder again">Refresh</button>
+          </div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead><tr><th>Map</th><th>Type</th><th>Size</th><th>Modified</th></tr></thead>
+              <tbody id="am-rows">
+                <tr><td colspan="4" class="table-empty">Loading run maps…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="empty-hint" id="am-note"></p>
+        </div>
+        <div id="am-viewer" style="display: none;">
+          <div class="card dgn-head">
+            <button type="button" id="am-back" class="btn" title="Back to the list of run maps">&larr; All maps</button>
+            <h2 id="am-title"></h2>
+            <div id="am-meta" class="muted"></div>
+          </div>
+          <div class="card">
+            <iframe id="am-frame" class="cmd-frame" title="Agent run map" referrerpolicy="no-referrer" sandbox=""></iframe>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: COMMANDERS — who leads which bots, and what did they order -->
+      <section id="tab-commanders" class="tab-view" style="display: none;">
+        <div class="kpi-row">
+          <div class="kpi"><div class="kpi-label">Commanders</div><div id="cmd-kpi-bindings" class="kpi-value">0</div><div class="kpi-sub">with a standing binding</div></div>
+          <div class="kpi"><div class="kpi-label">Bound bots</div><div id="cmd-kpi-bots" class="kpi-value">0</div><div class="kpi-sub" id="cmd-kpi-bots-sub">&nbsp;</div></div>
+          <div class="kpi"><div class="kpi-label">Down</div><div id="cmd-kpi-dead" class="kpi-value kpi-red">0</div><div class="kpi-sub">dead bound bots</div></div>
+          <div class="kpi"><div class="kpi-label">Report</div><div id="cmd-kpi-age" class="kpi-value">&ndash;</div><div class="kpi-sub">from the game server</div></div>
+        </div>
+        <div id="cmd-empty" class="card cmd-empty">
+          <h2 class="cmd-empty-title">No commander is bound right now</h2>
+          <p id="cmd-empty-why" class="empty-hint"></p>
+          <p class="empty-hint">A card appears here within a couple of seconds of a binding. A commander binds a bot-only party of up to five with <code>.bot commander bind &lt;LeadBot&gt; [&lt;Bot&gt; ...]</code> (a GM, or a player who controls every bot of the party; the server needs <code>AiPlayerbot.RemoteCommander = 1</code>). The card goes away when the commander unbinds with <code>.bot commander unbind</code>, logs out, or the party breaks up.</p>
+        </div>
+        <!-- Refresh rate: the same choice as in the top bar (one setting for every live view, kept in this browser). -->
+        <div class="card cmd-refresh-bar">
+          <label class="refresh-picker">
+            <span>Refresh every</span>
+            <select data-refresh-select aria-label="Refresh every"></select>
+          </label>
+          <button type="button" class="refresh-badge" data-refresh-badge hidden title="Frozen for a close look. Click to resume">Paused &middot; click to resume</button>
+          <span class="empty-hint">How often the maps and cards show new data. Paused freezes them, paths included; on resume they catch up to the newest data. The game server reports every 2 s either way.</span>
+        </div>
+        <!-- Demo map: a simulated group on its own card to try every drawing layer. Off by default; also #/commanders?demo=1. -->
+        <div class="card cmd-demo-bar">
+          <label class="cmd-demo-switch" title="Show an extra card with a made-up group (nothing comes from the game server) so every map layer can be tried">
+            <input type="checkbox" id="cmd-demo"><span>Demo map</span>
+          </label>
+          <span class="empty-hint">Simulated group on Uldaman, to try all the drawings. Never mixed with real commanders.</span>
+          <span id="cmd-demo-note" class="cmd-demo-note" hidden>
+            <button type="button" id="cmd-demo-all" class="btn" title="Switch every map layer on for this page (not saved)">Turn every layer on</button>
+          </span>
+        </div>
+        <!-- What the maps draw: one choice for every map on the page, kept in this browser. -->
+        <details id="cmd-layers" class="card cmd-layers">
+          <summary>Map layers</summary>
+          <p class="empty-hint">One choice for all the maps below, kept in this browser. A greyed layer has no data on any map right now; its reason is next to it.</p>
+          <div id="cmd-layers-body" class="cmd-layers-body"></div>
+          <button type="button" id="cmd-layers-reset" class="btn">Reset to defaults</button>
+        </details>
+        <div id="cmd-list"></div>
+        <!-- Only present when the operator set TBDASH_COMMANDER_URL; the frame is not loaded until it is opened. -->
+        <details id="cmd-external" class="card cmd-external" hidden>
+          <summary>Open the agent's live map</summary>
+          <p class="empty-hint"><a id="cmd-external-link" class="card-link" target="_blank" rel="noopener noreferrer">Open it in its own tab</a> for the full map, or look at it here. If the frame stays blank, the other dashboard refused to be framed from this address: use the link.</p>
+          <iframe id="cmd-external-frame" class="cmd-frame" title="Commander dashboard" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
+        </details>
       </section>
 
       <!-- TAB: ISSUES — what is broken -->
@@ -483,6 +710,7 @@
       </div>
       <div class="profile-actions">
         <span id="armory-online" class="badge badge-success">Online</span>
+        <span id="armory-kind" class="badge badge-info" style="display: none;">Bot</span>
         <button class="btn" id="armory-map-btn" title="Open the map on this bot">Show on map</button>
         <button id="close-profile" class="close-btn" aria-label="Close profile">&times;</button>
       </div>
@@ -554,6 +782,15 @@
 
 </div>
 
-<script src="/static/js/app.js?v=9"></script>
+<script src="/static/js/refresh.js?v=1"></script>
+<script src="/static/js/commanders.js?v=8"></script>
+<script src="/static/js/dungeons.js?v=2"></script>
+<script src="/static/js/agentmaps.js?v=1"></script>
+<script src="/static/js/maplayers.js?v=7"></script>
+<script src="/static/js/unitinfo.js?v=2"></script>
+<script src="/static/js/paths.js?v=2"></script>
+<script src="/static/js/dungeon-runs.js?v=1"></script>
+<script src="/static/js/demo.js?v=2"></script>
+<script src="/static/js/app.js?v=22"></script>
 </body>
 </html>

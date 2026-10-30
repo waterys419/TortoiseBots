@@ -5,10 +5,25 @@
 #include "MovementActions.h"
 #include "GenericActions.h"
 #include "playerbot/TravelMgr.h"
+#include "playerbot/policy/travel/TravelPickSlicePolicy.h"
+
+#include <chrono>
+#include <map>
+#include <unordered_map>
+#include <utility>
 
 namespace ai
 {
     const std::vector<uint32> travelPartitions = { 100, 250, 500, 1000, 2000, 3000, 4000, 5000, 6000, 10000, 50000, 100000, 500000 };
+    // The pool pick's shared route verdict: waypoints plus the legs between
+    // them, hostile-town cells, area levels, cross-continent transfers. Kept
+    // in this TU so its five-minute per-candidate cache stays in one place;
+    // the ordered town-errand window reuses it instead of re-implementing it.
+    // `avoidTownsOverride`: -1 follows the pool rule (masterless pool bots
+    // only); 0/1 forces the town gate off/on. Downtime bots have a real
+    // master yet walk alone, so the window passes 1.
+    bool SharedRouteIsSurvivable(Player* bot, WorldPosition* position, std::string& blocker,
+        int avoidTownsOverride = -1);
 
     // A companion standing inside a dungeon or raid must not run autonomous
     // travel selection (issue #388): a real player master bypasses activity
@@ -31,6 +46,18 @@ namespace ai
         virtual bool Execute(Event& event) override;
         virtual bool isUseful() override;
         static void ReportTravelTarget(Player* bot, Player* requester, TravelTarget* newTarget, TravelTarget* oldTarget);
+    public:
+        // Resume scan state for one bot's pick. Lives in the caller's resume
+        // store (ChooseTravelTargetAction.cpp), not in the action: actions
+        // are re-created per execution while the pick spans visits.
+        struct TravelPickScan
+        {
+            ai::TravelPickCursor cursor;
+            std::unordered_map<TravelDestination*, bool> isActive;
+            std::map<std::pair<TravelDestination*, WorldPosition*>, uint8_t> verdicts;
+            std::map<uint32_t, bool> partitionSkipRolled;
+            std::map<std::string, uint32> rejects;
+        };
     protected:
         // Checks shared by every travel-target action (activity, movement,
         // no active target). isUseful adds the prepared-request check.
@@ -38,6 +65,19 @@ namespace ai
         void setNewTarget(Player* requester, TravelTarget* newTarget, TravelTarget* oldTarget);
 
         bool SetBestTarget(Player* requester, TravelTarget* target, PartitionedTravelList& travelPartitions, bool onlyActive = true);
+        // Sliced pick (issue #642): same scan as SetBestTarget, but stops at
+        // the per-visit deadline and resumes from scan.cursor on the next
+        // visit. scan persists per bot in the caller's resume store; verdicts
+        // let a resumed visit skip already-rejected candidates without
+        // re-running their gates. Returns Found (target set), NotFound
+        // (list exhausted), or Yielded (deadline hit, resume next visit).
+        // The candidate order is never re-sorted, so a resumed pick accepts
+        // the same target as an uninterrupted scan.
+        ai::TravelPickOutcome SetBestTargetSliced(Player* requester, TravelTarget* target,
+            PartitionedTravelList& travelPartitions, bool onlyActive, TravelPickScan& scan,
+            uint64_t budgetUs, std::chrono::steady_clock::time_point visitStart);
+        // Why the last SetBestTarget refused every point ("inactive=4,area=2"), for the TravelSearchEmpty row.
+        std::string lastRejectReasons;
     public:
         static DestinationList FindDestination(PlayerTravelInfo info, std::string name, bool zones = true, bool npcs = true, bool quests = true, bool mobs = true, bool bosses = true, bool gather = true);
     private:

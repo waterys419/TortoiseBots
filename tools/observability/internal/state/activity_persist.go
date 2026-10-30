@@ -13,10 +13,9 @@ import (
 // dashboard came up". The daemon snapshots the rollup to one small JSON file
 // every minute (see cmd/server) and restores it at startup.
 //
-// The file is keyed by the game-server session: counters only continue when
-// the same server process is still running. A different session means a
-// restarted game server, whose pool starts from zero anyway, so the first
-// datagram drops the restored state via beginSessionLocked.
+// The counters are cumulative: they continue across a dashboard restart and
+// across a game-server restart (a new session only re-anchors money tracking
+// in beginSessionLocked), so the file is restored whatever session it names.
 const activityStateVersion = 1
 
 type persistedActivity struct {
@@ -119,7 +118,7 @@ func (s *Store) RestoreActivity(path string) (int, error) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return 0, err
 	}
-	if snap.V != activityStateVersion || snap.Session == 0 {
+	if snap.V != activityStateVersion {
 		return 0, nil
 	}
 
@@ -134,7 +133,7 @@ func (s *Store) RestoreActivity(path string) (int, error) {
 			class:     b.Class,
 			level:     b.Level,
 			lastMoney: b.LastMoney,
-			hasMoney:  b.HasMoney,
+			hasMoney:  false, // re-anchor on first live event
 			lastLevel: b.LastLevel,
 			openQuest: make(map[uint32]bool, len(b.OpenQuests)),
 		}

@@ -23,7 +23,12 @@ public:
 private:
     ACTION_NODE_A(aimed_shot, "aimed shot", "arcane shot");
 
-    ACTION_NODE_A(rapid_fire, "rapid fire", "readiness");
+    // No alternative: on 1.12 Readiness resets Deterrence, Feign Death and Trap,
+    // not Rapid Fire, so casting it while Rapid Fire is down only spends it.
+    static ActionNode* rapid_fire([[maybe_unused]] PlayerbotAI* botAI)
+    {
+        return new ActionNode("rapid fire", /*P*/ NULL, /*A*/ NULL, /*C*/ NULL);
+    }
 
     ACTION_NODE_A(aspect_of_the_pack, "aspect of the pack", "aspect of the cheetah");
 
@@ -65,9 +70,26 @@ void HunterStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     // may switch still gets its melee switch first; this step-back covers the
     // cases the switch leaves alone (target immobilized or too slow to close, or
     // no melee weapon), keeping the hunter from standing inside the dead zone.
+    // Mob on the hunter only; a pet- or tank-held mob gets the row below.
     triggers.push_back(new TriggerNode(
         "enemy too close for auto shot",
         NextAction::array(0, new NextAction("flee", static_cast<float>(ACTION_MOVE) - 1.0f), NULL)));
+
+    // Threat drop: the mob fought is on the hunter (or climbing to it) in
+    // melee reach. Disengage wipes the hunter off its threat list so the
+    // tank can take it back; it never moves the hunter, so it is no escape.
+    // Below the feign row: the full feign drop outranks it when threat is
+    // already medium.
+    triggers.push_back(new TriggerNode(
+        "disengage on attacker",
+        NextAction::array(0, new NextAction("disengage", static_cast<float>(ACTION_HIGH) - 1.0f), NULL)));
+
+    // Pet- or tank-held mob inside the dead zone: one step out per mob
+    // (HunterSwitchPolicy.h), then shots. If the step cannot get the hunter
+    // out, "switch to melee" takes over instead of fleeing again.
+    triggers.push_back(new TriggerNode(
+        "hunter dead zone step out",
+        NextAction::array(0, new NextAction("hunter step out", ACTION_MOVE), NULL)));
 
     triggers.push_back(new TriggerNode(
         "counterattack",
@@ -92,25 +114,53 @@ void HunterStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "aimed shot",
         NextAction::array(0, new NextAction("aimed shot", ACTION_NORMAL + 2), NULL)));
 
-    // Distracting shot: peel a peeling target back onto the hunter when the
-    // bot is losing it. "medium threat" fires when the bot trails the tank
-    // but still holds measurable threat; usefulness stays with the mature
-    // action (ammo + spell state).
+    // Medium threat means the bot is climbing toward the top of the threat
+    // table without holding aggro - exactly when a hunter should drop combat
+    // (mod-playerbots GenericHunterStrategy fires feign death 35 here). The
+    // old distracting-shot taunt pulled the mob back harder; feign threat
+    // stands the bot back up via the raid action node.
     triggers.push_back(new TriggerNode(
         "medium threat",
-        NextAction::array(0, new NextAction("distracting shot", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("feign death threat", ACTION_HIGH), NULL)));
 
     triggers.push_back(new TriggerNode(
         "arcane shot",
         NextAction::array(0, new NextAction("arcane shot", ACTION_NORMAL + 1), NULL)));
 
+    // [Turtle] Steady Shot filler: below aimed/arcane/multi, above the
+    // idle auto shot. The trigger only fires inside the Auto Shot window.
     triggers.push_back(new TriggerNode(
-        "enemy is close",
-        NextAction::array(0, new NextAction("raptor strike", ACTION_NORMAL + 1), NULL)));
+        "steady shot",
+        NextAction::array(0, new NextAction("steady shot", ACTION_NORMAL - 1), NULL)));
 
+    // With 2 or more mobs on the hunter, Wing Clip the nearest and step out
+    // of melee range instead of standing in the pack (HunterKitePolicy.h).
+    // Above the switch and melee-chain rows: while the trigger holds, the
+    // kite owns the fight; once the hunter is past the engage edge the plain
+    // ranged kit resumes.
+    triggers.push_back(new TriggerNode(
+        "hunter multiple attackers",
+        NextAction::array(0, new NextAction("wing clip on attacker", static_cast<float>(ACTION_MOVE) + 1.0f),
+                             new NextAction("hunter kite step out", static_cast<float>(ACTION_MOVE) + 0.5f), NULL)));
+
+    // Raptor Strike / Mongoose Bite / Wing Clip row (donor melee chain): when a
+    // mob closes in, raptor stays first, mongoose bite follows when raptor is
+    // not castable (no dodge requirement on Turtle), and wing clip slows the
+    // mob so the hunter keeps range. In the ranged kit only for a mob on the
+    // hunter: a pet- or tank-held mob gets the dead-zone step-back and shots
+    // instead (HunterEnemyIsCloseTrigger).
+    triggers.push_back(new TriggerNode(
+        "hunter enemy is close",
+        NextAction::array(0, new NextAction("raptor strike", ACTION_NORMAL + 1),
+                             new NextAction("mongoose bite", ACTION_NORMAL + 0.5f),
+                             new NextAction("wing clip", ACTION_NORMAL), NULL)));
+
+    // PET-5: last resort below the HunterPetStrategy "call pet" node — the
+    // engine falls through to this only when Call Pet is impossible
+    // (unknown, on cooldown). Instant call strictly dominates the 20s tame.
     triggers.push_back(new TriggerNode(
         "no pet",
-        NextAction::array(0, new NextAction("tame beast", ACTION_EMERGENCY), NULL)));
+        NextAction::array(0, new NextAction("tame beast", ACTION_NORMAL), NULL)));
 }
 
 void HunterStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -122,15 +172,21 @@ void HunterStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
         NextAction::array(0, new NextAction("flare", ACTION_NORMAL + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
+        "low ammo",
+        NextAction::array(0, new NextAction("say::low ammo", ACTION_NORMAL), NULL)));
+
+    triggers.push_back(new TriggerNode(
         "no ammo",
     NextAction::array(0,
         new NextAction("equip ammo", ACTION_EMERGENCY),
         new NextAction("say::no ammo", ACTION_NORMAL),
         NULL)));
 
+    // PET-5: same last-resort demotion as the combat node above — the
+    // HunterPetStrategy "call pet" (NORMAL+2) node wins wherever castable.
     triggers.push_back(new TriggerNode(
         "no pet",
-        NextAction::array(0, new NextAction("tame beast", ACTION_EMERGENCY), NULL)));
+        NextAction::array(0, new NextAction("tame beast", ACTION_NORMAL), NULL)));
 }
 
 void HunterStrategy::InitReactionTriggers(std::list<TriggerNode*>& triggers)
@@ -228,6 +284,11 @@ void HunterAoeStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "ranged medium aoe",
         NextAction::array(0, new NextAction("volley", ACTION_HIGH + 3), NULL)));
+
+    // Volley is a channel: stop it once the pack is gone (warlock Rain of Fire model).
+    triggers.push_back(new TriggerNode(
+        "volley channel check",
+        NextAction::array(0, new NextAction("cancel channel", ACTION_HIGH + 3), NULL)));
 
     triggers.push_back(new TriggerNode(
         "multi-shot",
@@ -483,6 +544,16 @@ void HunterStingRaidStrategy::InitCombatTriggers(std::list<TriggerNode*>& trigge
 
 void HunterAspectStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
 {
+    // Opt-in (AiPlayerbot.HunterViperOnLowMana): Viper on low mana, above the
+    // Hawk row; the Hawk trigger holds back until mana recovers. Row only
+    // exists with the toggle on, so off is today's behaviour exactly.
+    if (sPlayerbotAIConfig.hunterViperOnLowMana)
+    {
+        triggers.push_back(new TriggerNode(
+            "aspect of the viper low mana",
+            NextAction::array(0, new NextAction("aspect of the viper", ACTION_HIGH + 6), NULL)));
+    }
+
     triggers.push_back(new TriggerNode(
         "aspect of the hawk",
         NextAction::array(0, new NextAction("aspect of the hawk", ACTION_HIGH + 5), NULL)));
@@ -572,9 +643,33 @@ void HunterPetStrategy::InitCombatTriggers(std::list<TriggerNode*>& triggers)
         "pet attack",
         NextAction::array(0, new NextAction("pet attack", ACTION_HIGH + 2), NULL)));
 
+    // Mend Pet is a channel in 1.12/Turtle (spell 136 attributesEx 0x4),
+    // not the donor's instant WotLK heal-over-time, so every in-combat mend
+    // stops the shots. In combat only the low band (<40) mends, and below
+    // the rotation shots (NORMAL+1..+6) but above auto shot. The medium band
+    // tops the pet up out of combat only (InitNonCombatTriggers).
     triggers.push_back(new TriggerNode(
         "hunters pet low health",
-        NextAction::array(0, new NextAction("mend pet", ACTION_HIGH), NULL)));
+        NextAction::array(0, new NextAction("mend pet", ACTION_NORMAL), NULL)));
+
+    // PET-8b: the trigger already requires taunts stood down (grouped with
+    // a real tank), so this only fires when the pet stole aggro anyway.
+    // Urgent like mend: a pet tanking in a dungeon needs dropping now, not
+    // after the DPS rotation.
+    triggers.push_back(new TriggerNode(
+        "pet has aggro",
+        NextAction::array(0, new NextAction("cower", ACTION_HIGH), NULL)));
+
+    // PET-5: mid-fight recovery. Call Pet is near-instant and safe to try
+    // whenever petless; Revive is a 10s channel so it only fires with no
+    // attackers on the bot (checked inside the trigger).
+    triggers.push_back(new TriggerNode(
+        "no pet",
+        NextAction::array(0, new NextAction("call pet", ACTION_NORMAL + 1), NULL)));
+
+    triggers.push_back(new TriggerNode(
+        "safe to revive pet",
+        NextAction::array(0, new NextAction("revive pet", ACTION_NORMAL), NULL)));
 }
 
 void HunterPetStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
@@ -590,6 +685,11 @@ void HunterPetStrategy::InitNonCombatTriggers(std::list<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode(
         "hunters pet low health",
         NextAction::array(0, new NextAction("mend pet", ACTION_NORMAL + 1), NULL)));
+
+    // PET-4: medium band below the low node so low wins under 40.
+    triggers.push_back(new TriggerNode(
+        "hunters pet medium health",
+        NextAction::array(0, new NextAction("mend pet", ACTION_NORMAL), NULL)));
 
     triggers.push_back(new TriggerNode(
         "hunters pet dead",

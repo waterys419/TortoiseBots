@@ -1,10 +1,19 @@
 // pi-lens-ignore-file: all
+#include "BotCommandHandlers.h"
+#include "CommandShared.h"
 #include "BotCommands.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "../runtime/BotManager.h"
 #include "../runtime/BotActivityLease.h"
 #include "../runtime/HireLifecycle.h"
+#include "../runtime/ClaimLifecycle.h"
+#include "../runtime/AltBotPolicy.h"
+#include "../runtime/AltBotService.h"
 #include "../runtime/HireProvisionService.h"
+#include "../runtime/HireRaidPolicy.h"
+#include "../runtime/HireSpecPolicy.h"
+#include "../runtime/HireLevelPolicy.h"
+#include "../runtime/HireTierRequestPolicy.h"
 #include "BotCommandContext.h"
 #include "../behavior/PlayerConvenience.h"
 // pi-lens-ignore: clang:pp_file_not_found
@@ -17,13 +26,19 @@
 #include "../runtime/RandomBotService.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "../ai/playerbot/PlayerbotAI.h"
+#include "../ai/playerbot/RandomItemMgr.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "../ai/playerbot/PlayerbotDbStore.h"
 #include "../ai/playerbot/ChatHelper.h"
 #include "../ai/playerbot/BotState.h"
+#include "../ai/playerbot/PullOpeningPolicy.h"
+#include "../ai/playerbot/PullStartPolicy.h"
+#include "../ai/playerbot/PullRefusalPolicy.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "../ai/playerbot/strategy/generic/PullStrategy.h"
 #include "../ai/playerbot/strategy/values/RtiTargetValue.h"
+#include "../ai/playerbot/strategy/values/AttackersValue.h"
+#include "../ai/playerbot/strategy/values/PossibleAttackTargetsValue.h"
 #include "../ai/playerbot/strategy/values/PositionValue.h"
 #include "../ai/playerbot/strategy/values/ItemUsageValue.h"
 #include "../ai/playerbot/strategy/actions/EquipAction.h"
@@ -32,7 +47,23 @@
 #include "playerbot/PlayerbotFactory.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "playerbot/PlayerbotAIConfig.h"
+#include "playerbot/SurvivePolicy.h"
 #include "runtime/OwnedBotQolPolicy.h"
+#include "../runtime/PlayerAutogearPolicy.h"
+#include "../runtime/GearItemLevelCapPolicy.h"
+#include "../runtime/RemoteCommanderPolicy.h"
+#include "../ai/playerbot/AiFactory.h"
+#include "../runtime/RemoteCommanderView.h"
+#include "../runtime/RemoteCommanderTasks.h"
+#include "../runtime/RemoteCommanderEnter.h"
+#include "../runtime/CommanderTelemetry.h"
+#include "../ai/playerbot/LootObjectStack.h"
+#include "../ai/playerbot/strategy/Engine.h"
+#include "../ai/playerbot/strategy/Value.h"
+#include "../ai/playerbot/GuidPosition.h"
+#include "../host/ModuleLog.h"
+#include "../ai/playerbot/strategy/shaman/ShamanTotemCommandPolicy.h"
+#include "../ai/playerbot/strategy/shaman/ShamanTotemGroupPolicy.h"
 // pi-lens-ignore: clang:pp_file_not_found
 #include "Chat.h"
 // pi-lens-ignore: clang:pp_file_not_found
@@ -54,12 +85,34 @@
 // pi-lens-ignore: clang:pp_file_not_found
 #include "Group/Group.h"
 #include "Database/DatabaseEnv.h"
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Maps/PathFinder.h"
+#include "Movement/spline/MoveSplineInit.h"
+#include "Maps/Cell.h"
+#include "Maps/Map.h"
+#include "Database/DBCStores.h"
+#include "Database/SQLStorages.h"
+#include "Maps/CellImpl.h"
+#include "Maps/GridNotifiers.h"
+#include "Maps/GridNotifiersImpl.h"
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Creature.h"
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Spell.h"
+// pi-lens-ignore: clang:pp_file_not_found
+#include "Threat/ThreatManager.h"
+#include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <ctime>
+#include <initializer_list>
 #include <memory>
 #include <cstring>
 #include <sstream>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 // Lens fallback stubs — core headers absent in static analysis. Real build uses
@@ -122,2056 +175,12 @@ static Log sLog;
 namespace TortoiseBots {
 namespace BotCommands {
 
-static bool IsRaidTargetMark(std::string const& mark);
-static std::string CurrentCcMark(PlayerbotAI* ai);
-static bool HandleRaidAction(ChatHandler* handler, BotCommandContext const& context, Player* requester, std::string const& intent);
-static bool ExecuteInterruptAction(ChatHandler* handler, BotCommandContext const& context, Player* requester);
-
-static std::string Trim(std::string value)
-{
-    size_t first = value.find_first_not_of(" \t");
-    if (first == std::string::npos)
-        return {};
-    size_t last = value.find_last_not_of(" \t");
-    return value.substr(first, last - first + 1);
-}
-
-static Player* Requester(ChatHandler* handler)
-{
-    return handler && handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-}
-
-
-static bool ResolveOwnedBot(ChatHandler* handler, char const* args, Player*& bot, BotRecord*& record, std::string& name)
-{
-    bot = nullptr;
-    record = nullptr;
-    name = Trim(args ? args : "");
-    if (name.empty() || !normalizePlayerName(name))
-        return false;
-
-    bot = sObjectMgr.GetPlayer(name.c_str());
-    if (!bot)
-        bot = sObjectAccessor.FindPlayerByName(name.c_str());
-    if (!bot)
-        return false;
-
-    record = BotManager::Instance().FindBot(bot->GetObjectGuid());
-    if (!CanControlBot(Requester(handler), record))
-        return false;
-
-    return IsLiveHeadlessBot(bot, record);
-}
-
-static bool HandleList(ChatHandler* handler)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-
-    uint32 shown = 0;
-    for (Player* bot : BotManager::Instance().GetAllBots())
-    {
-        BotRecord* record = bot ? BotManager::Instance().FindBot(bot->GetObjectGuid()) : nullptr;
-        if (!bot || !record || !CanControlBot(requester, record))
-            continue;
-
-        ++shown;
-        handler->PSendSysMessage("%s: %s, random %u, AI %u",
-            bot->GetName(), record->enteredWorld ? "in world" : "starting",
-            record->random ? 1 : 0,
-            PlayerbotAIStorage::Instance().GetAI(bot) ? 1 : 0);
-    }
-
-    if (!shown)
-        handler->PSendSysMessage("No owned PlayerBots are online.");
-    return true;
-}
-
-static bool HandleStats(ChatHandler* handler)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-
-    uint32 total = 0;
-    uint32 random = 0;
-    uint32 withAi = 0;
-    for (Player* bot : BotManager::Instance().GetAllBots())
-    {
-        BotRecord* record = bot ? BotManager::Instance().FindBot(bot->GetObjectGuid()) : nullptr;
-        if (!bot || !record || !CanControlBot(requester, record))
-            continue;
-        ++total;
-        random += record->random ? 1 : 0;
-        withAi += PlayerbotAIStorage::Instance().GetAI(bot) ? 1 : 0;
-    }
-    handler->PSendSysMessage("Owned PlayerBots: %u online, %u random, %u with AI.", total, random, withAi);
-    return true;
-}
-
-static char const* LifecycleName(BotLifecycle lifecycle)
-{
-    switch (lifecycle)
-    {
-        case BotLifecycle::PendingAdd: return "starting";
-        case BotLifecycle::InWorld: return "in world";
-        case BotLifecycle::Removing: return "removing";
-    }
-
-    return "unknown";
-}
-
-static char const* MovementName(PlayerbotAI* ai)
-{
-    if (!ai)
-        return "unavailable";
-    if (ai->HasStrategy("follow", BotState::BOT_STATE_NON_COMBAT))
-        return "follow";
-    if (ai->HasStrategy("stay", BotState::BOT_STATE_NON_COMBAT))
-        return "stay";
-    if (ai->HasStrategy("guard", BotState::BOT_STATE_NON_COMBAT))
-        return "guard";
-    if (ai->HasStrategy("free", BotState::BOT_STATE_NON_COMBAT))
-        return "free";
-    return "custom";
-}
-
-static bool HandleStatus(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot status <online bot name> (same account only)");
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    handler->PSendSysMessage("%s: %s, AI %u, movement %s, random %u, owner %s.",
-        name.c_str(), LifecycleName(record->lifecycle), ai ? 1u : 0u,
-        MovementName(ai), record->random ? 1u : 0u,
-        record->masterGuid == requester->GetObjectGuid() ? "you" : "another player");
-    return true;
-}
-
-static bool HandleVersion(ChatHandler* handler)
-{
-    // Any player may ask; the version is public build metadata, not control.
-    handler->PSendSysMessage("TortoiseBots %s", BuildVersion().c_str());
-    handler->PSendSysMessage("TBM:VERSION|%s", BuildVersion().c_str());
-    handler->PSendSysMessage("%s", AttributionLine().c_str());
-    return true;
-}
-
-static bool HandleLease(ChatHandler* handler, char const* args)
-{
-    std::string sub = Trim(args ? args : "");
-    for (char& c : sub) c = tolower(c);
-    if (!sub.empty() && sub != "status")
-    {
-        handler->PSendSysMessage("Usage: .bot lease [status]");
-        return true;
-    }
-    uint32_t grinding, trading, lft, bg, master;
-    BotActivityLeaseManager::Instance().GetActivityCounts(grinding, trading, lft, bg, master);
-    uint32_t tracked = grinding + trading + lft + bg + master;
-    uint32_t online = BotManager::Instance().GetBotCount();
-    uint32_t idle = online > tracked ? online - tracked : 0;
-    handler->PSendSysMessage("Leases: Idle %u, Grinding %u, Trading %u, LftQueued %u, BgQueued %u, PlayerMaster %u (online %u, tracked %u).",
-        idle, grinding, trading, lft, bg, master, online, tracked);
-
-    std::vector<ActivityLeaseInfo> leases = BotActivityLeaseManager::Instance().GetActiveLeases();
-    for (ActivityLeaseInfo const& info : leases)
-    {
-        uint32_t remaining = BotActivityLeaseManager::Instance().GetRemainingMs(info.guidLow);
-        if (info.lease.maxDurationMs)
-            handler->PSendSysMessage("Lease %u: %s, %u ms remaining.", info.guidLow,
-                BotActivityName(info.lease.activity), remaining);
-        else
-            handler->PSendSysMessage("Lease %u: %s, indefinite.", info.guidLow,
-                BotActivityName(info.lease.activity));
-    }
-    return true;
-}
-
-
-static bool HandleInvite(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot invite <online bot name> (same account only)");
-        return true;
-    }
-    if (bot == requester || !requester->GetSession())
-    {
-        handler->PSendSysMessage("That character cannot be invited as your bot.");
-        return true;
-    }
-
-    // If the bot is still in another stale group, leave it so the invite can proceed.
-    if (Group* oldGroup = bot->GetGroup())
-    {
-        if (oldGroup != requester->GetGroup())
-        {
-            oldGroup->RemoveMember(bot->GetObjectGuid(), 0);
-        }
-    }
-
-    // Match the mature PlayerBots invite path: a full normal group must become
-    // a raid before inviting another controlled bot.  Native handlers retain
-    // ownership of the actual invitation and acceptance transitions.
-    Group* requesterGroup = requester->GetGroup();
-    if (requesterGroup && requesterGroup->isBGGroup())
-        requesterGroup = requester->GetOriginalGroup();
-    if (requesterGroup && !requesterGroup->IsLeader(requester->GetObjectGuid()))
-    {
-        Player* currentLeader = sObjectMgr.GetPlayer(requesterGroup->GetLeaderGuid());
-        if (currentLeader && currentLeader->GetSession() && currentLeader->GetSession()->IsHeadless())
-            requesterGroup->ChangeLeader(requester->GetObjectGuid());
-    }
-    if (requesterGroup && !requesterGroup->IsRaidGroup() &&
-        requesterGroup->GetMembersCount() > 4)
-    {
-        requesterGroup->ConvertToRaid();
-    }
-
-    // Let the native group handler create the invite. This emits the real
-    // SMSG_GROUP_INVITE, which the module packet bridge feeds to PlayerbotAI.
-    auto* previousInvite = bot->GetGroupInvite();
-    WorldPacket packet;
-    packet << bot->GetName() << uint32(0);
-    requester->GetSession()->HandleGroupInviteOpcode(packet);
-    if (bot->GetGroupInvite() == previousInvite)
-    {
-        handler->PSendSysMessage("The group invitation for %s was rejected by the native group handler.", name.c_str());
-        return true;
-    }
-    // The packet path remains queued for ordinary AI processing, but do not
-    // make the first group formation wait for an unrelated AI tick. Reuse the
-    // mature action, which still validates security and accepts through the
-    // core's native group handler. If it cannot run yet, the queued packet is
-    // the safe asynchronous fallback.
-    bool joinedImmediately = false;
-    if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot))
-    {
-        ai::Event inviteEvent("group invite", "", requester);
-        joinedImmediately = ai->DoSpecificAction("accept invitation", inviteEvent, true) &&
-            bot->IsInSameGroupWith(requester);
-    }
-
-    if (joinedImmediately)
-        handler->PSendSysMessage("Invitation sent to bot %s; it joined your group.", name.c_str());
-    else
-        handler->PSendSysMessage("Invitation sent to bot %s; it may accept it asynchronously.", name.c_str());
-    return true;
-}
-
-static bool HandleUninvite(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot uninvite <online bot name> (same account only)");
-        return true;
-    }
-
-    Group* requesterGroup = requester->GetGroup();
-    if (requesterGroup && requesterGroup->isBGGroup())
-        requesterGroup = requester->GetOriginalGroup();
-    if (requesterGroup && !requesterGroup->IsLeader(requester->GetObjectGuid()))
-    {
-        Player* currentLeader = sObjectMgr.GetPlayer(requesterGroup->GetLeaderGuid());
-        if (currentLeader && currentLeader->GetSession() && currentLeader->GetSession()->IsHeadless())
-            requesterGroup->ChangeLeader(requester->GetObjectGuid());
-    }
-
-    WorldPacket packet;
-    packet << bot->GetName();
-    requester->GetSession()->HandleGroupUninviteOpcode(packet);
-    handler->PSendSysMessage("Uninvite sent for bot %s.", name.c_str());
-    return true;
-}
-
-// Direct single-bot interrupt: same probe-and-execute path as
-// `.bot action interrupt`, but scoped to one owned bot instead of a
-// tactical executor search. Resolving the owner-selected or named bot first
-// keeps this consistent with .bot attack/.bot stay single-target verbs.
-static bool HandleInterrupt(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot interrupt <online bot name> (same account only)");
-        return true;
-    }
-    Unit* target = nullptr;
-    ObjectGuid selectionGuid = requester->GetSelectionGuid();
-    if (!selectionGuid.IsEmpty())
-    {
-        Unit* selected = requester->GetSelectedUnit();
-        if (selected && selected != requester &&
-            !BotManager::Instance().IsBot(selected->GetObjectGuid()))
-            target = selected;
-    }
-    if (!target || !target->IsInWorld() || !target->IsAlive())
-    {
-        handler->PSendSysMessage("Select a live enemy target first.");
-        return true;
-    }
-    if (!target->IsNonMeleeSpellCasted(true))
-    {
-        handler->PSendSysMessage("The target is not casting an interruptible spell.");
-        return true;
-    }
-    BotCommandContext context;
-    context.requester = requester;
-    context.selectedBot = bot;
-    context.enemyTarget = target;
-    return ExecuteInterruptAction(handler, context, requester);
-}
-
-// Direct strategy toggle: `.bot strategy <+|-name> [bot]` fans out over the
-// dynamic scope (selected bot or owned party bots), mirroring `.bot loot`.
-// Thin wrapper over the mature ChangeStrategy path; validation and
-// persistence stay AI-owned via ChangeStrategyAction/DbStore.
-static bool HandleStrategy(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    std::string input = Trim(args ? args : "");
-    if (input.empty() || (input[0] != '+' && input[0] != '-' && input[0] != '~'))
-    {
-        handler->PSendSysMessage("Usage: .bot strategy [+/-/~]<strategy> [bot] (e.g. .bot strategy +loot, .bot strategy -passive)");
-        return true;
-    }
-    size_t separator = input.find_first_of(" \t");
-    std::string change = separator == std::string::npos ? input : Trim(input.substr(0, separator));
-    std::string botToken = separator == std::string::npos ? std::string() : Trim(input.substr(separator + 1));
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope;
-    if (!botToken.empty())
-    {
-        Player* bot = nullptr;
-        BotRecord* record = nullptr;
-        std::string name;
-        if (!ResolveOwnedBot(handler, botToken.c_str(), bot, record, name))
-        {
-            handler->PSendSysMessage("You may only control an online bot on your account.");
-            return true;
-        }
-        scope.push_back(bot);
-    }
-    else
-        scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        ai->ChangeStrategy(change, BotState::BOT_STATE_ALL);
-        sPlayerbotDbStore.Save(ai);
-        ++succeeded;
-    }
-    handler->PSendSysMessage("Strategy change '%s' applied to %u bot(s).", change.c_str(), succeeded);
-    return true;
-}
-
-static bool HandleStay(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot stay <online bot name> (same account only)");
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!ai)
-    {
-        handler->PSendSysMessage("Bot %s has no AI yet.", name.c_str());
-        return true;
-    }
-
-    // Reuse the stay action so the command updates both strategies and the
-    // current "return"/"stay" position anchors.
-    ai::Event stayEvent("stay", "", requester);
-    if (!ai->DoSpecificAction("stay chat shortcut", stayEvent, true))
-    {
-        handler->PSendSysMessage("Bot %s could not enter stay mode.", name.c_str());
-        return true;
-    }
-
-    handler->PSendSysMessage("Bot %s will stay.", name.c_str());
-    return true;
-}
-
-static bool HandleNamedAction(ChatHandler* handler, char const* args, char const* command,
-    char const* action, char const* confirmation)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot %s <online bot name> (same account only)", command);
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!ai)
-    {
-        handler->PSendSysMessage("Bot %s has no AI yet.", name.c_str());
-        return true;
-    }
-
-    ai::Event event(command, "", requester);
-    if (!ai->DoSpecificAction(action, event, true))
-    {
-        handler->PSendSysMessage("Bot %s could not execute %s.", name.c_str(), command);
-        return true;
-    }
-
-    handler->PSendSysMessage("Bot %s %s.", name.c_str(), confirmation);
-    return true;
-}
-
-// `.bot action flee` parks bots in passive follow; an explicit tactical order
-// is the owner calling them back into the fight.
-static void EndFlee(PlayerbotAI* ai)
-{
-    if (!ai)
-        return;
-    if (ai->HasStrategy("passive", BotState::BOT_STATE_NON_COMBAT))
-        ai->ChangeStrategy("-passive", BotState::BOT_STATE_NON_COMBAT);
-    if (ai->HasStrategy("passive", BotState::BOT_STATE_COMBAT))
-        ai->ChangeStrategy("-passive", BotState::BOT_STATE_COMBAT);
-}
-
-// Tactical requests must be able to leave a prior stay/follow hold. The
-// movement and combat behavior itself remains owned by PlayerbotAI.
-static void RelaxTacticalMovement(PlayerbotAI* ai)
-{
-    if (!ai)
-        return;
-
-    // Stay is now kept in all three engines by the central movement setter;
-    // remove its reaction copy as well or it can survive a tactical request
-    // and be mistaken for an active hold during the next transition.
-    ai->ChangeStrategy("-stay", BotState::BOT_STATE_REACTION);
-    ai->ChangeStrategy("-stay", BotState::BOT_STATE_NON_COMBAT);
-    ai->ChangeStrategy("-stay,-follow", BotState::BOT_STATE_COMBAT);
-    EndFlee(ai);
-}
-
-static bool BindMovementMaster(Player* requester, Player* bot)
-{
-    if (!requester || !bot)
-        return false;
-
-    BotRecord* record = BotManager::Instance().FindBot(bot->GetObjectGuid());
-    if (!record)
-        return false;
-
-    // Rebind even when the durable GUID already matches: the live AI pointer
-    // may have been cleared by a reconnect, and FollowTargetValue caches the
-    // old pointer until its next calculation.
-    return BotManager::Instance().BindBotMaster(bot->GetObjectGuid(), requester->GetObjectGuid());
-}
-
-static bool HandleGuard(ChatHandler* handler, char const* args)
-{
-    return HandleNamedAction(handler, args, "guard", "guard chat shortcut", "will guard this position");
-}
-
-static bool HandleFree(ChatHandler* handler, char const* args)
-{
-    return HandleNamedAction(handler, args, "free", "free chat shortcut", "is free to move");
-}
-
-static bool HandleReady(ChatHandler* handler, char const* args)
-{
-    return HandleNamedAction(handler, args, "ready", "ready check", "will run a readiness check");
-}
-
-static bool HandleAttack(ChatHandler* handler, char const* args)
-{
-    return HandleNamedAction(handler, args, "attack", "attack my target", "will attack your selected target");
-}
-
-static bool IsPublicFormation(std::string const& formation)
-{
-    return formation == "default" || formation == "melee" || formation == "queue" ||
-        formation == "chaos" || formation == "circle" || formation == "line" ||
-        formation == "shield" || formation == "arrow" || formation == "near" ||
-        formation == "far";
-}
-
-static bool HandleFormation(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    std::string input = Trim(args ? args : "");
-    if (!requester || input.empty())
-    {
-        handler->PSendSysMessage("Usage: .bot formation [botName] <default/melee/queue/chaos/circle/line/shield/arrow/near/far>");
-        return true;
-    }
-
-    size_t separator = input.find_first_of(" \t");
-    std::string firstToken = input.substr(0, separator);
-    for (char& c : firstToken)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    // Single formation name without bot name applies to dynamic scope
-    if (separator == std::string::npos && IsPublicFormation(firstToken))
-    {
-        BotCommandContext context = BuildContext(requester);
-        std::vector<Player*> scope = ResolveDynamicScope(context);
-        if (scope.empty())
-        {
-            handler->PSendSysMessage("No live owned party bots are controllable.");
-            return true;
-        }
-
-        uint32 succeeded = 0;
-        for (Player* bot : scope)
-        {
-            PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-            if (!ai) continue;
-            ai::Event event("formation", firstToken, requester);
-            if (ai->DoSpecificAction("formation", event, true))
-                ++succeeded;
-        }
-
-        if (context.selectedBot && scope.size() == 1)
-            handler->PSendSysMessage("Bot %s formation set to %s.", context.selectedBot->GetName(), firstToken.c_str());
-        else
-            handler->PSendSysMessage("Party formation set to %s (%u bots updated).", firstToken.c_str(), succeeded);
-        return true;
-    }
-
-    if (separator == std::string::npos)
-    {
-        handler->PSendSysMessage("Usage: .bot formation [botName] <default/melee/queue/chaos/circle/line/shield/arrow/near/far>");
-        return true;
-    }
-
-    std::string botName = input.substr(0, separator);
-    std::string formation = Trim(input.substr(separator + 1));
-    for (char& character : formation)
-        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-
-    if (!IsPublicFormation(formation))
-    {
-        handler->PSendSysMessage("Unknown formation. Use default, melee, queue, chaos, circle, line, shield, arrow, near, or far.");
-        return true;
-    }
-
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!ResolveOwnedBot(handler, botName.c_str(), bot, record, name))
-    {
-        handler->PSendSysMessage("You may only control an online bot on your account.");
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!ai)
-    {
-        handler->PSendSysMessage("Bot %s has no AI yet.", name.c_str());
-        return true;
-    }
-
-    ai::Event event("formation", formation, requester);
-    if (!ai->DoSpecificAction("formation", event, true))
-    {
-        handler->PSendSysMessage("Bot %s could not set formation %s.", name.c_str(), formation.c_str());
-        return true;
-    }
-
-    handler->PSendSysMessage("Bot %s formation set to %s.", name.c_str(), formation.c_str());
-    return true;
-}
-// Explicit role designation (Player Agency First): a leveling Arms/Fury
-// warrior, Ret paladin, or Feral druid can serve as the party tank without
-// changing talents. The tank kit mirrors AiFactory's native tank strategies
-// so the bot qualifies via ContainsStrategy(STRATEGY_TYPE_TANK) and can pull.
-// Both spec placeholders are offered; each class context keeps the one it
-// knows ("protection" for Warrior/Paladin, "tank feral" for Druid) and the
-// engine silently ignores the unknown name.
-static bool HandleRole(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    std::string input = Trim(args ? args : "");
-    size_t separator = input.find_first_of(" \t");
-    std::string botToken = separator == std::string::npos ? input : input.substr(0, separator);
-    std::string roleToken = separator == std::string::npos ? std::string() : Trim(input.substr(separator + 1));
-    for (char& c : roleToken)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    uint8 role = 255;
-    if (roleToken == "tank")
-        role = static_cast<uint8>(ai::BOT_ROLE_TANK);
-    else if (roleToken == "healer" || roleToken == "heal")
-        role = static_cast<uint8>(ai::BOT_ROLE_HEALER);
-    else if (roleToken == "dps")
-        role = static_cast<uint8>(ai::BOT_ROLE_DPS);
-    else if (roleToken == "clear" || roleToken == "none" || roleToken == "reset")
-        role = static_cast<uint8>(ai::BOT_ROLE_NONE);
-
-    if (requester && role != 255 &&
-        (botToken == "self" || botToken == requester->GetName()))
-    {
-        PlayerbotAIStorage& storage = PlayerbotAIStorage::Instance();
-        if (role == static_cast<uint8>(ai::BOT_ROLE_NONE))
-            storage.ClearPlayerForcedRole(requester->GetObjectGuid());
-        else
-            storage.SetPlayerForcedRole(requester->GetObjectGuid(), role);
-
-        char const* label = role == static_cast<uint8>(ai::BOT_ROLE_TANK) ? "tank"
-            : role == static_cast<uint8>(ai::BOT_ROLE_HEALER) ? "healer"
-            : role == static_cast<uint8>(ai::BOT_ROLE_DPS) ? "dps" : "cleared";
-        handler->PSendSysMessage("Your role set to %s.", label);
-        return true;
-    }
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || botToken.empty() || role == 255 ||
-        !ResolveOwnedBot(handler, botToken.c_str(), bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot role <online bot name/self/your name> <tank/healer/dps/clear>");
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!ai)
-    {
-        handler->PSendSysMessage("Bot %s has no AI yet.", name.c_str());
-        return true;
-    }
-
-    // Rebuild from the talent spec plus the forced role so a previous
-    // designation cannot leak its strategy kit into the new role. The stored
-    // snapshot is spec-dependent, so drop its strategy rows first (independent
-    // value rows such as formation and CC marks are retained).
-    ai->SetForcedRole(role);
-    sPlayerbotDbStore.InvalidateStrategySnapshots(ai);
-    ai->ResetStrategies();
-    if (role == static_cast<uint8>(ai::BOT_ROLE_TANK))
-    {
-        ai->ChangeStrategy("+protection,+tank feral,+tank assist", BotState::BOT_STATE_NON_COMBAT);
-        ai->ChangeStrategy("+protection,+tank feral,+tank assist,+pull,+pull back,+close",
-            BotState::BOT_STATE_COMBAT);
-    }
-    else if (role == static_cast<uint8>(ai::BOT_ROLE_DPS) && bot->GetClass() == CLASS_DRUID)
-    {
-        // A Feral ordered to DPS fights as a Cat: drop any Bear leftovers
-        // ResetStrategies may have installed, then hold the Cat kit.
-        ai->ChangeStrategy("-tank feral,-tank assist,-protection,-pull,-pull back", BotState::BOT_STATE_NON_COMBAT);
-        ai->ChangeStrategy("-tank feral,-tank assist,-protection,-pull,-pull back", BotState::BOT_STATE_COMBAT);
-        ai->ChangeStrategy("+dps feral,+dps assist,+close,+behind", BotState::BOT_STATE_NON_COMBAT);
-        ai->ChangeStrategy("+dps feral,+dps assist,+close,+behind", BotState::BOT_STATE_COMBAT);
-    }
-    sPlayerbotDbStore.Save(ai);
-
-    // Issue #189 Phase 3: role-only designation stays gear-neutral, but warn
-    // when the worn gear cannot back the role (squishy tank, no heals).
-    if (role == static_cast<uint8>(ai::BOT_ROLE_TANK))
-    {
-        uint8 cls = bot->GetClass();
-        if (cls == CLASS_WARRIOR || cls == CLASS_PALADIN)
-        {
-            Item const* offhand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
-            ItemPrototype const* offProto = offhand ? offhand->GetProto() : nullptr;
-            bool hasShield = offProto && offProto->Class == ITEM_CLASS_ARMOR &&
-                offProto->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD;
-            if (!hasShield)
-                handler->PSendSysMessage("Warning: %s has no shield equipped — will be squishy as tank.", name.c_str());
-        }
-        else if (cls == CLASS_DRUID)
-        {
-            if (!bot->HasSpell(5487) && !bot->HasSpell(9634))
-                handler->PSendSysMessage("Warning: %s has no bear form — cannot tank effectively.", name.c_str());
-        }
-        else
-        {
-            handler->PSendSysMessage("Warning: %s is not a traditional tank class — will be squishy as tank.", name.c_str());
-        }
-    }
-
-    char const* label = role == static_cast<uint8>(ai::BOT_ROLE_TANK) ? "tank"
-        : role == static_cast<uint8>(ai::BOT_ROLE_HEALER) ? "healer"
-        : role == static_cast<uint8>(ai::BOT_ROLE_DPS) ? "dps" : "cleared";
-    handler->PSendSysMessage("Bot %s role set to %s.", name.c_str(), label);
-    return true;
-}
-
-
-static bool HandleMatureCommand(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    std::string input = Trim(args ? args : "");
-    size_t separator = input.find_first_of(" \t");
-    if (!requester || separator == std::string::npos)
-    {
-        handler->PSendSysMessage("Usage: .bot command <botName> <Playerbot command>");
-        return true;
-    }
-
-    std::string botName = input.substr(0, separator);
-    std::string command = Trim(input.substr(separator + 1));
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string resolvedName;
-    if (command.empty() || !ResolveOwnedBot(handler, botName.c_str(), bot, record, resolvedName))
-    {
-        handler->PSendSysMessage("You may only command an online bot on your account.");
-        return true;
-    }
-
-    if (PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot))
-    {
-        ai->HandleCommand(CHAT_MSG_WHISPER, command, *requester);
-        handler->PSendSysMessage("Forwarded command for %s: %s; action success is not guaranteed.", resolvedName.c_str(), command.c_str());
-    }
-    else
-        handler->PSendSysMessage("Bot %s has no AI yet.", resolvedName.c_str());
-    return true;
-}
-
-// pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename,clang:undeclared_var_use
-// Issue #192: fast-path companion hire. Same service, costs, and caps as the
-// <Mercenary Hire> gossip wizard, but only available when the server sets
-// AiPlayerbot.HireAnywhere; otherwise it points players to a recruiter. Usage:
-//   .bot hire <class> [dps|tank|healer] [race] [male|female]
-// Tokens after the class may come in any order: "warrior tauren male tank",
-// "mage female frost", and "paladin protection" all parse. Bare spec words
-// (protection/arms/fury/holy/retribution/...) imply their role.
-static bool HandleHire(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game to hire a companion.");
-        return true;
-    }
-    std::string input = Trim(args ? args : "");
-    if (input.empty())
-    {
-        handler->PSendSysMessage("Usage: .bot hire <class> [dps/tank/healer] [race] [male/female]");
-        return true;
-    }
-    // Split on whitespace; class/race/gender/role/spec tokens in any order.
-    std::vector<std::string> tokens;
-    {
-        std::istringstream stream(input);
-        std::string token;
-        while (stream >> token)
-            tokens.push_back(token);
-    }
-    HireSelection sel;
-    for (std::string raw : tokens)
-    {
-        std::string token = raw;
-        for (char& c : token)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (!sel.classId)
-        {
-            uint32 parsed = ai::ChatHelper::parseClass(token);
-            if (parsed >= CLASS_WARRIOR && parsed <= CLASS_DRUID && parsed != 6 && parsed != 10)
-            {
-                sel.classId = static_cast<uint8>(parsed);
-                continue;
-            }
-        }
-        if (!sel.race)
-        {
-            uint32 parsed = ai::ChatHelper::parseRace(token);
-            if (parsed >= RACE_HUMAN && parsed <= RACE_HIGH_ELF)
-            {
-                sel.race = static_cast<uint8>(parsed);
-                continue;
-            }
-        }
-        if (!sel.gender)
-        {
-            uint32 parsed = ai::ChatHelper::parseGender(token);
-            if (parsed == GENDER_MALE || parsed == GENDER_FEMALE)
-            {
-                sel.gender = static_cast<uint8>(parsed);
-                continue;
-            }
-        }
-        if (!sel.role)
-        {
-            ai::BotRoles parsed = ai::ChatHelper::parseRole(token);
-            if (parsed != ai::BOT_ROLE_NONE)
-            {
-                sel.role = static_cast<uint8>(parsed);
-                continue;
-            }
-            // Bare spec words imply their role (protection -> tank, holy ->
-            // healer). Match the gossip labels loosely: any token containing
-            // the spec stem counts ("prot", "ret", "feral bear"). Feral Cat
-            // stays DPS on the shared feral path (specIndex 3); other feral
-            // words keep the Bear tank default (specIndex 0).
-            std::string lower = token;
-            bool catWord = lower.find("cat") != std::string::npos;
-            bool tankWord = !catWord && (lower.find("prot") != std::string::npos || lower.find("tank") != std::string::npos ||
-                lower.find("bear") != std::string::npos || lower.find("feral") != std::string::npos);
-            bool healWord = lower.find("holy") != std::string::npos || lower.find("heal") != std::string::npos ||
-                lower.find("resto") != std::string::npos || lower.find("discipline") != std::string::npos ||
-                lower.find("disc") != std::string::npos;
-            if (tankWord)
-            {
-                sel.role = static_cast<uint8>(ai::BOT_ROLE_TANK);
-                if (sel.classId == CLASS_DRUID)
-                    sel.specIndex = 0;
-                continue;
-            }
-            if (healWord)
-            {
-                sel.role = static_cast<uint8>(ai::BOT_ROLE_HEALER);
-                if (sel.classId == CLASS_DRUID)
-                    sel.specIndex = 1;
-                continue;
-            }
-            bool balanceWord = lower.find("balance") != std::string::npos;
-            if (lower.find("dps") != std::string::npos || lower.find("arms") != std::string::npos ||
-                lower.find("fury") != std::string::npos || lower.find("shadow") != std::string::npos ||
-                lower.find("ret") != std::string::npos || balanceWord ||
-                lower.find("frost") != std::string::npos || lower.find("fire") != std::string::npos ||
-                lower.find("arcane") != std::string::npos || lower.find("afflic") != std::string::npos ||
-                lower.find("demon") != std::string::npos || lower.find("destro") != std::string::npos ||
-                lower.find("assassin") != std::string::npos || lower.find("combat") != std::string::npos ||
-                lower.find("subtle") != std::string::npos || lower.find("beast") != std::string::npos ||
-                lower.find("marks") != std::string::npos || lower.find("surv") != std::string::npos ||
-                lower.find("elem") != std::string::npos || lower.find("enhance") != std::string::npos ||
-                catWord)
-            {
-                sel.role = static_cast<uint8>(ai::BOT_ROLE_DPS);
-                if (sel.classId == CLASS_DRUID)
-                    sel.specIndex = catWord ? 3 : balanceWord ? 2 : -1;
-                continue;
-            }
-        }
-    }
-    if (!sel.classId)
-    {
-        handler->PSendSysMessage("Usage: .bot hire <class> [dps/tank/healer] [race] [male/female]");
-        return true;
-    }
-    // Defaults: requester's faction race pool, random gender, class role.
-    if (!sel.race)
-    {
-        Team team = requester->GetTeam();
-        std::vector<uint8> pool;
-        for (uint32 race = RACE_HUMAN; race <= RACE_HIGH_ELF; ++race)
-        {
-            if (Player::TeamForRace(race) != team)
-                continue;
-            // GetPlayerInfo is the authoritative class/race contract.
-            if (!sObjectMgr.GetPlayerInfo(race, sel.classId))
-                continue;
-            pool.push_back(static_cast<uint8>(race));
-        }
-        if (pool.empty())
-        {
-            handler->PSendSysMessage("No race of your faction can be that class.");
-            return true;
-        }
-        sel.race = pool[urand(0, uint32(pool.size() - 1))];
-    }
-    if (!sel.gender)
-        sel.gender = urand(0, 1) ? GENDER_FEMALE : GENDER_MALE;
-    if (!sel.role)
-        sel.role = HireProvisionService::DefaultRoleForClass(sel.classId);
-    if (sel.classId == CLASS_DRUID && sel.specIndex < 0 && sel.role == static_cast<uint8>(ai::BOT_ROLE_DPS))
-        sel.specIndex = 3;
-    HireOutcome outcome = HireProvisionService::Instance().Hire(requester, sel, false);
-    handler->PSendSysMessage("%s", outcome.message.c_str());
-    return true;
-}
-
-static bool HandleAdd(ChatHandler* handler, char const* args)
-{
-    if (!handler)
-        return false;
-    if (!args || !*args)
-    {
-        handler->PSendSysMessage("Usage: .bot add <characterName>");
-        return true;
-    }
-
-    std::string name = args;
-    // Trim
-    name.erase(0, name.find_first_not_of(" \t"));
-    name.erase(name.find_last_not_of(" \t") + 1);
-
-    if (name.empty())
-    {
-        handler->PSendSysMessage("Usage: .bot add <characterName>");
-        return true;
-    }
-
-    // Normalize name
-    if (!normalizePlayerName(name))
-    {
-        handler->PSendSysMessage("Invalid character name.");
-        return true;
-    }
-
-    ::Player* requester = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game to add a bot.");
-        return true;
-    }
-
-    PlayerCacheData* data = sObjectMgr.GetPlayerDataByName(name);
-    if (!data)
-    {
-        // Try online lookup
-        if (::Player* online = sObjectAccessor.FindPlayerByName(name.c_str()))
-            data = sObjectMgr.GetPlayerDataByGUID(online->GetObjectGuid().GetCounter());
-    }
-
-    if (!data)
-    {
-        handler->PSendSysMessage("Character '%s' not found.", name.c_str());
-        return true;
-    }
-
-    ::ObjectGuid guid(HIGHGUID_PLAYER, data->uiGuid);
-    uint32_t accountId = data->uiAccount;
-    ::ObjectGuid masterGuid = requester->GetObjectGuid();
-
-    if (sObjectAccessor.FindPlayer(guid))
-    {
-        handler->PSendSysMessage("Character '%s' is already online and cannot be claimed as a Headless bot.", name.c_str());
-        return true;
-    }
-
-    if (!requester->GetSession() ||
-        (accountId != requester->GetSession()->GetAccountId() && requester->GetSession()->GetSecurity() < SEC_GAMEMASTER))
-    {
-        handler->PSendSysMessage("You may only control characters on your account.");
-        return true;
-    }
-
-    uint32 ownerAccountId = requester->GetSession()->GetAccountId();
-    OwnedCharacter existingOwnership;
-    if (BotManager::Instance().GetOwnedCharacter(guid, existingOwnership) &&
-        existingOwnership.ownerAccountId != ownerAccountId &&
-        !IsBotAdministrator(requester))
-    {
-        handler->PSendSysMessage("Character '%s' is already owned by another account.", name.c_str());
-        return true;
-    }
-
-    if (BotManager::Instance().AddBotWithMaster(accountId, guid, masterGuid))
-    {
-        if (!BotManager::Instance().RegisterOwnedCharacter(
-            ownerAccountId, accountId, guid, masterGuid))
-        {
-            // Do not leave an unowned runtime after a failed durable write.
-            BotManager::Instance().RemoveBot(guid, false);
-            handler->PSendSysMessage("Failed to persist ownership for bot %s; login was cancelled.", name.c_str());
-            return true;
-        }
-        handler->PSendSysMessage("Bot %s queued for login; it will follow %s after entering the world.",
-            name.c_str(), requester->GetName());
-    }
-    else
-        handler->PSendSysMessage("Failed to add bot %s (already exists or error).", name.c_str());
-    return true;
-}
-
-// pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename
-static bool HandleRemove(ChatHandler* handler, char const* args)
-{
-    if (!handler)
-        return false;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game to remove a bot.");
-        return true;
-    }
-    if (!args || !*args)
-    {
-        handler->PSendSysMessage("Usage: .bot remove <characterName>");
-        return true;
-    }
-    std::string name = args;
-    name.erase(0, name.find_first_not_of(" \t"));
-    name.erase(name.find_last_not_of(" \t") + 1);
-    if (!normalizePlayerName(name))
-    {
-        handler->PSendSysMessage("Invalid character name.");
-        return true;
-    }
-
-    PlayerCacheData* data = sObjectMgr.GetPlayerDataByName(name);
-    if (!data)
-    {
-        handler->PSendSysMessage("Character '%s' not found.", name.c_str());
-        return true;
-    }
-    ::ObjectGuid guid(HIGHGUID_PLAYER, data->uiGuid);
-    BotRecord* record = BotManager::Instance().FindBot(guid);
-    if (!record)
-    {
-        handler->PSendSysMessage("Character '%s' is not a module-owned bot.", name.c_str());
-        return true;
-    }
-    if (!CanControlBot(requester, record))
-    {
-        handler->PSendSysMessage("You may only control characters on your account.");
-        return true;
-    }
-    if (HireLifecycle::Instance().IsHired(guid))
-    {
-        // Issue #192 follow-up: a hired companion is temporary. An explicit
-        // removal ends the hire now and deletes its character; the fee is not
-        // refunded and the next hire is a new character.
-        HireLifecycle::Instance().DismissNow(guid, "removed by master");
-        handler->PSendSysMessage("Hire ended for %s; its character is being deleted.", name.c_str());
-        return true;
-    }
-    if (BotManager::Instance().RemoveBot(guid, true))
-        handler->PSendSysMessage("Removal requested for bot %s; Headless cleanup completes asynchronously.", name.c_str());
-    else
-        handler->PSendSysMessage("Bot %s not found or not removable.", name.c_str());
-    return true;
-}
-
-// pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename
-static bool HandleFollow(ChatHandler* handler, char const* args)
-{
-    ::Player* requester = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-
-    if (!args || !*args)
-    {
-        handler->PSendSysMessage("Usage: .bot follow <botName>");
-        return true;
-    }
-    std::string name = args;
-    name.erase(0, name.find_first_not_of(" \t"));
-    name.erase(name.find_last_not_of(" \t") + 1);
-    if (!normalizePlayerName(name))
-    {
-        handler->PSendSysMessage("Invalid bot name.");
-        return true;
-    }
-
-    PlayerCacheData* data = sObjectMgr.GetPlayerDataByName(name);
-    if (!data)
-    {
-        handler->PSendSysMessage("Bot '%s' not found.", name.c_str());
-        return true;
-    }
-    ::ObjectGuid botGuid(HIGHGUID_PLAYER, data->uiGuid);
-    ::ObjectGuid masterGuid = requester->GetObjectGuid();
-    BotRecord* record = BotManager::Instance().FindBot(botGuid);
-    if (!record || !CanControlBot(requester, record))
-    {
-        handler->PSendSysMessage("You may only control characters on your account.");
-        return true;
-    }
-    if (BotManager::Instance().SetBotFollow(botGuid, masterGuid))
-        handler->PSendSysMessage("Bot %s now following %s.", name.c_str(), requester->GetName());
-    else
-        handler->PSendSysMessage("Bot %s could not enter follow mode; no success is reported.", name.c_str());
-    return true;
-}
-
-// Companion maintenance: loot toggling plus vendor sell/repair fan-out over
-// the dynamic scope (selected bot or all owned party bots). The mature chat
-// actions own vendor checks (proximity, gossip flags, gold); this layer only
-// resolves scope, invokes them, persists strategy state, and reports.
-static bool HandleRaidAction(ChatHandler* handler, BotCommandContext const& context, Player* requester, std::string const& intent);
-static bool HandleLoot(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    std::string mode = Trim(args ? args : "");
-    for (char& c : mode)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (!mode.empty() && mode != "on" && mode != "off")
-    {
-        handler->PSendSysMessage("Usage: .bot loot [on/off]");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        bool enabled = mode.empty() ? !ai->HasStrategy("loot", BotState::BOT_STATE_NON_COMBAT) : mode == "on";
-        ai->ChangeStrategy(enabled ? "+loot" : "-loot", BotState::BOT_STATE_NON_COMBAT);
-        sPlayerbotDbStore.Save(ai);
-        ++succeeded;
-        if (context.selectedBot && scope.size() == 1)
-            handler->PSendSysMessage("Bot %s: loot strategy %s.", bot->GetName(), enabled ? "enabled" : "disabled");
-    }
-    if (!context.selectedBot || scope.size() != 1)
-        handler->PSendSysMessage("Loot strategy toggled for %u bot(s).", succeeded);
-    return true;
-}
-
-static bool HandleRepair(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        if (ExecuteQuietAction(ai, "repair", ai::Event("bot command", "repair", requester)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Commanded %u bot(s) to repair equipment.", succeeded);
-    return true;
-}
-
-static bool HandleSell(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        if (ExecuteQuietAction(ai, "sell", ai::Event("bot command", "sell", requester)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Commanded %u bot(s) to sell vendor trash.", succeeded);
-    return true;
-}
-
-// Pre-combat rest: order scoped bots to sit and consume food/drink until
-// full, combat, or the master moves away. The mature food/drink actions own
-// inventory, sit state, and regen checks; this layer only fans out and
-// reports over the dynamic scope.
-static bool HandleRest(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        bool rested = false;
-        if (bot->GetPowerType() == POWER_MANA && bot->GetPower(POWER_MANA) < bot->GetMaxPower(POWER_MANA))
-            rested = ExecuteQuietAction(ai, "drink", ai::Event("bot command", "drink", requester)) || rested;
-        if (bot->GetHealth() < bot->GetMaxHealth())
-            rested = ExecuteQuietAction(ai, "food", ai::Event("bot command", "food", requester)) || rested;
-        if (rested)
-            ++succeeded;
-        else if (bot->GetHealth() >= bot->GetMaxHealth() && (bot->GetPowerType() != POWER_MANA || bot->GetPower(POWER_MANA) >= bot->GetMaxPower(POWER_MANA)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Commanded %u companion bot(s) to rest and restore health/mana.", succeeded);
-    return true;
-}
-
-static std::vector<Player*> DeadBotsInScope(BotCommandContext const& context)
-{
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    std::vector<Player*> dead;
-    for (Player* bot : scope)
-        if (bot && !bot->IsAlive())
-            dead.push_back(bot);
-    return dead;
-}
-
-static bool HandleRelease(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = DeadBotsInScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No dead companion bots found.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        if (ExecuteQuietAction(ai, "release", ai::Event("bot command", "release", requester)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Released spirit for %u companion bot(s).", succeeded);
-    return true;
-}
-
-static bool HandleCorpseRun(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = DeadBotsInScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No dead companion bots found.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        if (ExecuteQuietAction(ai, "corpse run", ai::Event("bot command", "corpse run", requester)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Commanded %u companion bot(s) to run back to corpse.", succeeded);
-    return true;
-}
-
-static bool HandleLearn(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        handler->PSendSysMessage("No live owned party bots are controllable.");
-        return true;
-    }
-    uint32 succeeded = 0;
-    for (Player* bot : scope)
-    {
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        if (ExecuteQuietAction(ai, "trainer", ai::Event("bot command", "learn", requester)))
-            ++succeeded;
-    }
-    handler->PSendSysMessage("Commanded %u companion bot(s) to learn spells from nearby trainers.", succeeded);
-    return true;
-}
-
-static bool HandleTrade(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    BotCommandContext context = BuildContext(requester);
-    Player* bot = context.selectedBot;
-    if (!bot || !bot->IsAlive())
-    {
-        handler->PSendSysMessage("Target an alive companion bot to trade.");
-        return true;
-    }
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!ai)
-    {
-        handler->PSendSysMessage("Bot %s has no AI yet.", bot->GetName());
-        return true;
-    }
-    if (ExecuteQuietAction(ai, "trade", ai::Event("bot command", requester->GetName(), requester)))
-        handler->PSendSysMessage("Trade requested with %s.", bot->GetName());
-    else
-        handler->PSendSysMessage("Bot %s could not open trade.", bot->GetName());
-    return true;
-}
-
-// pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename,clang:undeclared_var_use
-static bool HandlePullback(ChatHandler* handler, char const* args)
-{
-    (void)args;
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    if (!requester->IsInWorld() || requester->IsBeingTeleported())
-    {
-        handler->PSendSysMessage("You must be in world to use pullback.");
-        return true;
-    }
-    if (!requester->IsAlive() || requester->IsTaxiFlying())
-    {
-        handler->PSendSysMessage("You must be alive and not on a taxi to use pullback.");
-        return true;
-    }
-
-    BotCommandContext context = BuildContext(requester);
-    if (!context.enemyTarget)
-    {
-        handler->PSendSysMessage("Select a live non-bot target before using pullback.");
-        return true;
-    }
-
-    // PullRequestAction owns target validation, the pull position, movement,
-    // spell selection, return, and terminal cleanup. The command only finds a
-    // player-controlled tank and asks that mature path to handle the request.
-    Player* tank = ResolvePullExecutor(context);
-    if (!tank)
-    {
-        handler->PSendSysMessage("No tank bot found in your party (needs a bot with tank role). Designate one with .bot role <name> tank, or target a bot to pull with it.");
-        return true;
-    }
-
-    PlayerbotAI* tankAI = PlayerbotAIStorage::Instance().GetAI(tank);
-    if (!tankAI)
-    {
-        handler->PSendSysMessage("Tank %s has no AI yet.", tank->GetName());
-        return true;
-    }
-
-
-    BotRecord* record = BotManager::Instance().FindBot(tank->GetObjectGuid());
-    if (!record || (record->masterGuid != requester->GetObjectGuid() &&
-        !BotManager::Instance().BindBotMaster(tank->GetObjectGuid(), requester->GetObjectGuid())))
-    {
-        handler->PSendSysMessage("Tank %s could not be assigned to you for pullback.", tank->GetName());
-        return true;
-    }
-    if (!ConfigurePullMode(tankAI, true, sPlayerbotAIConfig.pullBackDpsJoinDelay))
-    {
-        handler->PSendSysMessage("Tank %s has no pullback strategy available.", tank->GetName());
-        return true;
-    }
-    RelaxTacticalMovement(tankAI);
-    PausePartyDpsForPull(context, tank, sPlayerbotAIConfig.pullBackDpsJoinDelay, true);
-    // Snapshot the target GUID like the action path does.
-    ai::Event event("pullback", context.enemyTarget->GetObjectGuid(), requester);
-    if (!ExecuteQuietAction(tankAI, "pull my target", event))
-    {
-        handler->PSendSysMessage("Tank %s could not start a pull for your selected target.", tank->GetName());
-        return true;
-    }
-
-    // Same as the .bot action path: do not let the tank's leftover action
-    // clock delay the pull.
-    tankAI->ClearActionClock();
-    ExecuteQuietNextAction(tankAI, false);
-
-    handler->PSendSysMessage("Pullback requested: tank %s is using its native pull strategy.", tank->GetName());
-    return true;
-}
-
-// pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename,clang:undeclared_var_use
-static bool HandleSummon(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    if (!requester)
-    {
-        handler->PSendSysMessage("You must be in-game.");
-        return true;
-    }
-    if (!requester->IsInWorld() || requester->IsBeingTeleported())
-    {
-        handler->PSendSysMessage("You must be in world and not teleporting.");
-        return true;
-    }
-    if (!requester->IsAlive())
-    {
-        handler->PSendSysMessage("You must be alive to summon.");
-        return true;
-    }
-    if (requester->IsTaxiFlying())
-    {
-        handler->PSendSysMessage("You cannot summon while on a taxi.");
-        return true;
-    }
-    std::string name = Trim(args ? args : "");
-    if (name.empty() || !normalizePlayerName(name))
-    {
-        handler->PSendSysMessage("Usage: .bot summon <online bot name> (same account only)");
-        return true;
-    }
-    Player* bot = sObjectMgr.GetPlayer(name.c_str());
-    if (!bot) bot = sObjectAccessor.FindPlayerByName(name.c_str());
-    if (!bot)
-    {
-        handler->PSendSysMessage("Bot '%s' not found or not online.", name.c_str());
-        return true;
-    }
-    BotRecord* record = BotManager::Instance().FindBot(bot->GetObjectGuid());
-    if (!record || !CanControlBot(requester, record))
-    {
-        handler->PSendSysMessage("You may only summon a bot on your account.");
-        return true;
-    }
-    if (!bot->GetSession() || !bot->GetSession()->IsHeadless() || !BotManager::Instance().IsBot(bot->GetObjectGuid()))
-    {
-        handler->PSendSysMessage("Character '%s' is not a module-owned Headless bot.", name.c_str());
-        return true;
-    }
-    if (!bot->IsInWorld())
-    {
-        handler->PSendSysMessage("Bot '%s' is not in world.", name.c_str());
-        return true;
-    }
-    if (!IsLiveHeadlessBot(bot, record))
-    {
-        handler->PSendSysMessage("Character '%s' has no ready PlayerbotAI and cannot be controlled.", name.c_str());
-        return true;
-    }
-    if (!bot->IsAlive())
-    {
-        handler->PSendSysMessage("Bot '%s' is dead and cannot be summoned (resurrect first).", name.c_str());
-        return true;
-    }
-    if (bot->IsBeingTeleported())
-    {
-        handler->PSendSysMessage("Bot '%s' is already teleporting.", name.c_str());
-        return true;
-    }
-    if (bot->IsTaxiFlying())
-    {
-        handler->PSendSysMessage("Bot '%s' is on a taxi.", name.c_str());
-        return true;
-    }
-    if (bot->IsInCombat())
-    {
-        handler->PSendSysMessage("Bot '%s' is in combat and cannot be summoned.", name.c_str());
-        return true;
-    }
-    if (requester->GetMap() && bot->GetMap() && requester->GetMap() != bot->GetMap())
-    {
-        // Cross-map summon is allowed via TeleportTo, just warn
-        handler->PSendSysMessage("Bot '%s' is on a different map; summon will teleport across maps.", name.c_str());
-    }
-    if (PlayerConvenience::Instance().IsBusy(bot->GetObjectGuid()))
-    {
-        handler->PSendSysMessage("Bot '%s' already has a pending convenience action.", name.c_str());
-        return true;
-    }
-    if (record->masterGuid != requester->GetObjectGuid() &&
-        !BotManager::Instance().BindBotMaster(bot->GetObjectGuid(), requester->GetObjectGuid()))
-    {
-        handler->PSendSysMessage("Bot '%s' could not be assigned to you for summon.", name.c_str());
-        return true;
-    }
-    if (!PlayerConvenience::Instance().RequestSummon(requester, bot))
-    {
-        handler->PSendSysMessage("Failed to summon bot '%s' (already pending or error).", name.c_str());
-        return true;
-    }
-    handler->PSendSysMessage("Summoning %s to a safe position near you (3s); it will follow on arrival.", name.c_str());
-    return true;
-}
-static std::string ProtocolSafe(std::string value)
-{
-    for (char& character : value)
-    {
-        if (character == '|' || character == '\r' || character == '\n')
-            character = ' ';
-    }
-    return value;
-}
-
-static void SendActionError(ChatHandler* handler, std::string const& intent,
-    char const* code, char const* message)
-{
-    if (!handler)
-        return;
-    std::string safeMessage = ProtocolSafe(message ? message : "request rejected");
-    handler->PSendSysMessage("TBM:ACTION_ERR|%s|%s|%s", ProtocolSafe(intent).c_str(),
-        code ? code : "rejected", safeMessage.c_str());
-}
-
-static void SendActionAck(ChatHandler* handler, std::string const& intent,
-    std::string const& scope, uint32 count, std::string const& executor = {})
-{
-    if (!handler)
-        return;
-    std::string safeScope = ProtocolSafe(scope);
-    std::string safeExecutor = executor.empty() ? "-" : ProtocolSafe(executor);
-    handler->PSendSysMessage("TBM:ACTION_ACK|%s|%s|%u|%s",
-        ProtocolSafe(intent).c_str(), safeScope.c_str(), count, safeExecutor.c_str());
-}
-
-static bool ExecuteInterruptAction(ChatHandler* handler, BotCommandContext const& context,
-    Player* requester)
-{
-    Unit* target = context.enemyTarget;
-    if (!target)
-    {
-        SendActionError(handler, "interrupt", "no-target", "Select a live enemy target first.");
-        return true;
-    }
-
-    if (!target->IsNonMeleeSpellCasted(true))
-    {
-        SendActionError(handler, "interrupt", "not-casting", "The target is not casting an interruptible spell.");
-        return true;
-    }
-
-    std::string actionName;
-    Player* executor = ResolveInterruptExecutor(context, target, &actionName);
-    if (!executor || actionName.empty())
-    {
-        SendActionError(handler, "interrupt", "no-interrupt",
-            "No owned bot has a ready interrupt for this target.");
-        return true;
-    }
-
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(executor);
-    if (!ai)
-    {
-        SendActionError(handler, "interrupt", "no-ai", "The selected interrupt bot has no AI.");
-        return true;
-    }
-
-    // Interrupt is an executor command, so break a stale hold/follow mode while
-    // leaving movement and combat decisions to the mature action graph.
-    RelaxTacticalMovement(ai);
-    executor->SetSelectionGuid(target->GetObjectGuid());
-    ai->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(target);
-
-    ai::Event event("action interrupt", "", requester);
-    bool accepted = ExecuteQuietAction(ai, actionName, event);
-    if (!accepted)
-    {
-        if (!target->IsInWorld() || !target->IsAlive())
-        {
-            SendActionError(handler, "interrupt", "no-target",
-                "The selected interrupt target is no longer available.");
-            return true;
-        }
-        if (!target->IsNonMeleeSpellCasted(true))
-        {
-            SendActionError(handler, "interrupt", "not-casting",
-                "The target finished casting before the interrupt could start.");
-            return true;
-        }
-
-        // Direct execution deliberately bypasses prerequisites. Queue the
-        // same mature action on the active engine instead, allowing its
-        // existing reach prerequisite to move and then cast without a
-        // command-side melee/ranged table.
-        // This request came from the networked owner. Keep its queued
-        // continuation eligible even if a later population tick is minimal.
-        if (!QueueMatureAction(ai, actionName, event, ACTION_PASSTROUGH))
-        {
-            SendActionError(handler, "interrupt", "failed",
-                "The mature interrupt action could not be started.");
-            return true;
-        }
-
-        // Do not wrap this tick in ScopedSilentStrategy: changing the
-        // non-combat strategy rebuilds that engine and would discard the
-        // queued action/continuation before the reach prerequisite can run.
-        ai->DoNextAction(false, true);
-        accepted = true;
-    }
-    else
-    {
-        ExecuteQuietNextAction(ai, true);
-    }
-
-    SendActionAck(handler, "interrupt",
-        context.selectedBot == executor
-            ? "bot:" + std::string(executor->GetName()) : "party",
-        1, executor->GetName());
-    return accepted;
-}
-
-static std::string RosterLocation(uint32 mapId, uint32 zoneId, uint32 areaId)
-{
-    uint32 displayAreaId = areaId ? areaId : zoneId;
-    if (displayAreaId)
-    {
-        auto const* area = GetAreaEntryByAreaID(displayAreaId);
-        if (area && area->Name && *area->Name)
-            return ProtocolSafe(area->Name);
-    }
-    if (!mapId && !zoneId && !areaId)
-        return "-";
-    return "map:" + std::to_string(mapId) + ",zone:" + std::to_string(zoneId) +
-        ",area:" + std::to_string(areaId);
-}
-
-// Channel the core currently dispatches addon commands from for this
-// requester. Mirrors the PARTY path of WorldSession::HandleMessagechatOpcode:
-// the message is consumed before any broadcast, so a pre-battleground group or
-// any non-battleground group works (raids included) and subgroup scoping is
-// irrelevant. A battleground group with no original group never reaches a
-// module, so the addon has to keep using `.bot` chat there.
-static char const* AddonCommandChannel(Player* requester)
-{
-    // A server can disable the addon channel outright; the chat handler drops
-    // every LANG_ADDON message before any module sees it.
-    if (!sWorld.getConfig(CONFIG_BOOL_ADDON_CHANNEL))
-        return "none";
-
-    Group* group = requester ? requester->GetOriginalGroup() : nullptr;
-    if (!group)
-    {
-        group = requester ? requester->GetGroup() : nullptr;
-        if (!group || group->isBGGroup())
-            return "none";
-    }
-    return "party";
-}
-
-// Per-bot behaviour toggles the TBM bot panel exposes. Each key maps to one
-// mature strategy on one engine; nothing outside this list is reachable from
-// `.bot behavior`, so the addon cannot be used as a generic strategy editor.
-struct BehaviorToggle
-{
-    char const* key;
-    char const* strategy;
-    BotState state;
-};
-
-static BehaviorToggle const BehaviorToggles[] = {
-    { "loot",     "loot",          BotState::BOT_STATE_NON_COMBAT },
-    { "aoe",      "dps aoe",       BotState::BOT_STATE_COMBAT },
-    { "autocc",   "auto cc",       BotState::BOT_STATE_COMBAT },
-    { "savemana", "conserve mana", BotState::BOT_STATE_COMBAT },
-    { "boost",    "boost",         BotState::BOT_STATE_COMBAT },
-    { "threat",   "threat",        BotState::BOT_STATE_COMBAT },
-    { "potions",  "potions",       BotState::BOT_STATE_REACTION },
-};
-
-static BehaviorToggle const* FindBehaviorToggle(std::string const& key)
-{
-    for (BehaviorToggle const& toggle : BehaviorToggles)
-        if (key == toggle.key)
-            return &toggle;
-    return nullptr;
-}
-
-// "TBM:BOTSTATE|<name>|move=follow,loot=on,..." - one line per live bot.
-// Flee parks a bot in passive follow, reported as its own movement mode so
-// the addon can show that the bot is holding off until the next order.
-static void SendBotStateLine(ChatHandler* handler, Player* bot)
-{
-    PlayerbotAI* ai = bot ? PlayerbotAIStorage::Instance().GetAI(bot) : nullptr;
-    if (!handler || !ai)
-        return;
-    std::string movement = MovementName(ai);
-    if (ai->HasStrategy("passive", BotState::BOT_STATE_NON_COMBAT))
-        movement = "flee";
-    std::string fields = "move=" + movement;
-    for (BehaviorToggle const& toggle : BehaviorToggles)
-        fields += std::string(",") + toggle.key + "=" + (ai->HasStrategy(toggle.strategy, toggle.state) ? "on" : "off");
-    handler->PSendSysMessage("TBM:BOTSTATE|%s|%s", ProtocolSafe(bot->GetName()).c_str(), fields.c_str());
-}
-
-static bool HandleRoster(ChatHandler* handler)
-{
-    Player* requester = Requester(handler);
-    if (!requester || !requester->GetSession())
-    {
-        handler->PSendSysMessage("TBM:ROSTER_ERROR|not-in-game|You must be in-game.");
-        handler->PSendSysMessage("You must be in-game to request a bot roster.");
-        return true;
-    }
-
-    uint32 accountId = requester->GetSession()->GetAccountId();
-    // Backfill runtime records created before the durable roster migration.
-    // The roster query also exposes undeleted same-account characters, while
-    // explicit cross-account rows remain limited to the owning GM account.
-    for (Player* bot : BotManager::Instance().GetAllBots())
-    {
-        BotRecord* record = bot ? BotManager::Instance().FindBot(bot->GetObjectGuid()) : nullptr;
-        if (!bot || !record || record->random || record->accountId != accountId ||
-            !CanControlBot(requester, record))
-            continue;
-
-        OwnedCharacter existing;
-        if (!BotManager::Instance().GetOwnedCharacter(bot->GetObjectGuid(), existing))
-            BotManager::Instance().RegisterOwnedCharacter(
-                accountId, record->accountId, bot->GetObjectGuid(), record->masterGuid);
-    }
-
-    std::vector<OwnedCharacter> rows = BotManager::Instance().GetOwnedCharacters(
-        requester->GetSession()->GetAccountId());
-    for (auto it = rows.begin(); it != rows.end(); )
-    {
-        // The roster lists the player's own characters. Hired companions live on
-        // random-pool accounts and are temporary: their character is deleted
-        // when the hire ends, so a dismissed companion never shows up here.
-        if (it->characterGuid == requester->GetObjectGuid() ||
-            RandomBotAccountRegistry::Instance().IsRegistered(it->characterAccountId))
-            it = rows.erase(it);
-        else
-            ++it;
-    }
-    handler->PSendSysMessage("TBM:ROSTER_BEGIN|%u", static_cast<uint32>(rows.size()));
-    std::vector<std::pair<std::string, std::string>> ccAssignments;
-    for (OwnedCharacter const& row : rows)
-    {
-        Player* player = sObjectAccessor.FindPlayer(row.characterGuid);
-        BotRecord* record = BotManager::Instance().FindBot(row.characterGuid);
-        std::string name = row.name.empty() ? "-" : row.name;
-        uint32 classId = row.classId;
-        uint32 mapId = row.mapId;
-        uint32 zoneId = row.zoneId;
-        uint32 areaId = row.areaId;
-        uint32 grouped = 0;
-        std::string ccMark = "-";
-
-        // Runtime Headless state, not characters.online, is authoritative.
-        // A Network player with the same GUID is never reported as an active bot.
-        std::string state = RosterState(player, record);
-        if (player && state != "offline")
-        {
-            name = player->GetName();
-            classId = player->GetClass();
-            mapId = player->GetMapId();
-            zoneId = player->GetZoneId();
-            areaId = player->GetAreaId();
-            grouped = requester->GetGroup() && requester->GetGroup()->IsMember(row.characterGuid) ? 1u : 0u;
-            ccMark = CurrentCcMark(PlayerbotAIStorage::Instance().GetAI(player));
-            if (ccMark != "-")
-                ccAssignments.emplace_back(name, ccMark);
-        }
-
-        handler->PSendSysMessage("TBM:ROSTER|%u|%s|%u|%s|%u|%s",
-            row.characterGuid.GetCounter(), ProtocolSafe(name).c_str(), classId,
-            ProtocolSafe(state).c_str(), grouped,
-            ProtocolSafe(RosterLocation(mapId, zoneId, areaId)).c_str());
-    }
-    handler->PSendSysMessage("TBM:ROSTER_END");
-    handler->PSendSysMessage("TBM:CC_ASSIGN_BEGIN|%u", static_cast<uint32>(ccAssignments.size()));
-    for (auto const& assignment : ccAssignments)
-        handler->PSendSysMessage("TBM:CC_ASSIGN|%s|%s", ProtocolSafe(assignment.first).c_str(),
-            ProtocolSafe(assignment.second).c_str());
-    handler->PSendSysMessage("TBM:CC_ASSIGN_END");
-    // Live behaviour snapshot for the controllable party bots (owned alts
-    // and hired companions alike): drives the addon's toggle states and the
-    // Party tab movement label. BEGIN/END replace the addon's whole set.
-    // The addon drops a snapshot whose row count differs from BEGIN, so
-    // count only the bots that will actually produce a line.
-    std::vector<Player*> stateBots;
-    for (Player* bot : BuildContext(requester).partyBots)
-        if (PlayerbotAIStorage::Instance().GetAI(bot))
-            stateBots.push_back(bot);
-    handler->PSendSysMessage("TBM:BOTSTATE_BEGIN|%u", static_cast<uint32>(stateBots.size()));
-    for (Player* bot : stateBots)
-        SendBotStateLine(handler, bot);
-    handler->PSendSysMessage("TBM:BOTSTATE_END");
-    // Version trailer: the addon shows "server <version>" from this line and
-    // falls back to "server ?" when an older module never sends it.
-    handler->PSendSysMessage("TBM:VERSION|%s", BuildVersion().c_str());
-    // Capability trailer: pull-seconds = adjustable pull/pullback delays
-    // (".bot action pull [seconds]", 0-60); flee = ".bot action flee";
-    // inventory = ".bot inv" / ".bot item"; behavior = ".bot behavior" and the
-    // BOTSTATE snapshot. Old addons ignore unknown lines and items.
-    handler->PSendSysMessage("TBM:CAPS|pull-seconds,flee,inventory,behavior");
-    // Transport trailer: the addon sends its next commands over the addon
-    // channel only while this says "party". See AddonCommandChannel.
-    handler->PSendSysMessage("TBM:TRANSPORT|%s", AddonCommandChannel(requester));
-    return true;
-}
-
-static bool HandleLogout(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot logout <online bot name> (same account only)");
-        return true;
-    }
-
-    if (HireLifecycle::Instance().IsHired(bot->GetObjectGuid()))
-    {
-        // A hire is temporary: logging it out ends the hire and deletes its
-        // character instead of keeping a pool character alive with the
-        // master's level and gear.
-        HireLifecycle::Instance().DismissNow(bot->GetObjectGuid(), "logged out by master");
-        handler->PSendSysMessage("Hire ended for %s; its character is being deleted.", name.c_str());
-        return true;
-    }
-
-    if (!BotManager::Instance().RemoveBot(bot->GetObjectGuid(), true))
-    {
-        handler->PSendSysMessage("Bot %s could not be logged out.", name.c_str());
-        return true;
-    }
-
-    // Remove/logout deliberately leaves tortoise_bots_owned_character intact.
-    handler->PSendSysMessage("Bot %s logout requested; durable ownership was retained.", name.c_str());
-    return true;
-}
-
 // ── TBM bot panel: inventory snapshot, item orders, behaviour toggles ──────
 // The panel addresses items by the server's own bag/slot pair, so an order
 // always lands on the exact item the player clicked - never on "the first
 // item with this name" like the whisper grammar.
 
-// Mirrors WorldSession::HandleSetTradeItemOpcode, which cancels the whole
-// trade on a refused item: only offer items the core will accept.
-static bool CanTradeItemTo(Player* bot, Item* item, Player* requester)
-{
-    if (!bot || !item || !requester || !item->CanBeTraded())
-        return false;
-    if (item->IsSoulBound())
-        return bot->GetMapId() == item->GetOriginMapId() &&
-            bot->GetGroup() == requester->GetGroup() &&
-            item->CanTradeSoulBoundToPlayer(requester->GetObjectGuid());
-    return true;
-}
-
-// Flags: e = the bot can equip it, u = the mature item-usage value calls it
-// an upgrade, b = it cannot be traded to the requester right now.
-static std::string InventoryItemFlags(PlayerbotAI* ai, Player* bot, Player* requester, Item* item)
-{
-    std::string flags;
-    ItemPrototype const* proto = item->GetProto();
-    if (proto && proto->InventoryType != INVTYPE_NON_EQUIP && bot->CanUseItem(proto) == EQUIP_ERR_OK)
-    {
-        flags += 'e';
-        ai::ItemUsage usage = ai->GetAiObjectContext()->GetValue<ai::ItemUsage>("item usage",
-            ai::ItemQualifier(item).GetQualifier())->Get();
-        if (usage == ai::ItemUsage::ITEM_USAGE_EQUIP)
-            flags += 'u';
-    }
-    if (!CanTradeItemTo(bot, item, requester))
-        flags += 'b';
-    return flags.empty() ? "-" : flags;
-}
-
-// TBM:INV_BEGIN|<bot>|<copper>
-// TBM:INV_EQ|<slot>|<itemId>|<durability>|<maxDurability>
-// TBM:INV_ITEM|<bag>|<slot>|<itemId>|<count>|<flags>
-// TBM:INV_END|<bot>|<freeSlots>|<totalSlots>
-static void SendInventorySnapshot(ChatHandler* handler, Player* bot, Player* requester)
-{
-    PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-    if (!handler || !bot || !ai)
-        return;
-    std::string const name = ProtocolSafe(bot->GetName());
-    handler->PSendSysMessage("TBM:INV_BEGIN|%s|%u", name.c_str(), bot->GetMoney());
-    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-    {
-        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-        if (!item)
-            continue;
-        handler->PSendSysMessage("TBM:INV_EQ|%u|%u|%u|%u", static_cast<uint32>(slot), item->GetEntry(),
-            item->GetUInt32Value(ITEM_FIELD_DURABILITY), item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY));
-    }
-
-    uint32 freeSlots = 0;
-    uint32 totalSlots = 0;
-    auto emit = [&](uint8 bag, uint8 slot, Item* item)
-    {
-        ++totalSlots;
-        if (!item)
-        {
-            ++freeSlots;
-            return;
-        }
-        handler->PSendSysMessage("TBM:INV_ITEM|%u|%u|%u|%u|%s", static_cast<uint32>(bag),
-            static_cast<uint32>(slot), item->GetEntry(), item->GetCount(),
-            InventoryItemFlags(ai, bot, requester, item).c_str());
-    };
-    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-        emit(INVENTORY_SLOT_BAG_0, slot, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
-    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
-    {
-        Bag* bag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot);
-        if (!bag)
-            continue;
-        for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
-            emit(bagSlot, static_cast<uint8>(slot), bag->GetItemByPos(static_cast<uint8>(slot)));
-    }
-    handler->PSendSysMessage("TBM:INV_END|%s|%u|%u", name.c_str(), freeSlots, totalSlots);
-}
-
-static bool HandleInventory(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name) ||
-        !PlayerbotAIStorage::Instance().GetAI(bot))
-    {
-        SendActionError(handler, "inv", "no-bot", "Usage: .bot inv <online bot you control>");
-        return true;
-    }
-    SendInventorySnapshot(handler, bot, requester);
-    return true;
-}
-// Issue #473: opt-in owned/hired-bot quality of life (all parts off by
-// default, pool bots never eligible). Maintenance refreshes one owned bot's
-// kit through the same bounded helpers as the hire/refresh paths
-// (consumables, reagents, ammo, thrown, bandages, then a free repair);
-// autogear re-gears incrementally within the quality/ilvl caps. With the
-// flags off the commands reply that the feature is disabled.
-static bool IsOwnedBotQolEligible(Player* bot, BotRecord const* record)
-{
-    if (!bot || !record)
-        return false;
-    if (!BotManager::Instance().IsBot(bot->GetObjectGuid()))
-        return false;
-    if (BotManager::Instance().IsRandomBot(bot->GetObjectGuid()))
-        return HireLifecycle::Instance().IsHired(bot->GetObjectGuid());
-    return true;
-}
-
-static bool HandleMaintenance(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    if (!requester || !ResolveOwnedBot(handler, args, bot, record, name))
-    {
-        handler->PSendSysMessage("Usage: .bot maintenance <online bot name> (same account only)");
-        return true;
-    }
-    if (!IsOwnedBotQolEligible(bot, record))
-    {
-        handler->PSendSysMessage("'%s' is a pool bot and keeps progressing organically.", name.c_str());
-        return true;
-    }
-    if (!sPlayerbotAIConfig.ownedBotMaintenanceEnabled)
-    {
-        handler->PSendSysMessage("Owned-bot maintenance is disabled (AiPlayerbot.OwnedBotMaintenanceEnabled = 0).");
-        return true;
-    }
-    if (!bot->IsAlive())
-    {
-        handler->PSendSysMessage("Bot '%s' must be alive.", name.c_str());
-        return true;
-    }
-    PlayerbotFactory factory(bot, bot->GetLevel());
-    factory.AddReagents();
-    factory.AddPotions();
-    factory.AddFood();
-    factory.AddConsumes();
-    factory.AddBandages();
-    factory.InitAmmo();
-    factory.InitThrown();
-    bot->DurabilityRepairAll(false, 0.0f);
-    bot->SaveToDB();
-    handler->PSendSysMessage("Maintained %s (consumables, reagents, ammo, repair).", name.c_str());
-    return true;
-}
-
-static bool HandleAutogear(ChatHandler* handler, char const* args)
+bool HandleAutogear(ChatHandler* handler, char const* args)
 {
     std::string text = Trim(args ? args : "");
     size_t split = text.find_first_of(" \t");
@@ -2211,1461 +220,326 @@ static bool HandleAutogear(ChatHandler* handler, char const* args)
     PlayerbotFactory factory(bot, bot->GetLevel());
     factory.AutogearOwned(parsed.quality, parsed.ilvlCap);
     handler->PSendSysMessage("Re-geared %s within the configured caps.", name.c_str());
+
+    // Autogear hands out no ammo: say so when the ranged weapon it left
+    // equipped has none in the bags (auto shot cannot fire), like the tank's
+    // "no shield equipped" warning.
+    Item const* ranged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    ItemPrototype const* rangedProto = ranged ? ranged->GetProto() : nullptr;
+    if (rangedProto && rangedProto->Class == ITEM_CLASS_WEAPON && !factory.HasAmmoInBagsFor(rangedProto->SubClass))
+    {
+        bool const gun = rangedProto->SubClass == ITEM_SUBCLASS_WEAPON_GUN;
+        handler->PSendSysMessage("Warning: %s has %s equipped but no %s in the bags - auto shot will not fire until %s gets some (owned-bot maintenance or hand them over).",
+            name.c_str(), rangedProto->Name1, gun ? "bullets" : "arrows", name.c_str());
+    }
     return true;
 }
 
-// Opens a trade window between the bot and the requester. The core creates
-// both trade records immediately; the requester's client opens its window
-// when TRADE_STATUS_BEGIN_TRADE arrives.
-static bool OpenTradeWith(Player* bot, Player* requester)
+// `.autogear` — gear a real player the way a spawned pool bot gets geared:
+// same candidate pool, score, required-level rule and spawn ceiling
+// (GearItemLevelCap with RandomGearMaxItemLevelAboveLevel). Upgrades only;
+// replaced pieces go to the bags or the target's own mailbox. A top-level
+// command like `.ahbot`, not a `.bot` subcommand: owned bots keep
+// `.bot autogear` above, and this handler refuses bots.
+static bool IsChallengeModeCharacter(Player* player)
 {
-    if (bot->GetTrader() == requester)
-        return true;
-    if (bot->GetTrader() || requester->GetTrader())
-        return false;
-    WorldPacket packet(CMSG_INITIATE_TRADE, 8);
-    packet << requester->GetObjectGuid();
-    bot->GetSession()->HandleInitiateTradeOpcode(packet);
-    return bot->GetTrader() == requester;
+    // Every Turtle challenge mode except CHALLENGE_WAR_MODE, which is the
+    // open-world PvP toggle rather than a gear restriction.
+    return player->HasChallenge(CHALLENGE_SLOW_AND_STEADY) || player->HasChallenge(CHALLENGE_EXHAUSTION_MODE) ||
+        player->HasChallenge(CHALLENGE_HARDCORE) || player->HasChallenge(CHALLENGE_VAGRANT_MODE) ||
+        player->HasChallenge(CHALLENGE_BOARING_MODE) || player->HasChallenge(CHALLENGE_CRAFTMASTER) ||
+        player->HasChallenge(CHALLENGE_LUNATIC) || player->HasChallenge(CHALLENGE_BREWMASTER) ||
+        player->HasChallenge(CHALLENGE_HEROIC);
 }
 
-// .bot item <bot> trade
-// .bot item <bot> equip|unequip|give <bag> <slot>
-// Every reply is one TBM:ACTION_ACK / TBM:ACTION_ERR with intent "item <op>";
-// equip and unequip follow it with a fresh inventory snapshot.
-static bool HandleItem(ChatHandler* handler, char const* args)
+static bool HandlePlayerAutogear(ChatHandler* handler, char const* args)
 {
     Player* requester = Requester(handler);
-    std::istringstream input(Trim(args ? args : ""));
-    std::string botName;
-    std::string op;
-    input >> botName >> op;
-    for (char& c : op)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    std::string const intent = "item " + (op.empty() ? std::string("?") : op);
-    if (op != "trade" && op != "equip" && op != "unequip" && op != "give")
+    if (!requester)
     {
-        SendActionError(handler, intent, "invalid", "Usage: .bot item <bot> trade | equip/unequip/give <bag> <slot>");
+        handler->PSendSysMessage("You must be in-game.");
         return true;
     }
 
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    PlayerbotAI* ai = nullptr;
-    if (!requester || !ResolveOwnedBot(handler, botName.c_str(), bot, record, name) ||
-        !(ai = PlayerbotAIStorage::Instance().GetAI(bot)))
+    std::string text = Trim(args ? args : "");
+    if (text.empty())
     {
-        SendActionError(handler, intent, "no-bot", "Unknown or uncontrollable bot name.");
-        return true;
-    }
-    std::string const scope = "bot:" + std::string(bot->GetName());
-    if (!bot->IsAlive())
-    {
-        SendActionError(handler, intent, "dead", "The bot must be alive.");
+        handler->PSendSysMessage("Usage: .autogear [player name] <spec> [ilvl]");
         return true;
     }
 
-    if (op == "trade")
+    std::vector<std::string> tokens;
+    std::istringstream stream(text);
+    std::string token;
+    while (stream >> token)
+        tokens.push_back(token);
+
+    // Trailing digits are the optional ilvl argument; everything before is
+    // [player name] <spec words...>.
+    uint32 requestedIlvl = 0;
+    if (!tokens.empty())
     {
-        if (!OpenTradeWith(bot, requester))
+        std::string const& last = tokens.back();
+        bool digitsOnly = !last.empty() && last.size() <= 5;
+        for (char c : last)
+            if (c < '0' || c > '9')
+                digitsOnly = false;
+        if (digitsOnly)
         {
-            SendActionError(handler, intent, "busy", "Trade could not be opened (busy, too far, or in combat).");
+            requestedIlvl = static_cast<uint32>(stoul(last));
+            tokens.pop_back();
+        }
+    }
+    if (tokens.empty())
+    {
+        handler->PSendSysMessage("Usage: .autogear [player name] <spec> [ilvl]");
+        return true;
+    }
+
+    // A leading spec word means no name was given; otherwise the first token
+    // is the player name and the rest are the spec words ("enhancement tank").
+    // A single token is always a spec word — with no spec following it, a
+    // name cannot parse, and the unknown-spec reply lists the valid specs.
+    std::string nameToken;
+    size_t specStart = 0;
+    if (tokens.size() >= 2 && !TortoiseBots::IsAutogearSpecToken(tokens[0]))
+    {
+        nameToken = tokens[0];
+        specStart = 1;
+    }
+    std::string specToken = tokens[specStart];
+    for (size_t i = specStart + 1; i < tokens.size(); ++i)
+        specToken += " " + tokens[i];
+
+    Player* target = nullptr;
+    if (!nameToken.empty())
+    {
+        std::string name = nameToken;
+        if (normalizePlayerName(name))
+            target = sObjectMgr.GetPlayer(name.c_str());
+        if (!target)
+            target = sObjectAccessor.FindPlayerByName(name.c_str());
+        if (!target)
+        {
+            handler->PSendSysMessage("Player '%s' is not online.", nameToken.c_str());
             return true;
         }
-        SendActionAck(handler, intent, scope, 1, "open");
-        return true;
     }
-
-    uint32 bag = 0;
-    uint32 slot = 0;
-    if (!(input >> bag >> slot) || bag > 255 || slot > 255)
-    {
-        SendActionError(handler, intent, "invalid", "Missing bag and slot.");
-        return true;
-    }
-    // Carried items only: equipment, backpack and equipped bags. Bank slots
-    // share bag 255 with the backpack and must never be reachable from here.
-    bool const equipped = Player::IsEquipmentPos(static_cast<uint8>(bag), static_cast<uint8>(slot));
-    if (!equipped && !Player::IsInventoryPos(static_cast<uint8>(bag), static_cast<uint8>(slot)))
-    {
-        SendActionError(handler, intent, "invalid", "Only carried items can be ordered.");
-        return true;
-    }
-    Item* item = bot->GetItemByPos(static_cast<uint8>(bag), static_cast<uint8>(slot));
-    if (!item || !item->GetProto())
-    {
-        SendActionError(handler, intent, "no-item", "That item is no longer there; refresh the bag view.");
-        SendInventorySnapshot(handler, bot, requester);
-        return true;
-    }
-    uint32 const itemId = item->GetEntry();
-
-    if (op == "equip")
-    {
-        ItemPrototype const* proto = item->GetProto();
-        if (equipped || proto->InventoryType == INVTYPE_NON_EQUIP || bot->CanUseItem(proto) != EQUIP_ERR_OK)
-        {
-            SendActionError(handler, intent, "cannot-equip", "The bot cannot equip this item.");
-            return true;
-        }
-        ai::EquipAction::EquipItem(ai, requester, item, true);
-        // Equip and bag slots all sit below the backpack range; ammo stays in
-        // the bag and is equipped through the ammo field instead.
-        bool const done = proto->InventoryType == INVTYPE_AMMO
-            ? bot->GetUInt32Value(PLAYER_AMMO_ID) == itemId
-            : item->GetBagSlot() == INVENTORY_SLOT_BAG_0 && item->GetSlot() < INVENTORY_SLOT_ITEM_START;
-        if (!done)
-            SendActionError(handler, intent, "failed", "The equip was refused (combat, level, or skill).");
-        else
-            SendActionAck(handler, intent, scope, 1, std::to_string(itemId));
-        SendInventorySnapshot(handler, bot, requester);
-        return true;
-    }
-
-    if (op == "unequip")
-    {
-        if (!equipped)
-        {
-            SendActionError(handler, intent, "not-equipped", "That item is not equipped.");
-            return true;
-        }
-        ai::UnequipAction::UnequipItem(ai, requester, item, true);
-        if (bot->GetItemByPos(static_cast<uint8>(bag), static_cast<uint8>(slot)) == item)
-            SendActionError(handler, intent, "failed", "No free bag space, or the item cannot be removed now.");
-        else
-            SendActionAck(handler, intent, scope, 1, std::to_string(itemId));
-        SendInventorySnapshot(handler, bot, requester);
-        return true;
-    }
-
-    // give: put the item into a trade window with the requester. Without an
-    // open trade the first request opens one and answers "pending"; the addon
-    // repeats the request once its trade window is shown.
-    if (equipped)
-    {
-        SendActionError(handler, intent, "equipped", "Unequip the item first.");
-        return true;
-    }
-    if (!CanTradeItemTo(bot, item, requester))
-    {
-        SendActionError(handler, intent, "no-trade", "This item cannot be traded (soulbound or quest item).");
-        return true;
-    }
-    if (bot->GetTrader() != requester)
-    {
-        if (!OpenTradeWith(bot, requester))
-        {
-            SendActionError(handler, intent, "busy", "Trade could not be opened (busy, too far, or in combat).");
-            return true;
-        }
-        SendActionAck(handler, intent, scope, 1, std::to_string(itemId) + " pending");
-        return true;
-    }
-    if (item->IsInTrade())
-    {
-        SendActionAck(handler, intent, scope, 1, std::to_string(itemId));
-        return true;
-    }
-    TradeData* trade = bot->GetTradeData();
-    int tradeSlot = -1;
-    for (uint8 i = 0; trade && i < TRADE_SLOT_TRADED_COUNT && tradeSlot < 0; ++i)
-        if (!trade->GetItem(TradeSlots(i)))
-            tradeSlot = i;
-    if (tradeSlot < 0)
-    {
-        SendActionError(handler, intent, "trade-full", "The trade window is full.");
-        return true;
-    }
-    WorldPacket packet(CMSG_SET_TRADE_ITEM, 3);
-    packet << static_cast<uint8>(tradeSlot) << static_cast<uint8>(bag) << static_cast<uint8>(slot);
-    bot->GetSession()->HandleSetTradeItemOpcode(packet);
-    if (!item->IsInTrade())
-    {
-        SendActionError(handler, intent, "failed", "The trade refused this item.");
-        return true;
-    }
-    SendActionAck(handler, intent, scope, 1, std::to_string(itemId));
-    return true;
-}
-
-// .bot behavior <bot> <key> <on|off> - allowlisted per-bot strategy toggles
-// (BehaviorToggles). Persisted through the mature AI store like loot/auto cc;
-// answers with an ACK and the bot's fresh TBM:BOTSTATE line.
-static bool HandleBehavior(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    std::istringstream input(Trim(args ? args : ""));
-    std::string botName;
-    std::string key;
-    std::string mode;
-    input >> botName >> key >> mode;
-    for (char& c : key)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    for (char& c : mode)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    std::string const intent = "behavior " + (key.empty() ? std::string("?") : key);
-    BehaviorToggle const* toggle = FindBehaviorToggle(key);
-    if (!toggle || (mode != "on" && mode != "off"))
-    {
-        SendActionError(handler, intent, "invalid",
-            "Usage: .bot behavior <bot> <loot|aoe|autocc|savemana|boost|threat|potions> <on|off>");
-        return true;
-    }
-
-    Player* bot = nullptr;
-    BotRecord* record = nullptr;
-    std::string name;
-    PlayerbotAI* ai = nullptr;
-    if (!requester || !ResolveOwnedBot(handler, botName.c_str(), bot, record, name) ||
-        !(ai = PlayerbotAIStorage::Instance().GetAI(bot)))
-    {
-        SendActionError(handler, intent, "no-bot", "Unknown or uncontrollable bot name.");
-        return true;
-    }
-
-    bool const enable = mode == "on";
-    ai->ChangeStrategy((enable ? "+" : "-") + std::string(toggle->strategy), toggle->state);
-    sPlayerbotDbStore.Save(ai);
-    bool const now = ai->HasStrategy(toggle->strategy, toggle->state);
-    if (now != enable)
-        SendActionError(handler, intent, "failed", "This bot does not support that behaviour.");
     else
-        SendActionAck(handler, intent, "bot:" + std::string(bot->GetName()), 1, now ? "on" : "off");
-    SendBotStateLine(handler, bot);
-    return true;
-}
-
-static bool ParseAction(std::string input, std::string& intent, std::string& option)
-{
-    intent.clear();
-    option.clear();
-    input = Trim(input);
-    if (input.empty())
-        return false;
-
-    size_t firstSeparator = input.find_first_of(" \t");
-    std::string first = input.substr(0, firstSeparator);
-    for (char& character : first)
-        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-
-    std::string remainder = firstSeparator == std::string::npos
-        ? std::string() : Trim(input.substr(firstSeparator + 1));
-    if (first == "focus" || first == "cc")
     {
-        size_t secondSeparator = remainder.find_first_of(" \t");
-        std::string mark = remainder.substr(0, secondSeparator);
-        for (char& character : mark)
-            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-        // "cc clear [<BotName>]" is the dismissal intent (no mark named
-        // "clear" exists: GetRtiIndex returns -1 for it).
-        if (first == "cc" && mark == "clear")
-        {
-            std::string botToken = secondSeparator == std::string::npos
-                ? std::string() : Trim(remainder.substr(secondSeparator + 1));
-            if (mark.empty() || botToken.find_first_of(" \t") != std::string::npos)
-                return false;
-            intent = botToken.empty() ? first + " " + mark : first + " " + mark + " " + botToken;
-            return true;
-        }
-        // "cc <mark> [<BotName>]": an explicit bot name assigns the mark to
-        // that owned bot without juggling the player's target.
-        if (first == "cc" && IsRaidTargetMark(mark))
-        {
-            std::string botToken = secondSeparator == std::string::npos
-                ? std::string() : Trim(remainder.substr(secondSeparator + 1));
-            if (mark.empty() || botToken.find_first_of(" \t") != std::string::npos)
-                return false;
-            intent = botToken.empty() ? first + " " + mark : first + " " + mark + " " + botToken;
-            return true;
-        }
-        if ((first == "focus" && mark != "skull") ||
-            (first == "cc" && !IsRaidTargetMark(mark)) ||
-            mark.empty() ||
-            (secondSeparator != std::string::npos &&
-                !Trim(remainder.substr(secondSeparator + 1)).empty()))
-            return false;
-        intent = first + " " + mark;
-        return true;
+        // No name: the selected player, or the caller themself when nothing
+        // (or no player) is selected.
+        Unit* selected = requester->GetSelectedUnit();
+        target = selected ? selected->ToPlayer() : nullptr;
+        if (!target)
+            target = requester;
     }
-    if (first == "corpse")
+
+    if (BotManager::Instance().IsBot(target->GetObjectGuid()))
     {
-        std::string rest = remainder;
-        for (char& character : rest)
-            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-        if (rest != "run")
-            return false;
-        intent = "corpse run";
+        handler->PSendSysMessage("'%s' is a bot - owned bots are geared with .bot autogear.", target->GetName());
         return true;
     }
 
-    if (first != "attack" && first != "interrupt" && first != "stop" && first != "pull" &&
-        first != "pullback" && first != "come" && first != "stay" &&
-        first != "follow" && first != "auto" && first != "aoe" && first != "hold" &&
-        first != "comestay" && first != "ready" && first != "loot" &&
-        first != "repair" && first != "sell" && first != "rest" &&
-        first != "drink" && first != "eat" && first != "release" &&
-        first != "corpse run" && first != "corpserun" && first != "learn" &&
-        first != "trade" && first != "raid" && first != "flee")
-        return false;
-
-    if (first == "raid")
+    bool const shapeshifted = target->GetClass() == CLASS_DRUID && target->GetShapeshiftForm() != FORM_NONE;
+    switch (TortoiseBots::DecidePlayerAutogearTargetState(target->IsAlive(), target->IsInCombat(), shapeshifted))
     {
-        std::string rest = remainder;
-        for (char& character : rest)
-            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-        if (rest != "status" && rest != "tankface" && rest != "douse" && rest != "custom status" && rest != "custom on" && rest != "custom off")
-            return false;
-        intent = "raid " + rest;
-        return true;
-    }
-    else if (first == "corpse run" || first == "corpserun")
-    {
-        intent = "corpse run";
-        return true;
-    }
-    else if (first == "auto")
-    {
-        std::string rest = remainder;
-        for (char& character : rest)
-            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-        // Only "auto cc" exists today; keep the surface extensible.
-        // Split "auto cc [on|off]" into intent + option like aoe/loot.
-        if (rest == "cc")
-        {
-            intent = "auto cc";
+        case TortoiseBots::PlayerAutogearTargetState::Dead:
+            handler->PSendSysMessage("'%s' must be alive.", target->GetName());
             return true;
-        }
-        if (rest == "cc on" || rest == "cc off")
-        {
-            intent = "auto cc";
-            option = rest.substr(3);
+        case TortoiseBots::PlayerAutogearTargetState::InCombat:
+            handler->PSendSysMessage("'%s' must be out of combat.", target->GetName());
             return true;
-        }
-        return false;
-    }
-    else if (first == "pull" || first == "pullback")
-    {
-        // Owner-specified adjustable delay: ".bot action pull [seconds]" and
-        // ".bot action pullback [seconds]". Plain "pull"/"pullback" keeps the
-        // configured default; the TBM addon sends the slider value here.
-        // Anything else is rejected here (not in HandleAction) so the usage
-        // line stays the single source of truth for the surface.
-        if (remainder.empty())
-        {
-            intent = first;
+        case TortoiseBots::PlayerAutogearTargetState::Shapeshifted:
+            handler->PSendSysMessage("'%s' must leave the shapeshift form first.", target->GetName());
             return true;
-        }
-        try
-        {
-            size_t pos = 0;
-            int seconds = std::stoi(remainder, &pos);
-            if (pos != remainder.size() || seconds < 0 || seconds > 60)
-                return false;
-            intent = first;
-            option = std::to_string(seconds);
+        case TortoiseBots::PlayerAutogearTargetState::Ready:
+            break;
+    }
+
+    bool const callerIsGm = requester->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
+    switch (TortoiseBots::DecidePlayerAutogearPermission(callerIsGm, sPlayerbotAIConfig.playerAutogearForAll,
+        target == requester, IsChallengeModeCharacter(target)))
+    {
+        case TortoiseBots::PlayerAutogearPermission::Allowed:
+            break;
+        case TortoiseBots::PlayerAutogearPermission::GmOnly:
+            handler->PSendSysMessage("Autogear is GM-only (AiPlayerbot.PlayerAutogearForAll = 1 lets every player gear themselves).");
             return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
+        case TortoiseBots::PlayerAutogearPermission::NotSelf:
+            handler->PSendSysMessage("You may only gear yourself with .autogear.");
+            return true;
+        case TortoiseBots::PlayerAutogearPermission::ChallengeGmOnly:
+            handler->PSendSysMessage("'%s' is on a challenge mode - only a GM may gear that character.", target->GetName());
+            return true;
     }
-    else if (!remainder.empty())
-        return false;
-    intent = first;
-    return true;
-}
 
-static bool IsRaidTargetMark(std::string const& mark)
-{
-    return RtiTargetValue::GetRtiIndex(mark) >= 0;
-}
-
-// One mark = one owner. After assigning <mark> to <owner>, every other owned
-// live bot in the same command scope holding that mark is reset to "none" and
-// persisted. "none" resolves to GetRtiIndex -1, so CurrentCcMark reports "-"
-// and the CC_ASSIGN snapshot drops the stale owner without extra plumbing.
-static void RevokeDuplicateCcOwners(Player* owner, std::string const& mark,
-    std::vector<Player*> const& scope)
-{
-    for (Player* other : scope)
+    uint8 const classId = target->GetClass();
+    std::string const scale = TortoiseBots::MatchAutogearSpec(classId, specToken);
+    uint32 const specId = scale.empty() ? 0 : sRandomItemMgr.GetSpecIdFor(classId, scale);
+    if (!specId)
     {
-        if (!other || other == owner || !IsLiveHeadlessBot(other))
-            continue;
-        PlayerbotAI* otherAi = PlayerbotAIStorage::Instance().GetAI(other);
-        if (!otherAi || !otherAi->GetAiObjectContext())
-            continue;
-        ai::Value<std::string>* otherMark =
-            otherAi->GetAiObjectContext()->GetValue<std::string>("rti cc");
-        if (!otherMark || otherMark->Get() != mark)
-            continue;
-        otherMark->Set("none");
-        sPlayerbotDbStore.Save(otherAi);
-    }
-}
-
-static std::string CurrentCcMark(PlayerbotAI* ai)
-{
-    if (!ai || !ai->GetAiObjectContext())
-        return "-";
-
-    std::string mark = ai->GetAiObjectContext()->GetValue<std::string>("rti cc")->Get();
-    return IsRaidTargetMark(mark) ? mark : "-";
-}
-
-static bool HandleAction(ChatHandler* handler, char const* args)
-{
-    Player* requester = Requester(handler);
-    std::string intent;
-    std::string option;
-    if (!requester || !ParseAction(Trim(args ? args : ""), intent, option))
-    {
-        SendActionError(handler, intent, "invalid", "Usage: .bot action attack/interrupt/stop/pull [seconds]/pullback [seconds]/come/stay/hold/follow/flee/focus skull/cc <mark> [bot]/cc clear [bot]/auto cc [on/off]/aoe [on/off]/loot [on/off]/repair/sell/rest/drink/eat/release/corpse run/learn/trade/ready/raid [status/tankface/douse/custom status/custom on/custom off]");
-        return true;
-    }
-    if (!requester->IsInWorld() || !requester->IsAlive() || requester->IsBeingTeleported())
-    {
-        SendActionError(handler, intent, "requester", "Requester must be alive, in world, and not teleporting.");
+        std::string const valid = TortoiseBots::ListAutogearSpecs(classId);
+        handler->PSendSysMessage("Unknown spec '%s'%s. Valid specs: %s",
+            specToken.c_str(), target == requester ? "" : " for that class",
+            valid.empty() ? "none for this class" : valid.c_str());
         return true;
     }
 
-    BotCommandContext context = BuildContext(requester);
-    bool tactical = intent == "pull" || intent == "pullback";
-    if ((intent == "attack" || intent == "interrupt" || tactical) && !context.enemyTarget)
+    // Spawn ceiling of a pool bot of the target's level; the ilvl argument
+    // may only lower it below max level, and may raise it at max level.
+    uint32 const defaultCeiling = TortoiseBots::GearItemLevelCap(target->GetLevel(),
+        sPlayerbotAIConfig.randomGearMaxItemLevelAboveLevel, sPlayerbotAIConfig.randomGearMaxLevel);
+    TortoiseBots::PlayerAutogearIlvl const ilvl = TortoiseBots::ResolvePlayerAutogearIlvl(
+        target->GetLevel(), TortoiseBots::kAutogearMaxLevel, requestedIlvl, defaultCeiling);
+    if (ilvl.clamped)
+        handler->PSendSysMessage("Item level %u is above the ceiling for level %u; using %u.",
+            requestedIlvl, target->GetLevel(), defaultCeiling);
+
+    PlayerbotFactory factory(target, target->GetLevel());
+    factory.AutogearPlayer(specId, ilvl.effective, ilvl.effective > defaultCeiling);
+
+    Item const* ranged = target->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    ItemPrototype const* rangedProto = ranged ? ranged->GetProto() : nullptr;
+
+    // Autogear hands out no ammo: warn when the equipped ranged weapon has
+    // none in the bags, like the owned-bot command does.
+    if (rangedProto && rangedProto->Class == ITEM_CLASS_WEAPON && !factory.HasAmmoInBagsFor(rangedProto->SubClass))
     {
-        SendActionError(handler, intent, "no-target", "Select a live non-bot target first.");
-        return true;
+        bool const gun = rangedProto->SubClass == ITEM_SUBCLASS_WEAPON_GUN;
+        handler->PSendSysMessage("Warning: %s has %s equipped but no %s in the bags - auto shot will not fire until they get some.",
+            target->GetName(), rangedProto->Name1, gun ? "bullets" : "arrows");
     }
-    if (intent == "interrupt")
-        return ExecuteInterruptAction(handler, context, requester);
 
-    std::vector<Player*> scope;
-    if (intent == "focus skull")
-    {
-        if (context.group && context.enemyTarget)
-        {
-            context.group->SetTargetIcon(static_cast<uint8>(RtiTargetValue::GetRtiIndex("skull")), context.enemyTarget->GetObjectGuid());
-        }
-        else if (context.group)
-        {
-            int skullIndex = RtiTargetValue::GetRtiIndex("skull");
-            ObjectGuid skullGuid = context.group->GetTargetIcon(static_cast<uint8>(skullIndex));
-            if (skullGuid.IsEmpty())
-            {
-                SendActionError(handler, intent, "no-target", "Select an enemy target or mark a target with Skull first.");
-                return true;
-            }
-        }
-        else if (!context.enemyTarget)
-        {
-            SendActionError(handler, intent, "no-target", "Select an enemy target or mark a target with Skull first.");
-            return true;
-        }
-        scope = context.partyBots;
-    }
-    else if (intent == "cc clear" || intent.compare(0, 9, "cc clear ") == 0)
-    {
-        // Dismissal: an explicit name clears only that bot; a targeted bot
-        // clears itself; otherwise the whole owned party is cleared. "none"
-        // is not a raid mark, so CurrentCcMark reports "-" and the next
-        // CC_ASSIGN snapshot drops the owner.
-        std::vector<Player*> clearScope;
-        if (intent.size() > 9)
-        {
-            Player* named = nullptr;
-            BotRecord* namedRecord = nullptr;
-            std::string namedName;
-            if (!ResolveOwnedBot(handler, intent.substr(9).c_str(), named, namedRecord, namedName))
-            {
-                SendActionError(handler, intent, "no-bot",
-                    "Unknown or uncontrollable bot name for cc clear.");
-                return true;
-            }
-            clearScope.push_back(named);
-        }
-        else if (context.selectedBot && IsLiveHeadlessBot(context.selectedBot))
-            clearScope.push_back(context.selectedBot);
-        else
-            clearScope = context.partyBots;
-        uint32 cleared = 0;
-        std::string clearedName = "-";
-        for (Player* bot : clearScope)
-        {
-            if (!bot || !IsLiveHeadlessBot(bot))
-                continue;
-            PlayerbotAI* botAi = PlayerbotAIStorage::Instance().GetAI(bot);
-            if (!botAi || !botAi->GetAiObjectContext())
-                continue;
-            botAi->GetAiObjectContext()->GetValue<std::string>("rti cc")->Set("none");
-            sPlayerbotDbStore.Save(botAi);
-            clearedName = bot->GetName();
-            ++cleared;
-        }
-        if (!cleared)
-        {
-            SendActionError(handler, intent, "no-target",
-                "Select an owned bot or have owned party bots to clear CC marks.");
-            return true;
-        }
-        SendActionAck(handler, intent,
-            clearScope.size() == 1 && cleared == 1
-                ? "bot:" + clearedName : "party",
-            cleared, clearedName);
-        return true;
-    }
-    else if (intent.compare(0, 3, "cc ") == 0)
-    {
-        // Optional explicit bot name ("cc <mark> <BotName>") assigns that
-        // owned bot without juggling the player's target. The mark token
-        // itself is lowercase; the name keeps its case for resolution.
-        std::string ccBotToken;
-        std::string ccMark = intent.substr(3);
-        size_t ccSpace = ccMark.find_first_of(" \t");
-        if (ccSpace != std::string::npos)
-        {
-            ccBotToken = Trim(ccMark.substr(ccSpace + 1));
-            ccMark = ccMark.substr(0, ccSpace);
-        }
-        int markIndex = RtiTargetValue::GetRtiIndex(ccMark);
-        Unit* ccTarget = context.enemyTarget;
+    TortoiseBots::PlayerAutogearRunCounts counts;
+    for (PlayerbotFactory::AutogearUpgrade const& upgrade : factory.autogearUpgrades)
+        TortoiseBots::CountPlayerAutogearRecord(counts, upgrade.oldItemId, upgrade.newItemId, upgrade.mailed);
 
-        // Selecting an enemy is the most explicit request: make that unit the
-        // requested raid mark. If the player selected a bot instead, preserve
-        // the existing group mark and use it as the assignment target.
-        if (ccTarget)
-        {
-            if (context.group)
-                context.group->SetTargetIcon(static_cast<uint8>(markIndex), ccTarget->GetObjectGuid());
-        }
-        else if (context.group && requester->GetMap())
-        {
-            ObjectGuid markGuid = context.group->GetTargetIcon(static_cast<uint8>(markIndex));
-            if (!markGuid.IsEmpty())
-                ccTarget = requester->GetMap()->GetUnit(markGuid);
-        }
-
-        if (ccTarget && (!ccTarget->IsInWorld() || !ccTarget->IsAlive()))
-            ccTarget = nullptr;
-
-        // An explicit name wins over the live target: same assignment path
-        // as the selected-bot case, including the immediate-cast probe when
-        // an enemy is selected or the mark already exists.
-        Player* namedBot = nullptr;
-        if (!ccBotToken.empty())
-        {
-            BotRecord* namedRecord = nullptr;
-            std::string namedName;
-            if (!ResolveOwnedBot(handler, ccBotToken.c_str(), namedBot, namedRecord, namedName))
-            {
-                SendActionError(handler, intent, "no-bot",
-                    "Unknown or uncontrollable bot name for cc assignment.");
-                return true;
-            }
-        }
-
-        Player* executor = nullptr;
-        std::string ccAction;
-        if (namedBot)
-        {
-            executor = namedBot;
-            if (ccTarget)
-            {
-                // Probe the named bot itself, not the party's best executor,
-                // so the immediate cast uses an action this bot owns.
-                BotCommandContext namedContext = context;
-                namedContext.selectedBot = namedBot;
-                ResolveCcExecutor(namedContext, ccTarget, ccMark, &ccAction);
-            }
-        }
-        else if (context.selectedBot && IsLiveHeadlessBot(context.selectedBot))
-        {
-            // A selected bot is an assignment request. It may be configured
-            // before an enemy is marked; when a live target is available, keep
-            // the mature capability probe for an immediate attempt, but never
-            // reject the assignment just because this current creature is not
-            // legal for that bot's CC spell.
-            executor = context.selectedBot;
-            if (ccTarget)
-            {
-                ResolveCcExecutor(context, ccTarget, ccMark, &ccAction);
-            }
-        }
-        else
-        {
-            if (!ccTarget)
-            {
-                SendActionError(handler, intent, "no-target",
-                    "Select an enemy target or an owned bot with an existing raid mark.");
-                return true;
-            }
-
-            executor = ResolveCcExecutor(context, ccTarget, ccMark, &ccAction);
-            if (!executor)
-            {
-                SendActionError(handler, intent, "no-cc",
-                    "No owned bot can CC this target (check class, target type, and spell state).");
-                return true;
-            }
-        }
-
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(executor);
-        if (!ai)
-        {
-            SendActionError(handler, intent, "no-ai", "The selected CC bot has no AI.");
-            return true;
-        }
-
-        // RtiCcValue is a per-bot preference. Persist it through the existing
-        // mature AI store so the assignment survives AI recreation/relogin.
-        if (!ExecuteQuietAction(ai, "rti", ai::Event(intent, "cc " + ccMark, requester)))
-        {
-            SendActionError(handler, intent, "failed", "The mature CC assignment was rejected.");
-            return true;
-        }
-        sPlayerbotDbStore.Save(ai);
-        // Exclusive ownership: the new owner keeps the mark; every other owned
-        // live party bot holding it is reset to "none" and persisted.
-        RevokeDuplicateCcOwners(executor, ccMark, context.partyBots);
-
-        if (ccTarget && !ccAction.empty())
-        {
-            // Break stay/follow in combat so a ranged executor can reach the
-            // target. The mature AI remains responsible for subsequent casts.
-            RelaxTacticalMovement(ai);
-            executor->SetSelectionGuid(ccTarget->GetObjectGuid());
-            ai->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(ccTarget);
-            sServerFacade.SetFacingTo(executor, ccTarget);
-            ai::Event ccEvent(intent, "cc " + ccMark, requester);
-            if (!ExecuteQuietAction(ai, ccAction, ccEvent))
-            {
-                // Direct execution deliberately bypasses prerequisites. Keep
-                // the mature CC action queued so its existing reach
-                // prerequisite can move and then cast without a command-side
-                // class/range table.
-                // Keep this explicit owner request eligible through later
-                // minimal ticks while the mature reach chain is in progress.
-                if (!QueueMatureAction(ai, ccAction, ccEvent, ACTION_PASSTROUGH))
-                {
-                    SendActionError(handler, intent, "failed",
-                        "The mature CC action could not be started.");
-                    return true;
-                }
-                // Keep the queued prerequisite chain intact for the first
-                // movement/cast decision; the quiet helper would rebuild the
-                // non-combat engine and drop it.
-                ai->DoNextAction(false, true);
-            }
-            else
-                ExecuteQuietNextAction(ai, true);
-        }
-
-        SendActionAck(handler, intent, (namedBot || context.selectedBot == executor)
-            ? "bot:" + std::string(executor->GetName()) : "party", 1, executor->GetName());
-        return true;
-    }
-    else if (intent == "raid status" || intent == "raid tankface" || intent == "raid douse" || intent == "raid custom status" || intent == "raid custom on" || intent == "raid custom off")
-        return HandleRaidAction(handler, context, requester, intent);
+    if (factory.autogearUpgrades.empty())
+        handler->PSendSysMessage("No upgrades for %s (%s) at item level %u - nothing changed.",
+            target->GetName(), specToken.c_str(), ilvl.effective);
     else
-        scope = ResolveDynamicScope(context);
-    if (tactical)
+        handler->PSendSysMessage("Geared %s as '%s': %u slot(s) equipped, %u replaced item(s) to the bags, %u mailed.",
+            target->GetName(), specToken.c_str(), counts.slotsEquipped, counts.replaced - counts.mailed, counts.mailed);
+
+    std::ostringstream logLine;
+    logLine << "PlayerAutogear: caller=" << requester->GetName() << " target=" << target->GetName()
+            << " spec=" << scale << " ilvl=" << ilvl.effective;
+    for (PlayerbotFactory::AutogearUpgrade const& upgrade : factory.autogearUpgrades)
+        logLine << " [" << uint32(upgrade.slot) << "] " << upgrade.oldItemId << "->" << upgrade.newItemId
+            << (upgrade.mailed ? " (mailed)" : "");
+    sLog.outString("%s", logLine.str().c_str());
+    return true;
+}
+
+// `.bot help` answers with the addon protocol version line; the TBM addon
+// parses it, so the output must stay exactly as it is.
+bool HandleHelp(ChatHandler* handler, char const* /*args*/)
+{
+    handler->PSendSysMessage("TBM:VERSION|%s", BuildVersion().c_str());
+    return true;
+}
+
+// One row per `.bot` subcommand: primary name, handler, short usage, aliases, and whether it shows
+// in the top-level usage line. Dispatch and the docs check (tools/verify_command_docs.py) read every
+// row; the usage line skips the work-in-progress commands while their flags are off (typed anyway,
+// they answer 'disabled').
+struct BotCommandEntry
+{
+    char const* name;
+    bool (*handler)(ChatHandler*, char const*);
+    char const* usage;
+    std::initializer_list<char const*> aliases;
+    bool (*visible)();
+};
+
+static bool AlwaysVisible() { return true; }
+static bool CommanderVisible() { return RemoteCommander::CommanderSurfaceOn(CurrentCommanderGates()); }
+static bool TraceVisible() { return sPlayerbotAIConfig.runTrace; }
+static bool RunVisible() { return RemoteCommander::RunSurfaceOn(CurrentCommanderGates()); }
+
+static BotCommandEntry const botCommands[] = {
+    {"ah", HandleAhBot, "ah <status|reload|rebuild|item ...>", {"ahbot"}, AlwaysVisible},
+    {"action", HandleAction, "action <intent>", {}, AlwaysVisible},
+    {"commander", HandleCommander, "commander <bind|unbind|status|view ...>", {}, CommanderVisible},
+    {"cmd", HandleCommanderOrder, "cmd <order>", {}, CommanderVisible},
+    {"trace", HandleTrace, "trace <start|stop|status> ...", {}, TraceVisible},
+    {"run", HandleDungeonRun, "run <start|pause|resume|skip|stop|status|list|here> ...", {}, RunVisible},
+    {"add", HandleAdd, "add <characterName>", {}, AlwaysVisible},
+    {"remove", HandleRemove, "remove <characterName>", {"rm"}, AlwaysVisible},
+    {"logout", HandleLogout, "logout <online bot name>", {}, AlwaysVisible},
+    {"roster", HandleRoster, "roster", {}, AlwaysVisible},
+    {"follow", HandleFollow, "follow <botName>", {}, AlwaysVisible},
+    {"invite", HandleInvite, "invite <online bot name>", {}, AlwaysVisible},
+    {"uninvite", HandleUninvite, "uninvite <online bot name>", {"kick"}, AlwaysVisible},
+    {"stay", HandleStay, "stay <online bot name>", {}, AlwaysVisible},
+    {"guard", HandleGuard, "guard <online bot name>", {}, AlwaysVisible},
+    {"free", HandleFree, "free <online bot name>", {}, AlwaysVisible},
+    {"ready", HandleReady, "ready <online bot name>", {}, AlwaysVisible},
+    {"attack", HandleAttack, "attack <online bot name>", {}, AlwaysVisible},
+    {"interrupt", HandleInterrupt, "interrupt <online bot name>", {}, AlwaysVisible},
+    {"formation", HandleFormation, "formation [botName] <formation>", {}, AlwaysVisible},
+    {"cc", HandleCc, "cc <mark> [bot] | cc clear [bot]", {}, AlwaysVisible},
+    {"list", HandleList, "list", {}, AlwaysVisible},
+    {"stats", HandleStats, "stats", {}, AlwaysVisible},
+    {"status", HandleStatus, "status <online bot name>", {}, AlwaysVisible},
+    {"lease", HandleLease, "lease [status]", {}, AlwaysVisible},
+    {"version", HandleVersion, "version", {"v", "about", "credits"}, AlwaysVisible},
+    {"features", HandleFeatures, "features", {}, AlwaysVisible},
+    {"pullback", HandlePullback, "pullback", {"pull-back"}, AlwaysVisible},
+    {"role", HandleRole, "role <online bot name/self/your name> <tank/healer/dps/clear>", {}, AlwaysVisible},
+    {"summon", HandleSummon, "summon <online bot name>", {}, AlwaysVisible},
+    {"maintenance", HandleMaintenance, "maintenance <online bot name>", {}, AlwaysVisible},
+    {"autogear", HandleAutogear, "autogear <online bot name> [quality|ilvl]", {}, AlwaysVisible},
+    {"hire", HandleHire, "hire <class> [dps/tank/healer] ... | hire raid <preset> [tier]", {}, AlwaysVisible},
+    {"pool", HandlePool, "pool <status|accounts|adopt ...>", {}, AlwaysVisible},
+    {"loot", HandleLoot, "loot [on/off]", {}, AlwaysVisible},
+    {"lootlog", HandleLootLog, "lootlog [cursor]", {}, AlwaysVisible},
+    {"repair", HandleRepair, "repair", {}, AlwaysVisible},
+    {"sell", HandleSell, "sell", {}, AlwaysVisible},
+    {"downtime", HandleDowntime, "downtime [online bot name]", {}, AlwaysVisible},
+    {"rest", HandleRest, "rest", {"drink", "eat"}, AlwaysVisible},
+    {"release", HandleRelease, "release", {}, AlwaysVisible},
+    {"corpse", HandleCorpseShortcut, "corpse run", {}, AlwaysVisible},
+    {"corpserun", HandleCorpseRun, "corpserun", {}, AlwaysVisible},
+    {"learn", HandleLearn, "learn", {}, AlwaysVisible},
+    {"trade", HandleTrade, "trade", {}, AlwaysVisible},
+    {"command", HandleMatureCommand, "command <botName> <Playerbot command>", {}, AlwaysVisible},
+    {"inv", HandleInventory, "inv <online bot you control>", {"inventory"}, AlwaysVisible},
+    {"item", HandleItem, "item <bot> <trade|equip|unequip|give ...>", {}, AlwaysVisible},
+    {"behavior", HandleBehavior, "behavior <bot|party|raid> <behavior> <on|off>", {"behaviour"}, AlwaysVisible},
+    {"totem", HandleTotem, "totem <bot|party|raid> ...", {}, AlwaysVisible},
+    {"strategy", HandleStrategy, "strategy <+/-/~><strategy name> [role or botName] | strategy reset", {}, AlwaysVisible},
+    {"help", HandleHelp, "help", {"h"}, AlwaysVisible},
+};
+
+static BotCommandEntry const* FindBotCommand(std::string const& cmd)
+{
+    for (BotCommandEntry const& entry : botCommands)
     {
-        Player* executor = ResolvePullExecutor(context);
-        if (!executor)
-        {
-            SendActionError(handler, intent, "no-tank", "No live tank-capable owned party bot can pull this target.");
-            return true;
-        }
-
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(executor);
-        // Join delay: per-command [seconds] (0-60, parsed) or the configured
-        // default. For a pullback the window runs from the tank's arrival at
-        // the anchor; the hold placed below keeps DPS waiting through the
-        // return leg and is re-stamped on arrival.
-        bool pullback = intent == "pullback";
-        uint32 joinDelay = pullback
-            ? sPlayerbotAIConfig.pullBackDpsJoinDelay
-            : sPlayerbotAIConfig.pullDpsJoinDelay;
-        if (!option.empty())
-            joinDelay = static_cast<uint32>(std::stoi(option));
-        // Pull and Pullback share the mature request action; the per-command
-        // return mode (plus join delay) is recorded on the PullStrategy
-        // (never sticky). The tank's default is restored when the pull ends.
-        if (!ConfigurePullMode(ai, pullback, joinDelay))
-        {
-            char const* message = pullback
-                ? "The mature pullback strategy is unavailable."
-                : "The mature ordinary-pull strategy is unavailable.";
-            SendActionError(handler, intent, "pull-policy", message);
-            return true;
-        }
-
-        // Report a body-pull substitution honestly: "reach pull" means the
-        // tank has no working ranged option, so it walks in, hits the mob in
-        // melee once, then returns to the anchor like a ranged pullback. The
-        // ACK detail carries it for both intents.
-        std::string pullActionName;
-        if (PullStrategy* probe = PullStrategy::Get(ai))
-            pullActionName = probe->GetPullActionName();
-        bool bodyPull = pullActionName == "reach pull";
-
-        // Pulling requires tank movement: break stay!
-        RelaxTacticalMovement(ai);
-        // A pull after a flee brings the whole party back, not just the tank.
-        for (Player* member : context.partyBots)
-            EndFlee(PlayerbotAIStorage::Instance().GetAI(member));
-        PausePartyDpsForPull(context, executor, joinDelay, pullback);
-        // Snapshot the target GUID: the live selection can change between
-        // command validation and the pull tick.
-        ai::Event pullEvent(intent, context.enemyTarget->GetObjectGuid(), requester);
-        if (!ExecuteQuietAction(ai, "pull my target", pullEvent))
-        {
-            SendActionError(handler, intent, "failed", "The native pull strategy rejected the target.");
-            return true;
-        }
-        // A human order acts now: the tank's own action clock (left over from
-        // whatever it was doing) would otherwise stall the pull for the rest of
-        // its delay before the second pull tick ever runs - the reported "tank
-        // stands still for seconds, then starts pulling".
-        ai->ClearActionClock();
-        // Pull start/action are normal movement-priority actions.  A minimal
-        // step filters them out and leaves the tank waiting for a later tick.
-        ExecuteQuietNextAction(ai, false);
-
-        // A ranged pull closes the distance with a point move to a firing
-        // position. If that move cannot be launched the tank stands where it
-        // was and the pull can only run out its 15 s window - report it instead
-        // of acknowledging a pull that never started (issue #389). A body pull
-        // is exempt: its melee chase is launched by the core on the next
-        // movement tick, not inside this AI tick.
-        if (!bodyPull)
-        {
-            Unit* pullTarget = nullptr;
-            float pullRange = 0.0f;
-            if (PullStrategy* probe = PullStrategy::Get(ai))
-            {
-                pullTarget = probe->GetTarget();
-                pullRange = probe->GetRange();
-            }
-
-            bool started = !pullTarget || !pullTarget->IsInWorld() ||
-                sServerFacade.isMoving(executor) ||
-                executor->GetDistance(pullTarget) <= pullRange;
-
-            if (!started)
-            {
-                // Abort the way the pull timeout would, so the tank is not left
-                // holding the pull target or the party.
-                ExecuteQuietAction(ai, "pull end", ai::Event(intent, "", requester));
-                SendActionError(handler, intent, "unreachable",
-                    "The tank could not start moving to a firing position for the pull.");
-                return true;
-            }
-        }
-
-        std::string scope = context.selectedBot == executor
-            ? "bot:" + std::string(executor->GetName()) : "party";
-        if (bodyPull)
-            SendActionAck(handler, intent, scope, 1, std::string(executor->GetName()) + "|body-pull");
-        else
-            SendActionAck(handler, intent, scope, 1, executor->GetName());
-        return true;
+        if (cmd == entry.name)
+            return &entry;
+        for (char const* alias : entry.aliases)
+            if (cmd == alias)
+                return &entry;
     }
+    return nullptr;
+}
 
-    if (scope.empty())
+static std::string BuildBotUsageLine()
+{
+    std::string usage = "Usage: .bot ";
+    bool first = true;
+    for (BotCommandEntry const& entry : botCommands)
     {
-        SendActionError(handler, intent, "no-bots", "No live owned party bots are controllable.");
-        return true;
-    }
-
-    uint32 succeeded = 0;
-    std::string aoeState;
-    for (Player* bot : scope)
-    {
-        // Scope entries are resolved live from ObjectAccessor, but earlier
-        // iterations run full AI actions; re-check before dereferencing so a
-        // bot that logged out mid-loop is skipped, not crashed into (#225).
-        if (!bot || !bot->IsInWorld())
+        if (!entry.visible())
             continue;
-
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-
-        bool accepted = false;
-        if (intent == "attack")
-        {
-            // AttackMyTargetAction intentionally reads requester's selection,
-            // preserving the mature target validation and combat path.
-            // Break stay and follow in combat so bots can move to and fight the target!
-            RelaxTacticalMovement(ai);
-            // Explicit attack unleashes DPS early: drop the wait window and
-            // our anchor stay (never a player-placed stay). No-op when absent.
-            ReleasePartyDpsFromPull(context, bot);
-            // Dedicated healers should support the party, not be forced to target and attack the enemy
-            if (!PlayerbotAI::IsHeal(bot))
-            {
-                accepted = ExecuteQuietAction(ai, "attack my target",
-                    ai::Event("action attack", "", requester));
-            }
-            else
-            {
-                accepted = true;
-            }
-            // Caster rotations and party heals are below the minimal-action
-            // cutoff.  Run a normal first combat decision after committing the
-            // explicit target so ranged bots engage alongside melee bots.
-            ExecuteQuietNextAction(ai, false);
-        }
-        else if (intent == "stop")
-        {
-            // Keep healing and movement strategies enabled: stop only combat,
-            // then use the mature narrow reset/target cleanup.
-            bot->CombatStopWithPets(true);
-            ai->Reset(false);
-            bot->GetMotionMaster()->Clear();
-            accepted = true;
-        }
-        else if (intent == "follow")
-        {
-            // FollowChatShortcutAction owns the cross-engine movement
-            // transition; this narrow clear only discards a stale movement
-            // generator left by the preceding tactical action.
-            if (!BindMovementMaster(requester, bot))
-                continue;
-            bot->GetMotionMaster()->Clear();
-            accepted = ExecuteQuietAction(ai, "follow chat shortcut",
-                ai::Event(intent, "", requester));
-        }
-        else if (intent == "flee")
-        {
-            // Break off: drop combat and any pull hold, then the mature flee
-            // shortcut parks the bot in passive follow on the requester. The
-            // next tactical order (attack, pull, follow, stay...) ends it.
-            ReleasePartyDpsFromPull(context, bot);
-            bot->CombatStopWithPets(true);
-            ai->Reset(false);
-            bot->GetMotionMaster()->Clear();
-            if (!BindMovementMaster(requester, bot))
-                continue;
-            accepted = ExecuteQuietAction(ai, "flee chat shortcut",
-                ai::Event(intent, "", requester));
-        }
-        else if (intent == "stay")
-        {
-            accepted = ExecuteQuietAction(ai, "stay chat shortcut",
-                ai::Event(intent, "", requester));
-        }
-        else if (intent == "come" || intent == "hold" || intent == "comestay")
-        {
-            ai->Reset();
-            // Use the same owner-controlled transition as the mature Stay
-            // shortcut; the captured stay position below remains Come's
-            // regroup anchor.
-            ai->SetMovementStrategy("stay");
-            ai::PositionMap& posMap = ai->GetAiObjectContext()->GetValue<ai::PositionMap&>("position")->Get();
-            ai::PositionEntry pos = posMap["stay"];
-            pos.Set(WorldPosition(requester));
-            posMap["stay"] = pos;
-            accepted = ExecuteQuietAction(ai, "return to stay position",
-                ai::Event("return to stay position", "stay", requester));
-        }
-        else if (intent == "ready")
-        {
-            accepted = ExecuteQuietAction(ai, "ready check",
-                ai::Event(intent, "", requester));
-        }
-        else if (intent == "rest" || intent == "drink" || intent == "eat")
-        {
-            bool rested = false;
-            if (bot->GetPowerType() == POWER_MANA && bot->GetPower(POWER_MANA) < bot->GetMaxPower(POWER_MANA))
-                rested = ExecuteQuietAction(ai, "drink", ai::Event(intent, "drink", requester)) || rested;
-            if (bot->GetHealth() < bot->GetMaxHealth())
-                rested = ExecuteQuietAction(ai, "food", ai::Event(intent, "food", requester)) || rested;
-            accepted = rested || (bot->GetHealth() >= bot->GetMaxHealth() &&
-                (bot->GetPowerType() != POWER_MANA || bot->GetPower(POWER_MANA) >= bot->GetMaxPower(POWER_MANA)));
-        }
-        else if (intent == "aoe")
-        {
-            bool enable = option == "on" ||
-                (option.empty() && !ai->HasStrategy("dps aoe", BotState::BOT_STATE_COMBAT));
-            if (option == "off")
-                enable = false;
-            ai->ChangeStrategy((enable ? "+" : "-") + std::string("dps aoe"),
-                BotState::BOT_STATE_COMBAT);
-            ExecuteQuietNextAction(ai, true);
-            accepted = ai->HasStrategy("dps aoe", BotState::BOT_STATE_COMBAT) == enable;
-        }
-        else if (intent == "auto cc")
-        {
-            // Opt-in smart auto CC, OFF by default. Persisted like the loot
-            // toggle so the choice survives relog; explicit `.bot action cc`
-            // marks always win (CcTargetValue returns them first).
-            bool enable = option == "on" ||
-                (option.empty() && !ai->HasStrategy("auto cc", BotState::BOT_STATE_COMBAT));
-            if (option == "off")
-                enable = false;
-            ai->ChangeStrategy((enable ? "+" : "-") + std::string("auto cc"),
-                BotState::BOT_STATE_COMBAT);
-            sPlayerbotDbStore.Save(ai);
-            ExecuteQuietNextAction(ai, true);
-            accepted = ai->HasStrategy("auto cc", BotState::BOT_STATE_COMBAT) == enable;
-        }
-        else if (intent == "focus skull")
-        {
-            RelaxTacticalMovement(ai);
-            bool set = ExecuteQuietAction(ai, "rti",
-                ai::Event("focus skull", "skull", requester));
-            accepted = set && ExecuteQuietAction(ai, "attack rti target",
-                ai::Event("focus skull", "", requester));
-            ExecuteQuietNextAction(ai, true);
-        }
-        else if (intent == "loot")
-        {
-            bool enable = option == "on" ||
-                (option.empty() && !ai->HasStrategy("loot", BotState::BOT_STATE_NON_COMBAT));
-            if (option == "off")
-                enable = false;
-            ai->ChangeStrategy((enable ? "+" : "-") + std::string("loot"),
-                BotState::BOT_STATE_NON_COMBAT);
-            sPlayerbotDbStore.Save(ai);
-            accepted = ai->HasStrategy("loot", BotState::BOT_STATE_NON_COMBAT) == enable;
-        }
-        else if (intent == "repair")
-        {
-            accepted = ExecuteQuietAction(ai, "repair", ai::Event(intent, "repair", requester));
-        }
-        else if (intent == "sell")
-        {
-            accepted = ExecuteQuietAction(ai, "sell", ai::Event(intent, "sell", requester));
-        }
-        else if (intent == "release")
-        {
-            if (!bot || bot->IsAlive())
-                continue;
-            accepted = ExecuteQuietAction(ai, "release", ai::Event(intent, "release", requester));
-        }
-        else if (intent == "corpse run")
-        {
-            if (!bot || bot->IsAlive())
-                continue;
-            accepted = ExecuteQuietAction(ai, "corpse run", ai::Event(intent, "corpse run", requester));
-        }
-        else if (intent == "learn")
-        {
-            accepted = ExecuteQuietAction(ai, "trainer", ai::Event(intent, "learn", requester));
-        }
-        else if (intent == "trade")
-        {
-            if (context.selectedBot != bot)
-                continue;
-            accepted = ExecuteQuietAction(ai, "trade", ai::Event(intent, requester->GetName(), requester));
-        }
-
-        if (accepted)
-        {
-            ++succeeded;
-            if (intent == "aoe")
-            {
-                std::string current = ai->HasStrategy("dps aoe", BotState::BOT_STATE_COMBAT)
-                    ? "on" : "off";
-                if (aoeState.empty())
-                    aoeState = current;
-                else if (aoeState != current)
-                    aoeState = "mixed";
-            }
-            if (intent == "loot")
-            {
-                std::string current = ai->HasStrategy("loot", BotState::BOT_STATE_NON_COMBAT)
-                    ? "on" : "off";
-                if (aoeState.empty())
-                    aoeState = current;
-                else if (aoeState != current)
-                    aoeState = "mixed";
-            }
-            if (intent == "auto cc")
-            {
-                std::string current = ai->HasStrategy("auto cc", BotState::BOT_STATE_COMBAT)
-                    ? "on" : "off";
-                if (aoeState.empty())
-                    aoeState = current;
-                else if (aoeState != current)
-                    aoeState = "mixed";
-            }
-        }
+        if (!first)
+            usage += '/';
+        first = false;
+        usage += entry.name;
     }
-
-    if (!succeeded)
-    {
-        SendActionError(handler, intent, "failed", "No scoped bot accepted the mature action.");
-        return true;
-    }
-
-    std::string scopeName = context.selectedBot && scope.size() == 1
-        ? "bot:" + std::string(context.selectedBot->GetName()) : "party";
-    SendActionAck(handler, intent, scopeName, succeeded,
-        intent == "aoe" || intent == "loot" || intent == "auto cc" ? aoeState : "");
-    return true;
-}
-
-static bool HandleRaidAction(ChatHandler* handler, BotCommandContext const& context, Player* requester, std::string const& intent)
-{
-    std::vector<Player*> scope = ResolveDynamicScope(context);
-    if (scope.empty())
-    {
-        SendActionError(handler, intent, "no-bots", "No live owned party bots are controllable.");
-        return true;
-    }
-    if (intent == "raid status")
-    {
-        uint32 count = 0;
-        for (Player* bot : scope)
-        {
-            if (!bot || !bot->IsInWorld())
-                continue;
-            PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-            if (!ai)
-                continue;
-            std::string active;
-            for (char const* strategy : { "molten core", "onyxia's lair", "blackwing lair", "naxxramas",
-                                          "onyxia", "magmadar", "suppression room", "four horseman",
-                                          "emerald sanctum", "lower karazhan", "karazhan crypt",
-                                          "solnius", "araxxna", "moroes" })
-            {
-                if (ai->HasStrategy(strategy, BotState::BOT_STATE_COMBAT))
-                    active += (active.empty() ? "" : ",") + std::string(strategy);
-            }
-            handler->PSendSysMessage("TBM:ACTION_ACK|raid status|bot:%s|1|%s",
-                bot->GetName(), active.empty() ? "outdoor" : active.c_str());
-            ++count;
-        }
-        if (!count)
-            SendActionError(handler, intent, "failed", "No scoped bot accepted the mature action.");
-        return true;
-    }
-    if (intent == "raid custom status" || intent == "raid custom on" || intent == "raid custom off")
-    {
-        // Custom Turtle raid tactics gate (Emerald Sanctum / Lower Karazhan /
-        // Karazhan Crypt): enabling adds the three transition strategies so
-        // zone-ins swap them in; disabling drops them for manual control.
-        // Playtesting-dependent geometry stays out regardless (#237).
-        uint32 succeeded = 0;
-        for (Player* bot : scope)
-        {
-            if (!bot || !bot->IsInWorld())
-                continue;
-            PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-            if (!ai)
-                continue;
-            if (intent == "raid custom status")
-            {
-                std::string active;
-                for (char const* strategy : { "emerald sanctum", "lower karazhan", "karazhan crypt" })
-                {
-                    if (ai->HasStrategy(strategy, BotState::BOT_STATE_COMBAT))
-                        active += (active.empty() ? "" : ",") + std::string(strategy);
-                }
-                handler->PSendSysMessage("TBM:ACTION_ACK|raid custom status|bot:%s|1|%s",
-                    bot->GetName(), active.empty() ? "off" : active.c_str());
-                ++succeeded;
-                continue;
-            }
-            bool enable = intent == "raid custom on";
-            for (BotState state : { BotState::BOT_STATE_COMBAT, BotState::BOT_STATE_NON_COMBAT })
-            {
-                ai->ChangeStrategy((enable ? "+" : "-") + std::string("emerald sanctum"), state);
-                ai->ChangeStrategy((enable ? "+" : "-") + std::string("lower karazhan"), state);
-                ai->ChangeStrategy((enable ? "+" : "-") + std::string("karazhan crypt"), state);
-            }
-            ++succeeded;
-        }
-        if (!succeeded)
-        {
-            SendActionError(handler, intent, "failed", "No scoped bot accepted the mature action.");
-            return true;
-        }
-        std::string scopeName = context.selectedBot && scope.size() == 1
-            ? "bot:" + std::string(context.selectedBot->GetName()) : "party";
-        SendActionAck(handler, intent, scopeName, succeeded, "");
-        return true;
-    }
-    uint32 succeeded = 0;
-    char const* matureAction = intent == "raid tankface" ? "dragon tank face away" : "douse mc rune eternal";
-    for (Player* bot : scope)
-    {
-        if (!bot || !bot->IsInWorld())
-            continue;
-        PlayerbotAI* ai = PlayerbotAIStorage::Instance().GetAI(bot);
-        if (!ai)
-            continue;
-        bool accepted = ExecuteQuietAction(ai, matureAction, ai::Event(intent, "", requester));
-        if (!accepted && intent == "raid douse")
-            accepted = ExecuteQuietAction(ai, "douse mc rune aqual", ai::Event(intent, "", requester));
-        if (accepted)
-            ++succeeded;
-    }
-    if (!succeeded)
-    {
-        SendActionError(handler, intent, "failed", "No scoped bot accepted the mature action.");
-        return true;
-    }
-    std::string scopeName = context.selectedBot && scope.size() == 1
-        ? "bot:" + std::string(context.selectedBot->GetName()) : "party";
-    SendActionAck(handler, intent, scopeName, succeeded, "");
-    return true;
-}
-
-static bool HandleAhBot(ChatHandler* handler, char const* args)
-{
-    if (!handler)
-        return false;
-
-    Player* requester = Requester(handler);
-    if (requester && !IsBotAdministrator(requester))
-    {
-        handler->PSendSysMessage("You do not have permission to manage the AH bot.");
-        return true;
-    }
-
-    std::string argStr = args ? args : "";
-    argStr = Trim(argStr);
-    if (argStr.empty() || argStr == "help")
-    {
-        handler->PSendSysMessage("AHBot commands:");
-        handler->PSendSysMessage("  .bot ah status - Display synthetic AH engine status and telemetry");
-        handler->PSendSysMessage("  .bot ah reload - Reload price overrides and bans from ahbot_items");
-        handler->PSendSysMessage("  .bot ah rebuild [all] - Restart market pass (all = expire active unbid synthetic items)");
-        handler->PSendSysMessage("  .bot ah item <id> - View override for item");
-        handler->PSendSysMessage("  .bot ah item <id> reset - Remove override for item");
-        handler->PSendSysMessage("  .bot ah item <id> <value> [chance] [min] [max] - Set override (0 0 = blacklist)");
-        return true;
-    }
-
-    std::stringstream ss(argStr);
-    std::string subCmd;
-    ss >> subCmd;
-    for (char& c : subCmd) c = tolower(c);
-
-    if (subCmd == "status")
-    {
-        std::string status = AhMarketService::Instance().GetStatus();
-        handler->PSendSysMessage("%s", status.c_str());
-        return true;
-    }
-
-    if (subCmd == "reload")
-    {
-        AhMarketService::Instance().ReloadOverrides();
-        handler->PSendSysMessage("AHBot overrides reloaded from database.");
-        return true;
-    }
-
-    if (subCmd == "rebuild")
-    {
-        std::string mode;
-        ss >> mode;
-        for (char& c : mode) c = tolower(c);
-        bool all = (mode == "all");
-        AhMarketService::Instance().RebuildMarket(all);
-        if (all)
-            handler->PSendSysMessage("AHBot market rebuild scheduled (expiring active unbid synthetic listings).");
-        else
-            handler->PSendSysMessage("AHBot market rebuild scheduled.");
-        return true;
-    }
-
-    if (subCmd == "item")
-    {
-        uint32_t itemId = 0;
-        if (!(ss >> itemId) || itemId == 0)
-        {
-            handler->PSendSysMessage("Usage: .bot ah item <id> [value [chance [min [max]]]] / reset");
-            return true;
-        }
-
-        std::string nextToken;
-        if (!(ss >> nextToken))
-        {
-            if (AhMarketService::Instance().IsItemBlacklisted(itemId))
-            {
-                handler->PSendSysMessage("AHBot item %u is blacklisted/banned.", itemId);
-            }
-            else
-            {
-                handler->PSendSysMessage("AHBot item %u has no blacklist or has an active price override.", itemId);
-            }
-            return true;
-        }
-
-        for (char& c : nextToken) c = tolower(c);
-        if (nextToken == "reset")
-        {
-            AhMarketService::Instance().ResetItemOverride(itemId);
-            handler->PSendSysMessage("AHBot item %u override reset.", itemId);
-            return true;
-        }
-
-        uint32_t value = 0;
-        try {
-            value = std::stoul(nextToken);
-        } catch (...) {
-            handler->PSendSysMessage("Invalid value '%s' for item override.", nextToken.c_str());
-            return true;
-        }
-
-        uint32_t chance = 100;
-        uint32_t minAmount = 1;
-        uint32_t maxAmount = 1;
-
-        if (ss >> chance)
-        {
-            if (ss >> minAmount)
-            {
-                if (!(ss >> maxAmount))
-                    maxAmount = minAmount;
-            }
-        }
-
-        AhMarketService::Instance().SetItemOverride(itemId, value, chance, minAmount, maxAmount);
-        if (value == 0 && chance == 0)
-        {
-            handler->PSendSysMessage("AHBot item %u blacklisted (value=0, chance=0).", itemId);
-        }
-        else
-        {
-            handler->PSendSysMessage("AHBot item %u override set: value=%u copper, chance=%u%%, amount=%u..%u.",
-                itemId, value, chance, minAmount, maxAmount);
-        }
-        return true;
-    }
-
-    handler->PSendSysMessage("Unknown AHBot command '%s'. Try .bot ah help", subCmd.c_str());
-    return true;
-}
-
-
-// ---- Managed random-bot pool (issue #265) ---------------------------------
-// The module's AllCommandScript intercepts `.bot` before the core command
-// table can protect a subcommand, so every permission check below is local.
-// Adoption and account listing are server-console-only: no player, addon
-// message, hired bot or headless session can reach them.
-static bool IsServerConsole(ChatHandler* handler)
-{
-    if (!handler || handler->GetSession())
-        return false;
-#ifdef MANGOSSERVER_CHAT_H
-    // Remote-access and Discord commands also use null-session CliHandler
-    // instances, carrying the calling account's security level. ChatHandler
-    // keeps GetAccessLevel() protected, so the concrete handler type is the only
-    // way to read it: only the stdin console (and operator-written
-    // `pending_commands` rows, which the core also queues as SEC_CONSOLE) carries
-    // SEC_CONSOLE, so a remote user of any account rank is rejected here.
-    CliHandler* cli = dynamic_cast<CliHandler*>(handler);
-    return cli && cli->GetAccessLevel() == SEC_CONSOLE;
-#else
-    return true; // lens stub: the real build always takes the branch above
-#endif
-}
-
-static bool RequirePoolAdmin(ChatHandler* handler)
-{
-    if (IsServerConsole(handler))
-        return true;
-    WorldSession* session = handler ? handler->GetSession() : nullptr;
-    if (!session || !session->GetPlayer())
-    {
-        handler->PSendSysMessage("You must be in-game or at the server console.");
-        return false;
-    }
-    if (session->GetSecurity() < SEC_GAMEMASTER)
-    {
-        handler->PSendSysMessage("Your account may not inspect the bot pool.");
-        return false;
-    }
-    return true;
-}
-
-static bool RequireServerConsole(ChatHandler* handler)
-{
-    if (IsServerConsole(handler))
-        return true;
-    handler->PSendSysMessage("This command is only available at the server console.");
-    return false;
-}
-
-static bool HandlePoolStatus(ChatHandler* handler)
-{
-    if (!RequirePoolAdmin(handler))
-        return true;
-
-    RandomBotAccountRegistry& registry = RandomBotAccountRegistry::Instance();
-    RandomBotPoolReset& reset = RandomBotPoolReset::Instance();
-
-    // Parsed from the module's startup configuration (aiplayerbot.conf is read
-    // once at startup, so `.reload config` cannot change what a reset does).
-    // This reports the configured mode even when the service never planned one.
-    PoolResetSetting setting = ParsePoolResetSetting(sPlayerbotAIConfig.randomBotPoolReset);
-    std::string mode = PoolResetModeName(setting.mode);
-    if (setting.mode == PoolResetMode::Once)
-        mode += ":" + setting.token;
-    if (setting.mode == PoolResetMode::Invalid)
-        mode += " (" + setting.error + ")";
-
-    // Live count of the characters on managed pool accounts. A failed count is
-    // reported as unavailable rather than as zero.
-    uint32 managedCharacters = 0;
-    std::string countError;
-    bool haveCharacterCount = registry.CountManagedCharacters(managedCharacters, countError);
-
-    handler->PSendSysMessage("TortoiseBots pool status:");
-    handler->PSendSysMessage("  reset setting      : %s", mode.c_str());
-    if (setting.mode == PoolResetMode::Once)
-        handler->PSendSysMessage("  requested generation: %s", setting.token.c_str());
-    handler->PSendSysMessage("  applied generation : %s",
-        reset.AppliedGeneration().empty() ? "(none)" : reset.AppliedGeneration().c_str());
-    handler->PSendSysMessage("  managed accounts   : %u%s",
-        static_cast<uint32>(registry.AccountCount()),
-        registry.IsValidated() ? "" : " (registry NOT validated)");
-    if (haveCharacterCount)
-        handler->PSendSysMessage("  managed characters : %u", managedCharacters);
-    else
-        handler->PSendSysMessage("  managed characters : (count unavailable: %s)", countError.c_str());
-    handler->PSendSysMessage("  reset phase        : %s", reset.PhaseName());
-    if (reset.TargetCount() && reset.Phase() == PoolResetPhase::SettlingAuctions)
-        handler->PSendSysMessage("  reset progress     : %u/%u characters' auctions settled",
-            reset.SettledAuctionOwnerCount(), reset.TargetCount());
-    else if (reset.TargetCount())
-        handler->PSendSysMessage("  reset progress     : %u/%u characters deleted",
-            reset.ProcessedCount(), reset.TargetCount());
-    // The service is the single authority for availability: it combines the
-    // registry state with the reset state.
-    handler->PSendSysMessage("  pool available     : %s",
-        RandomBotService::Instance().IsPoolAvailable() ? "yes" : "no");
-    if (!reset.LastFailure().empty())
-        handler->PSendSysMessage("  last failure       : %s", reset.LastFailure().c_str());
-    return true;
-}
-
-static bool HandlePoolAccounts(ChatHandler* handler)
-{
-    if (!RequireServerConsole(handler))
-        return true;
-
-    RandomBotAccountRegistry& registry = RandomBotAccountRegistry::Instance();
-    if (!registry.IsValidated())
-    {
-        handler->PSendSysMessage("The managed-account registry could not be read: %s",
-            registry.LastError().empty() ? "unknown error" : registry.LastError().c_str());
-        return true;
-    }
-
-    uint32 total = 0;
-    std::string countError;
-    bool haveTotal = registry.CountManagedCharacters(total, countError);
-    handler->PSendSysMessage("Managed pool accounts: %u, characters: %s",
-        static_cast<uint32>(registry.AccountCount()),
-        haveTotal ? std::to_string(total).c_str() : "(count unavailable)");
-    for (PoolAccount const& account : registry.Accounts())
-    {
-        uint32 characters = 0;
-        std::unique_ptr<QueryResult> count(CharacterDatabase.PQuery(
-            "SELECT COUNT(*) FROM `characters` WHERE `deleteDate` IS NULL AND `account` = '%u'", account.accountId));
-        if (count)
-            characters = count->Fetch()[0].GetUInt32();
-        handler->PSendSysMessage("  #%u %s [%s] - %u character(s)%s",
-            account.accountId, account.username.c_str(), RegistrationSourceName(account.source), characters,
-            count ? "" : " (character count unavailable)");
-    }
-    if (!registry.AccountCount())
-        handler->PSendSysMessage("  (none; the pool is empty)");
-    return true;
-}
-
-static bool HandlePoolAdopt(ChatHandler* handler, char const* args)
-{
-    if (!RequireServerConsole(handler))
-        return true;
-
-    std::string sub = Trim(args ? args : "");
-    std::string subLower = sub;
-    for (char& c : subLower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    RandomBotAccountRegistry& registry = RandomBotAccountRegistry::Instance();
-
-    if (subLower == "preview")
-    {
-        RandomBotAccountRegistry::AdoptionPreview preview = registry.PreviewLegacyAdoption();
-        if (!preview.ok)
-        {
-            handler->PSendSysMessage("Adoption preview failed: %s", preview.error.c_str());
-            return true;
-        }
-
-        handler->PSendSysMessage("Accounts matching prefix '%s': %u", preview.prefix.c_str(),
-            static_cast<uint32>(preview.accounts.size()));
-        for (RandomBotAccountRegistry::LegacyAccount const& account : preview.accounts)
-            handler->PSendSysMessage("  #%u %s - %u character(s) %s",
-                account.accountId, account.username.c_str(), account.characterCount,
-                account.alreadyRegistered ? "[already managed]" : "[NOT managed]");
-
-        if (preview.accounts.empty())
-        {
-            handler->PSendSysMessage("Nothing to adopt.");
-            return true;
-        }
-
-        handler->PSendSysMessage("Total: %u account(s), %u character(s); %u account(s) still need adoption.",
-            static_cast<uint32>(preview.accounts.size()), preview.totalCharacters, preview.pendingAccounts);
-        handler->PSendSysMessage("Adoption registers accounts only; no character is changed or deleted.");
-        if (preview.pendingAccounts)
-            handler->PSendSysMessage("To enroll them, run exactly: bot pool adopt confirm %s (valid for 5 minutes)",
-                preview.challenge.c_str());
-        else
-            handler->PSendSysMessage("Every matching account is already managed.");
-        return true;
-    }
-
-    if (subLower.rfind("confirm", 0) == 0)
-    {
-        std::string challenge = Trim(subLower.substr(7));
-        if (challenge.empty())
-        {
-            handler->PSendSysMessage("Usage: bot pool adopt confirm <challenge> (from 'bot pool adopt preview')");
-            return true;
-        }
-
-        RandomBotAccountRegistry::AdoptionConfirm confirm = registry.ConfirmLegacyAdoption(challenge, time(nullptr));
-        if (!confirm.ok)
-        {
-            handler->PSendSysMessage("Adoption aborted: %s", confirm.error.c_str());
-            return true;
-        }
-        handler->PSendSysMessage("Adoption complete: %u account(s) registered, %u already managed. No character was changed.",
-            confirm.adopted, confirm.alreadyRegistered);
-        return true;
-    }
-
-    handler->PSendSysMessage("Usage: bot pool adopt preview / bot pool adopt confirm <challenge>");
-    return true;
-}
-
-static bool HandlePool(ChatHandler* handler, char const* args)
-{
-    std::string sub = Trim(args ? args : "");
-    std::string subLower = sub;
-    for (char& c : subLower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    if (subLower == "status")
-        return HandlePoolStatus(handler);
-    if (subLower == "accounts")
-        return HandlePoolAccounts(handler);
-    if (subLower.rfind("adopt", 0) == 0)
-        return HandlePoolAdopt(handler, subLower.substr(5).c_str());
-
-    handler->PSendSysMessage("Usage: bot pool status / accounts / adopt preview / adopt confirm <challenge>");
-    return true;
+    return usage;
 }
 
 // pi-lens-ignore: clang:incomplete_member_access,clang:unknown_typename
@@ -3678,7 +552,7 @@ bool HandleChatCommand(ChatHandler* handler, char const* args)
     while (*args == ' ' || *args == '\t') ++args;
     if (!*args)
     {
-        handler->PSendSysMessage("Usage: .bot add/remove/logout/roster/action/follow/invite/uninvite/kick/stay/guard/free/ready/attack/interrupt/formation/list/stats/status/lease/version/about/pullback/role/summon/command/hire/loot/repair/sell/rest/drink/eat/release/corpse run/learn/trade/inv/item/behavior/strategy/maintenance/autogear/ah/pool");
+        handler->PSendSysMessage("%s", BuildBotUsageLine().c_str());
         return true;
     }
 
@@ -3696,107 +570,13 @@ bool HandleChatCommand(ChatHandler* handler, char const* args)
     // Normalize cmd to lowercase
     for (char& c : cmd) c = tolower(c);
 
-    if (cmd == "ah" || cmd == "ahbot")
-        return HandleAhBot(handler, subArgs);
-    if (cmd == "action")
-        return HandleAction(handler, subArgs);
-    if (cmd == "add")
-        return HandleAdd(handler, subArgs);
-    if (cmd == "remove")
-        return HandleRemove(handler, subArgs);
-    if (cmd == "logout")
-        return HandleLogout(handler, subArgs);
-    if (cmd == "roster")
-        return HandleRoster(handler);
-    if (cmd == "follow")
-        return HandleFollow(handler, subArgs);
-    if (cmd == "invite")
-        return HandleInvite(handler, subArgs);
-    if (cmd == "uninvite" || cmd == "kick")
-        return HandleUninvite(handler, subArgs);
-    if (cmd == "stay")
-        return HandleStay(handler, subArgs);
-    if (cmd == "guard")
-        return HandleGuard(handler, subArgs);
-    if (cmd == "free")
-        return HandleFree(handler, subArgs);
-    if (cmd == "ready")
-        return HandleReady(handler, subArgs);
-    if (cmd == "attack")
-        return HandleAttack(handler, subArgs);
-    if (cmd == "interrupt")
-        return HandleInterrupt(handler, subArgs);
-    if (cmd == "formation")
-        return HandleFormation(handler, subArgs);
-    if (cmd == "list")
-        return HandleList(handler);
-    if (cmd == "stats")
-        return HandleStats(handler);
-    if (cmd == "status")
-        return HandleStatus(handler, subArgs);
-    if (cmd == "lease")
-        return HandleLease(handler, subArgs);
-    if (cmd == "version" || cmd == "v" || cmd == "about" || cmd == "credits")
-        return HandleVersion(handler);
-    if (cmd == "pullback" || cmd == "pull-back")
-        return HandlePullback(handler, subArgs);
-    if (cmd == "role")
-        return HandleRole(handler, subArgs);
-    if (cmd == "summon")
-        return HandleSummon(handler, subArgs);
-    if (cmd == "maintenance")
-        return HandleMaintenance(handler, subArgs);
-    if (cmd == "autogear")
-        return HandleAutogear(handler, subArgs);
-    if (cmd == "hire")
-        return HandleHire(handler, subArgs);
-    if (cmd == "pool")
-        return HandlePool(handler, subArgs);
-    if (cmd == "loot")
-        return HandleLoot(handler, subArgs);
-    if (cmd == "repair")
-        return HandleRepair(handler, subArgs);
-    if (cmd == "sell")
-        return HandleSell(handler, subArgs);
-    if (cmd == "rest" || cmd == "drink" || cmd == "eat")
-        return HandleRest(handler, subArgs);
-    if (cmd == "release")
-        return HandleRelease(handler, subArgs);
-    if (cmd == "corpse")
+    BotCommandEntry const* entry = FindBotCommand(cmd);
+    if (!entry)
     {
-        std::string rest = Trim(subArgs ? subArgs : "");
-        for (char& c : rest)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (rest == "run" || rest.empty())
-            return HandleCorpseRun(handler, "");
-        handler->PSendSysMessage("Usage: .bot corpse run");
+        handler->PSendSysMessage("Unknown bot command '%s'. Try .bot help", cmd.c_str());
         return true;
     }
-    if (cmd == "corpserun")
-        return HandleCorpseRun(handler, subArgs);
-    if (cmd == "learn")
-        return HandleLearn(handler, subArgs);
-    if (cmd == "trade")
-        return HandleTrade(handler, subArgs);
-    if (cmd == "command")
-        return HandleMatureCommand(handler, subArgs);
-    if (cmd == "inv" || cmd == "inventory")
-        return HandleInventory(handler, subArgs);
-    if (cmd == "item")
-        return HandleItem(handler, subArgs);
-    if (cmd == "behavior" || cmd == "behaviour")
-        return HandleBehavior(handler, subArgs);
-    if (cmd == "strategy")
-        return HandleStrategy(handler, subArgs);
-    if (cmd == "help" || cmd == "h")
-    {
-        handler->PSendSysMessage("TortoiseBots: Enabled");
-        handler->PSendSysMessage("TBM:VERSION|%s", BuildVersion().c_str());
-        return true;
-    }
-
-    handler->PSendSysMessage("Unknown bot command '%s'. Try .bot help", cmd.c_str());
-    return true;
+    return entry->handler(handler, subArgs);
 }
 
 // pi-lens-ignore: clang:incomplete_member_access
@@ -3804,6 +584,9 @@ bool TryHandleBotCommand(ChatHandler* handler, char const* text)
 {
     if (!handler || !text)
         return false;
+    // Check for ".autogear" (real players; bots use ".bot autogear")
+    if (strncmp(text, "autogear", 8) == 0 && (text[8] == '\0' || text[8] == ' ' || text[8] == '\t'))
+        return HandlePlayerAutogear(handler, text + 8);
     // Check for ".ahbot" alias
     if (strncmp(text, "ahbot", 5) == 0 && (text[5] == '\0' || text[5] == ' ' || text[5] == '\t'))
     {

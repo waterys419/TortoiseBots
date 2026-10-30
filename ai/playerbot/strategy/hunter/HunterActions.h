@@ -1,5 +1,6 @@
 #pragma once
 
+#include "playerbot/HunterSwitchPolicy.h"
 #include "playerbot/strategy/actions/GenericActions.h"
 
 namespace ai
@@ -15,8 +16,32 @@ namespace ai
     // fallback has to stay available for that hunter.
     bool HunterHasLoadedRangedWeapon(PlayerbotAI* ai);
 
+    // [Turtle] Steady Shot weave gate: true when a Steady Shot started now
+    // ends early enough that the next Auto Shot is not delayed. Shared by the
+    // trigger and the action, because a queued basket can outlive the window.
+    bool HunterSteadyShotFitsAutoShotWindow(PlayerbotAI* ai, uint32 spellId);
+
     BEGIN_RANGED_DEBUFF_ACTION(CastHuntersMarkAction, "hunter's mark")
     END_SPELL_ACTION()
+
+    // One step straight out of the shot's dead zone while the pet, a tank or
+    // anyone else holds the mob (HunterDeadZoneStepOutTrigger). Point move to
+    // a checked spot (LOS, path) about 15 yd from the mob, fanned up to 90
+    // degrees off straight back like mod-playerbots 79bd428
+    // MovementAction::MoveAway. While the step runs it holds without
+    // re-dispatching; a step that left the hunter inside is retried farther
+    // (a few times per mob, HunterSwitchPolicy.h).
+    class HunterStepOutAction : public MovementAction
+    {
+    public:
+        HunterStepOutAction(PlayerbotAI* ai, std::string name = "hunter step out",
+            std::string targetName = "current target")
+            : MovementAction(ai, std::move(name)), targetName(std::move(targetName)) {}
+        bool Execute(Event& event) override;
+
+    private:
+        std::string targetName;
+    };
 
     class CastAutoShotAction : public CastSpellAction
     {
@@ -45,6 +70,15 @@ public:
         virtual bool isUseful() override { return HunterHasRangedAmmo(ai) && CastSpellAction::isUseful(); }
     END_SPELL_ACTION()
 
+    BEGIN_RANGED_SPELL_ACTION(CastSteadyShotAction, "steady shot")
+        virtual bool isUseful() override
+        {
+            return HunterHasRangedAmmo(ai) &&
+                HunterSteadyShotFitsAutoShotWindow(ai, AI_VALUE2(uint32, "spell id", "steady shot")) &&
+                CastSpellAction::isUseful();
+        }
+    END_SPELL_ACTION()
+
     BEGIN_RANGED_DEBUFF_ACTION(CastConcussiveShotAction, "concussive shot")
         virtual bool isUseful() override { return HunterHasRangedAmmo(ai) && CastRangedDebuffSpellAction::isUseful(); }
     END_SPELL_ACTION()
@@ -67,10 +101,18 @@ public:
 
     BEGIN_RANGED_SPELL_ACTION(CastMultiShotAction, "multi-shot")
         virtual bool isUseful() override { return HunterHasRangedAmmo(ai) && CastSpellAction::isUseful(); }
+        // Multi-Shot also hits the mobs beside the target, loose adds included:
+        // the party threat back-off checks it against the "aoe" threat. (The
+        // donor leaves it single-target; ZF hires-2 showed it splashing mobs the
+        // tank had not picked up yet.)
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
     END_SPELL_ACTION()
 
     BEGIN_RANGED_SPELL_ACTION(CastVolleyAction, "volley")
         virtual bool isUseful() override { return HunterHasRangedAmmo(ai) && CastSpellAction::isUseful(); }
+        // Hits every mob in the area, loose adds included: the party threat back-off
+        // checks it against the "aoe" threat (mod-playerbots types it Aoe too).
+        virtual ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_AOE; }
     END_SPELL_ACTION()
 
     BEGIN_RANGED_DEBUFF_ACTION(CastSerpentStingAction, "serpent sting")
@@ -109,9 +151,9 @@ public:
     class CastAspectOfTheViperAction : public CastBuffSpellAction
     {
     public:
-        // Tortoise 45651: mana-regen aspect. Manual like Wolf: auto-maintain
-        // would fight the Hawk upkeep (mutually exclusive aspects). A level
-        // gate with hysteresis belongs to a future aspect-arbitration pass.
+        // Tortoise 45651: mana-regen aspect. Manual by default, like Wolf. With
+        // AiPlayerbot.HunterViperOnLowMana = 1 the low-mana trigger casts it and
+        // the Hawk upkeep holds back until mana recovers (HunterViperPolicy.h).
         CastAspectOfTheViperAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "aspect of the viper") {}
     };
 
@@ -168,6 +210,17 @@ public:
         CastRevivePetAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "revive pet") {}
     };
 
+    // PET-8b: deliberate threat drop ordered when the pet holds aggro while
+    // taunts are stood down. Pet-cast (range/cooldown resolve against the
+    // pet); autocast stays off via the upkeep denylist. Named apart from the
+    // druid cat-form CastCowerAction (same namespace, different base).
+    class CastPetCowerAction : public CastPetSpellAction
+    {
+    public:
+        CastPetCowerAction(PlayerbotAI* ai) : CastPetSpellAction(ai, "cower") {}
+        std::string GetTargetName() override { return "pet target"; }
+    };
+
     class CastTrueshotAuraAction : public CastBuffSpellAction
     {
     public:
@@ -178,6 +231,9 @@ public:
     {
     public:
         CastFeignDeathAction(PlayerbotAI* ai) : CastBuffSpellAction(ai, "feign death") {}
+        // Not while a mob on the hunter has only the hunter on its threat list:
+        // it would evade (a scripted event resets). runtime/HunterFeignDeathPolicy.h
+        bool isUseful() override;
     };
 
     REMOVE_BUFF_ACTION(RemoveFeignDeathAction, "feign death");
@@ -190,10 +246,28 @@ public:
 
     BUFF_ACTION(CastReadinessAction, "readiness");
     ;
-    class CastWingClipAction : public CastMeleeSpellAction
+    // Melee row abilities (Raptor Strike, Mongoose Bite, Wing Clip). A mob that
+    // is already on the hunter leaves nothing for the party threat back-off to
+    // protect: the multiplier (ThreatMultiplier) vetoed all three while the
+    // hunter held the mob in a party with a tank, so the melee kit only
+    // auto-attacked. Against a mob someone else holds they stay subject to it.
+    class HunterMeleeRowAction : public CastMeleeSpellAction
     {
     public:
-        CastWingClipAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "wing clip") {}
+        HunterMeleeRowAction(PlayerbotAI* ai, std::string spell) : CastMeleeSpellAction(ai, spell) {}
+
+        ActionThreatType getThreatType() override
+        {
+            Unit* target = GetTarget();
+            return HunterMeleeRowIgnoresThreatBackoff(target && target->GetVictim() == bot) ?
+                ActionThreatType::ACTION_THREAT_NONE : ActionThreatType::ACTION_THREAT_SINGLE;
+        }
+    };
+
+    class CastWingClipAction : public HunterMeleeRowAction
+    {
+    public:
+        CastWingClipAction(PlayerbotAI* ai) : HunterMeleeRowAction(ai, "wing clip") {}
 
         virtual bool isUseful()
         {
@@ -201,10 +275,43 @@ public:
         }
     };
 
-    class CastRaptorStrikeAction : public CastMeleeSpellAction
+    // Clips the nearest mob that is on the hunter, not the current target.
+    // No reach prerequisite: a kiting hunter must never be walked back into
+    // the pack to clip, so the cast only happens in melee reach.
+    class CastWingClipOnAttackerAction : public CastWingClipAction
     {
     public:
-        CastRaptorStrikeAction(PlayerbotAI* ai) : CastMeleeSpellAction(ai, "raptor strike") {}
+        CastWingClipOnAttackerAction(PlayerbotAI* ai) : CastWingClipAction(ai) {}
+        std::string GetTargetName() override { return "closest attacker targeting me"; }
+        std::string GetReachActionName() override { return ""; }
+        virtual bool isUseful() override
+        {
+            Unit* target = GetTarget();
+            return ai->HasSpell("wing clip") && target && bot->CanReachWithMeleeAutoAttack(target) &&
+                CastWingClipAction::isUseful();
+        }
+    };
+
+    // Disengage drops threat only (it never moves the hunter on 1.12-style
+    // cores). The readiness check must use the rank-aware "spell id" value:
+    // it resolves the highest known rank (0 when untrained) and each rank
+    // has its own cooldown, so a hardcoded base-rank id would check the wrong
+    // cooldown and an untrained hunter would churn impossible casts.
+    class CastDisengageAction : public CastSpellAction
+    {
+    public:
+        CastDisengageAction(PlayerbotAI* ai) : CastSpellAction(ai, "disengage") {}
+        virtual bool isUseful() override
+        {
+            uint32 const rankId = AI_VALUE2(uint32, "spell id", "disengage");
+            return rankId && sServerFacade.IsSpellReady(bot, rankId) && CastSpellAction::isUseful();
+        }
+    };
+
+    class CastRaptorStrikeAction : public HunterMeleeRowAction
+    {
+    public:
+        CastRaptorStrikeAction(PlayerbotAI* ai) : HunterMeleeRowAction(ai, "raptor strike") {}
 
         virtual bool isUseful()
         {
@@ -254,7 +361,11 @@ public:
     BUFF_ACTION(DeterrenceAction, "deterrence");
     MELEE_ACTION(CastCounterattackAction, "counterattack");
     SNARE_ACTION(WyvernStingSnareAction, "wyvern sting");
-    MELEE_ACTION(MongooseBiteAction, "mongoose bite");
+    class MongooseBiteAction : public HunterMeleeRowAction
+    {
+    public:
+        MongooseBiteAction(PlayerbotAI* ai) : HunterMeleeRowAction(ai, "mongoose bite") {}
+    };
     SPELL_ACTION(CastKillCommandAction, "kill command");
     MELEE_ACTION(CastLacerateAction, "lacerate");
     MELEE_ACTION(CastCarveAction, "carve");
@@ -316,8 +427,28 @@ public:
         std::string GetTargetQualifier() override { return GetTrapSpellName(); }
         ActionThreatType getThreatType() override { return ActionThreatType::ACTION_THREAT_NONE; }
 
+        // Only the CC trap still walks to its target first (a freezing trap
+        // is laid where the CC target will be). The damage/slow traps are
+        // laid at the hunter's feet only when the target is already in melee
+        // reach (HunterTrapTargetInReach): the walk took group hunters into
+        // the tank's mob and the trap was never cast (#1018).
+        virtual bool WalksToTrapTarget() const { return false; }
+
+        bool isUseful() override
+        {
+            if (!CastSpellAction::isUseful())
+                return false;
+            if (WalksToTrapTarget())
+                return true;
+            Unit* trapTarget = AI_VALUE(Unit*, GetTrapTargetName());
+            return trapTarget && (trapTarget == bot || HunterTrapTargetInReach(bot->GetDistance(trapTarget)));
+        }
+
         NextAction** getPrerequisites() override
         {
+            if (!WalksToTrapTarget())
+                return Action::getPrerequisites();
+
             const std::string reachAction = GetReachActionName();
             const std::string spellName = GetSpellName();
             const std::string targetName = GetTrapTargetName();
@@ -348,6 +479,7 @@ private:
     {
     public:
         TrapOnCcTargetAction(PlayerbotAI* ai, std::string spell) : TrapOnTargetAction(ai, spell) {}
+        bool WalksToTrapTarget() const override { return true; }
         bool IsCrowdControlAction() const override { return true; }
         std::string GetCrowdControlSpellName() const override { return GetTrapSpellName(); }
         std::string GetTrapTargetName() override { return "cc target"; }
